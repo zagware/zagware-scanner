@@ -453,26 +453,29 @@ def clone_and_checkout_sha(url: str, base_branch: str, sha: str, dest: str) -> N
 # ── Scan ───────────────────────────────────────────────────────────────────────
 
 def run_scan(path: str, output_json: str) -> dict:
-    """Run the IaC scanner on *path*, write JSON to *output_json*, return parsed results."""
+    """Run the IaC scanner on *path*, write JSON to *output_json*, return parsed results.
+
+    Runs with cwd=path so the scanner emits file paths relative to the scan root
+    (e.g. 'terraform/main.tf' instead of an absolute or '../..' relative path).
+    """
     out_dir  = str(Path(output_json).parent)
     out_name = Path(output_json).stem
 
     cmd = [
         _SCANNER_BIN, "scan",
-        "--path",        path,
+        "--path",         ".",          # relative to cwd=path below
         "--queries-path", _QUERIES_PATH,
         "--report-formats", "json",
-        "--output-path", out_dir,
-        "--output-name", out_name,
+        "--output-path",  out_dir,      # absolute — unaffected by cwd
+        "--output-name",  out_name,
         "--exclude-paths", _EXCLUDE_PATHS,
         "--disable-full-descriptions",
         "--no-progress",
         "--ci",
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=path)
     if result.returncode not in (0, 50):
-        # 0 = clean, 50 = findings found (both are success for scan purposes)
         log.warning("Scanner returned code %d", result.returncode)
         if result.stderr:
             log.debug("stderr: %s", result.stderr[:800])
@@ -578,7 +581,7 @@ def render_comment(
                     "|------|-----:|----------|-------|----------|--------|",
                 ]
                 for f in q["files"]:
-                    fname    = f["file_name"].lstrip("./\\")
+                    fname    = f["file_name"]
                     resource = f.get("resource_name") or f.get("resource_type") or "—"
                     L.append(
                         f"| `{fname}` | {f['line']} | `{resource}`"
