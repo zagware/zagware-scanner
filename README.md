@@ -63,7 +63,26 @@ That's the entire file. `GITHUB_TOKEN` is provided automatically by GitHub — n
 
 ### GitLab CI
 
-Add the following job to your `.gitlab-ci.yml`:
+**One-time setup:** GitLab's built-in `CI_JOB_TOKEN` does not have permission to post merge request notes — this is a [GitLab platform limitation](https://docs.gitlab.com/ee/ci/jobs/ci_job_token.html). You need to create a dedicated access token and add it as a CI/CD variable once per project (or once at the group level to cover all projects).
+
+**Step 1 — Create an access token with `api` scope:**
+
+*Project-level* (Settings → Access Tokens → Add new token → role: Developer, scope: `api`):
+```
+Settings → Access Tokens → Add new token
+Role: Developer   Scope: api ✅   Copy the generated token
+```
+*Group-level* (covers all projects in the group): Settings → Access Tokens → same steps.
+
+**Step 2 — Add it as a masked CI/CD variable:**
+```
+Settings → CI/CD → Variables → Add variable
+Key:    GITLAB_TOKEN
+Value:  <your token>
+Mask:   ✅  (hides it from job logs)
+```
+
+**Step 3 — Add the job to your `.gitlab-ci.yml`:**
 
 ```yaml
 zagware-iac-scan:
@@ -76,10 +95,11 @@ zagware-iac-scan:
   allow_failure: true
 ```
 
-All required variables (`CI_JOB_TOKEN`, `CI_PROJECT_PATH`, `CI_MERGE_REQUEST_IID`, etc.) are injected automatically by GitLab for merge request pipelines. No additional setup required.
+All other required variables (`CI_JOB_TOKEN`, `CI_PROJECT_PATH`, `CI_PROJECT_ID`, `CI_MERGE_REQUEST_IID`, `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`, `CI_MERGE_REQUEST_SOURCE_BRANCH_NAME`, `CI_SERVER_URL`) are injected automatically by GitLab for merge request pipelines.
+
+> **New GitLab.com accounts:** GitLab.com requires identity verification before running CI/CD pipelines. If your pipelines trigger but no jobs appear, visit **https://gitlab.com/-/profile/identity_verification** to complete verification (credit card hold or mobile number — one-time only).
 
 > **To block merges on new findings:** remove `allow_failure: true`.
-
 ---
 
 ### Bitbucket Pipelines
@@ -252,6 +272,7 @@ zagware-iac-scan:
   variables:
     ZAGWARE_EXCLUDE_PATHS: "tests,fixtures,vendor"
     ZAGWARE_FAIL_ON_NEW:   "true"
+    # GITLAB_TOKEN is set as a masked project/group variable — see GitLab setup above
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 ```
@@ -263,11 +284,16 @@ zagware-iac-scan:
 The `latest` tag always points to the most recent release. For reproducible builds, pin to a specific version tag or image digest:
 
 ```yaml
-# Pin by version tag
-uses: docker://davymcaleer99/zagware-iac-scan:1.0.0
+# GitHub Actions — pin by version tag
+uses: docker://davymcaleer99/zagware-iac-scan:1.0.1
 
-# Pin by digest (most reproducible)
-uses: docker://davymcaleer99/zagware-iac-scan@sha256:f78efd4584a27f7abb99f20321c42c0dab3de13c42d2875b98aaa51d3366c8d9
+# GitHub Actions — pin by digest (most reproducible)
+uses: docker://davymcaleer99/zagware-iac-scan@sha256:5af863993722ce7946c18e2f90adce56791facc8e20eb8fca5f9147552290675
+```
+
+```yaml
+# GitLab CI / Bitbucket — pin by version tag
+image: davymcaleer99/zagware-iac-scan:1.0.1
 ```
 
 ---
@@ -307,8 +333,14 @@ This approach eliminates the line-number instability that affects SARIF-based di
 **Does the scanner send my code anywhere?**  
 No. The container runs entirely within your CI environment. It clones your repository using the token your CI platform already has, scans locally, and posts results to your PR via the platform API. No data leaves your infrastructure.
 
-**What permissions does it need?**  
-On GitHub: `pull-requests: write`. The `GITHUB_TOKEN` with this permission is sufficient and is available automatically in Actions. On other platforms, see the platform-specific setup notes above.
+**What permissions does it need?**
+
+| Platform | What's needed | How |
+|---|---|---|
+| **GitHub Actions** | `pull-requests: write` | Add `permissions: pull-requests: write` to the workflow job. `GITHUB_TOKEN` is automatic. |
+| **GitLab CI** | `GITLAB_TOKEN` with `api` scope | Create a project or group access token and add it as a masked CI/CD variable named `GITLAB_TOKEN`. See [GitLab setup](#gitlab-ci) above. |
+| **Bitbucket** | Repository Access Token with pull request read/write | Create under Repository settings → Access Tokens. Add as variable `BITBUCKET_TOKEN`. |
+| **Azure DevOps** | `Contribute to pull requests` on the repository | Enable OAuth token in pipeline settings; grant the build service identity the permission in Repository Security. |
 
 **Can I use it on private repositories?**  
 Yes. The clone uses the token provided by your CI platform, which already has access to your private repository.
