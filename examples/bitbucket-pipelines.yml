@@ -1,0 +1,26 @@
+# Zagware IaC Scanner — Bitbucket Pipelines
+# ──────────────────────────────────────────
+# Add or merge this into your bitbucket-pipelines.yml.
+#
+# Prerequisites:
+#   1. Create a Repository Access Token (or app password) with pull request
+#      read/write scope at Repository settings → Access tokens.
+#   2. Add it as a repository variable named BITBUCKET_TOKEN
+#      at Repository settings → Pipelines → Repository variables.
+#
+# All other required variables (BITBUCKET_WORKSPACE, BITBUCKET_REPO_SLUG,
+# BITBUCKET_PR_ID, BITBUCKET_PR_DESTINATION_BRANCH, BITBUCKET_BRANCH,
+# BITBUCKET_COMMIT) are auto-injected by Bitbucket.
+#
+# Optional repository variables:
+#   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
+#   ZAGWARE_FAIL_ON_NEW     Set to "true" to fail the step when new findings exist
+
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: Zagware IaC Scanner
+          image: davymcaleer99/zagware-iac-scan:latest
+          script:
+            - /usr/local/bin/zagware-scan

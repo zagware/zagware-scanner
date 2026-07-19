@@ -1,0 +1,32 @@
+# Zagware IaC Scanner — GitHub Actions
+# ─────────────────────────────────────
+# Add this file to .github/workflows/ in your repository.
+# No other files are required.
+#
+# Optional environment variables (add under env: in the step):
+#   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
+#   ZAGWARE_FAIL_ON_NEW     Set to "true" to fail the job when new findings exist
+
+name: Zagware IaC Scanner
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: zagware-iac-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: write   # required to post the comment
+
+jobs:
+  iac-scan:
+    name: IaC security scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Zagware IaC Scanner
+        uses: docker://davymcaleer99/zagware-iac-scan:latest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER:    ${{ github.event.pull_request.number }}
