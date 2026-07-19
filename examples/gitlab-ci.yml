@@ -2,7 +2,14 @@
 # ─────────────────────────────────
 # Merge into your existing .gitlab-ci.yml, or use as a standalone file.
 #
-# All required variables (CI_JOB_TOKEN, CI_PROJECT_PATH, CI_PROJECT_ID,
+# One-time setup:
+#   GitLab's CI_JOB_TOKEN cannot write MR notes (GitLab platform limitation).
+#   Create a project or group access token with 'api' scope and add it as a
+#   CI/CD variable named GITLAB_TOKEN:
+#     Settings → CI/CD → Variables → Add variable
+#     Key: GITLAB_TOKEN  |  Value: <your token>  |  Mask: ✅  |  Protect: optional
+#
+# All other required variables (CI_JOB_TOKEN, CI_PROJECT_PATH, CI_PROJECT_ID,
 # CI_MERGE_REQUEST_IID, CI_MERGE_REQUEST_TARGET_BRANCH_NAME,
 # CI_MERGE_REQUEST_SOURCE_BRANCH_NAME, CI_SERVER_URL) are injected
 # automatically by GitLab for merge request pipelines.

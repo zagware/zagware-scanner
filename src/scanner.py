@@ -189,10 +189,17 @@ class GitHub(Platform):
 
 class GitLab(Platform):
     """
-    Required env vars (all auto-injected in merge_request pipelines):
-      CI_JOB_TOKEN, CI_PROJECT_PATH, CI_PROJECT_ID,
+    GitLab CI/CD MR pipelines inject most variables automatically.
+
+    Auto-injected by GitLab:
+      CI_JOB_TOKEN, CI_PROJECT_PATH, CI_PROJECT_ID, CI_SERVER_URL,
       CI_MERGE_REQUEST_IID, CI_MERGE_REQUEST_TARGET_BRANCH_NAME,
-      CI_MERGE_REQUEST_SOURCE_BRANCH_NAME, CI_SERVER_URL
+      CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+
+    Required CI/CD variable (add once in Settings → CI/CD → Variables):
+      GITLAB_TOKEN   A project or group access token with 'api' scope.
+                     CI_JOB_TOKEN cannot post MR notes (GitLab limitation);
+                     a dedicated token is required for comment posting.
     """
 
     def detected(self) -> bool:
@@ -202,7 +209,20 @@ class GitLab(Platform):
         return "GitLab"
 
     @property
-    def _token(self) -> str:
+    def _api_token(self) -> str:
+        """Token used for GitLab REST API calls (comment posting).
+
+        GITLAB_TOKEN (PAT / project access token) is required because
+        CI_JOB_TOKEN does not have permission to write MR notes.
+        """
+        tok = os.environ.get("GITLAB_TOKEN") or os.environ.get("CI_JOB_TOKEN", "")
+        if not tok:
+            raise RuntimeError("Set GITLAB_TOKEN (project/group access token with api scope) as a CI/CD variable")
+        return tok
+
+    @property
+    def _clone_token(self) -> str:
+        """CI_JOB_TOKEN is sufficient for git clone operations."""
         return os.environ["CI_JOB_TOKEN"]
 
     @property
@@ -219,7 +239,7 @@ class GitLab(Platform):
 
     def clone_url(self) -> str:
         host = self._server.split("://", 1)[-1]
-        return f"https://gitlab-ci-token:{self._token}@{host}/{self._project_path}.git"
+        return f"https://gitlab-ci-token:{self._clone_token}@{host}/{self._project_path}.git"
 
     def base_branch(self) -> str:
         return os.environ["CI_MERGE_REQUEST_TARGET_BRANCH_NAME"]
@@ -235,7 +255,8 @@ class GitLab(Platform):
         return os.environ.get("CI_MERGE_REQUEST_SOURCE_BRANCH_NAME", "MR branch")
 
     def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self._token}"}
+        # PRIVATE-TOKEN header works for both PATs and project/group access tokens.
+        return {"PRIVATE-TOKEN": self._api_token}
 
     def post_or_update_comment(self, body: str) -> None:
         mr  = os.environ["CI_MERGE_REQUEST_IID"]
