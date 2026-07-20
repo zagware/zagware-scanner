@@ -35,7 +35,8 @@ from pathlib import Path
 
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
-_COMMENT_MARKER = "<!-- zagware-iac-scanner -->"
+_COMMENT_MARKER    = "<!-- zagware-iac-scanner -->"          # GitHub / GitLab (hidden HTML comment)
+_BB_COMMENT_MARKER = "[zagware-iac-scanner]: https://github.com/zagware/iac-scanner"  # Bitbucket (invisible link ref)
 _MAX_COMMENT   = 60_000
 _FAIL_ON_NEW   = os.environ.get("ZAGWARE_FAIL_ON_NEW", "false").lower() == "true"
 _EXCLUDE_PATHS = os.environ.get("ZAGWARE_EXCLUDE_PATHS", ".git")
@@ -364,7 +365,8 @@ class Bitbucket(Platform):
         assert isinstance(data, dict)
         existing = next(
             (c["id"] for c in data.get("values", [])
-             if _COMMENT_MARKER in c.get("content", {}).get("raw", "")),
+             if _BB_COMMENT_MARKER in c.get("content", {}).get("raw", "")
+             or "## Zagware IaC Scanner" in c.get("content", {}).get("raw", "")),
             None,
         )
         payload = {"content": {"raw": body}}
@@ -594,17 +596,23 @@ def render_comment(
         s = q.get("severity", "UNKNOWN")
         sev_counts[s] = sev_counts.get(s, 0) + len(q["files"])
 
-    L: list[str] = [
-        _COMMENT_MARKER,
-        "## Zagware IaC Scanner",
-        "",
-        f"Comparing **`{base_label}`** → **`{head_label}`**",
-        "",
-        "| | Base branch | This PR | New |",
-        "|---|:---:|:---:|:---:|",
-        f"| Findings | {total_base} | {total_pr} | **{total_new}** |",
-        "",
-    ]
+    # On GitHub/GitLab the HTML comment is hidden; on Bitbucket it renders as text.
+    # For Bitbucket we omit it from the top and embed an invisible CommonMark link
+    # reference definition at the bottom instead.
+    marker_line = _COMMENT_MARKER if collapsible else ""
+
+    L: list[str] = (
+        ([marker_line, ""] if marker_line else []) + [
+            "## Zagware IaC Scanner",
+            "",
+            f"Comparing **`{base_label}`** → **`{head_label}`**",
+            "",
+            "| | Base branch | This PR | New |",
+            "|---|:---:|:---:|:---:|",
+            f"| Findings | {total_base} | {total_pr} | **{total_new}** |",
+            "",
+        ]
+    )
 
     if not novel:
         L.append("✅ **No new security findings introduced by this PR.**")
@@ -660,11 +668,15 @@ def render_comment(
             if collapsible:
                 L += ["</details>", ""]
 
-    L += [
+    footer = [
         "---",
         "<sub>Zagware IaC Scanner &nbsp;·&nbsp; "
         "[zagware/iac-scanner](https://github.com/zagware/iac-scanner)</sub>",
     ]
+    # Bitbucket: append invisible CommonMark link-reference definition as the comment marker
+    if not collapsible:
+        footer.append(_BB_COMMENT_MARKER)
+    L += footer
 
     body = "\n".join(L)
     if len(body) > _MAX_COMMENT:
