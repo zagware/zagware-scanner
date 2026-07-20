@@ -266,35 +266,54 @@ Set these as environment variables in your CI configuration. All are optional.
 
 | Variable | Default | Description |
 |---|---|---|
+| `ZAGWARE_MIN_SEVERITY` | _(unset — all)_ | Minimum severity to report. Findings below this level are excluded from both scans and the PR comment. Valid values: `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` `TRACE` |
+| `ZAGWARE_FAIL_ON_NEW` | `false` | Exit with a non-zero code when new findings exist at or above `ZAGWARE_MIN_SEVERITY`, blocking the PR merge. |
 | `ZAGWARE_EXCLUDE_PATHS` | `.git` | Comma-separated list of paths or glob patterns to skip during scanning. |
-| `ZAGWARE_FAIL_ON_NEW` | `false` | Set to `true` to exit with a non-zero code when new findings are present, blocking the PR merge. |
 | `ZAGWARE_DEBUG` | _(unset)_ | Set to any value to enable verbose debug logging from the scanner. |
 
-### Example: exclude test fixtures and fail on new findings
+### Severity threshold
 
-**GitHub Actions:**
+`ZAGWARE_MIN_SEVERITY` controls what gets scanned, shown in the PR comment, and counted for pass/fail. Findings below the threshold are never generated — they do not appear in the comment or affect the build outcome.
+
+| `ZAGWARE_MIN_SEVERITY` | Severities scanned |
+|---|---|
+| `CRITICAL` | 🔴 CRITICAL only |
+| `HIGH` | 🔴 CRITICAL · 🟠 HIGH |
+| `MEDIUM` | 🔴 CRITICAL · 🟠 HIGH · 🟡 MEDIUM |
+| `LOW` | 🔴 CRITICAL · 🟠 HIGH · 🟡 MEDIUM · 🔵 LOW |
+| `INFO` or unset | All severities including ⚪ INFO |
+
+**GitHub Actions — block merges on HIGH or above:**
 ```yaml
 - uses: docker://davymcaleer99/zagware-iac-scan:latest
   env:
-    GITHUB_TOKEN:           ${{ github.token }}
-    PR_NUMBER:              ${{ github.event.pull_request.number }}
-    ZAGWARE_EXCLUDE_PATHS:  "tests,fixtures,vendor"
-    ZAGWARE_FAIL_ON_NEW:    "true"
+    GITHUB_TOKEN:          ${{ github.token }}
+    PR_NUMBER:             ${{ github.event.pull_request.number }}
+    ZAGWARE_MIN_SEVERITY:  "HIGH"
+    ZAGWARE_FAIL_ON_NEW:   "true"
 ```
 
-**GitLab CI:**
+**GitLab CI — report MEDIUM and above, block on any new finding:**
 ```yaml
 zagware-iac-scan:
   image: davymcaleer99/zagware-iac-scan:latest
   script:
     - /usr/local/bin/zagware-scan
   variables:
-    ZAGWARE_EXCLUDE_PATHS: "tests,fixtures,vendor"
-    ZAGWARE_FAIL_ON_NEW:   "true"
+    ZAGWARE_MIN_SEVERITY: "MEDIUM"
+    ZAGWARE_FAIL_ON_NEW:  "true"
     # GITLAB_TOKEN is set as a masked project/group variable — see GitLab setup above
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 ```
+
+**Bitbucket Pipelines** — add `ZAGWARE_MIN_SEVERITY` and `ZAGWARE_FAIL_ON_NEW` as repository variables alongside `BITBUCKET_API_TOKEN` and `ATLASSIAN_EMAIL`.
+
+**Azure DevOps** — add `ZAGWARE_MIN_SEVERITY` and `ZAGWARE_FAIL_ON_NEW` as pipeline variables and pass them with `-e ZAGWARE_MIN_SEVERITY -e ZAGWARE_FAIL_ON_NEW` in the docker run command.
+
+### How `ZAGWARE_FAIL_ON_NEW` interacts with `ZAGWARE_MIN_SEVERITY`
+
+When both are set, the build fails **only** if there are new findings at or above `ZAGWARE_MIN_SEVERITY`. A PR that introduces only LOW or INFO findings against a `ZAGWARE_MIN_SEVERITY=HIGH` threshold will pass the build — those findings are filtered out before any comparison occurs.
 
 ---
 
@@ -304,15 +323,15 @@ The `latest` tag always points to the most recent release. For reproducible buil
 
 ```yaml
 # GitHub Actions — pin by version tag
-uses: docker://davymcaleer99/zagware-iac-scan:1.0.1
+uses: docker://davymcaleer99/zagware-iac-scan:1.0.4
 
 # GitHub Actions — pin by digest (most reproducible)
-uses: docker://davymcaleer99/zagware-iac-scan@sha256:5af863993722ce7946c18e2f90adce56791facc8e20eb8fca5f9147552290675
+uses: docker://davymcaleer99/zagware-iac-scan@sha256:1c39d5a5d300c3a20346f016b60d69b31ed69704c6c5a6a0103cb613e0cee3f6
 ```
 
 ```yaml
 # GitLab CI / Bitbucket — pin by version tag
-image: davymcaleer99/zagware-iac-scan:1.0.1
+image: davymcaleer99/zagware-iac-scan:1.0.4
 ```
 
 ---

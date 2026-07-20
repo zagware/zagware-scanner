@@ -40,12 +40,28 @@ _BB_COMMENT_MARKER = "[zagware-iac-scanner]: https://github.com/zagware/iac-scan
 _MAX_COMMENT   = 60_000
 _FAIL_ON_NEW   = os.environ.get("ZAGWARE_FAIL_ON_NEW", "false").lower() == "true"
 _EXCLUDE_PATHS = os.environ.get("ZAGWARE_EXCLUDE_PATHS", ".git")
+_MIN_SEVERITY  = os.environ.get("ZAGWARE_MIN_SEVERITY", "").upper().strip()
 
 _SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "TRACE"]
 _SEVERITY_EMOJI = {
     "CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡",
     "LOW":      "🔵", "INFO": "⚪", "TRACE":   "⚫",
 }
+
+def _severities_below() -> list[str]:
+    """Return severities to pass to --exclude-severities based on ZAGWARE_MIN_SEVERITY.
+
+    ZAGWARE_MIN_SEVERITY=HIGH  →  exclude MEDIUM,LOW,INFO,TRACE
+    ZAGWARE_MIN_SEVERITY=MEDIUM →  exclude LOW,INFO,TRACE
+    Empty / unset              →  no exclusion (scan everything)
+    """
+    if not _MIN_SEVERITY:
+        return []
+    if _MIN_SEVERITY not in _SEVERITY_ORDER:
+        # Validated at startup; warn once here in case of late env mutation
+        return []
+    idx = _SEVERITY_ORDER.index(_MIN_SEVERITY)
+    return _SEVERITY_ORDER[idx + 1:]   # everything with a lower severity rank
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -529,6 +545,11 @@ def run_scan(path: str, output_json: str) -> dict:
         "--no-progress",
         "--ci",
     ]
+    # Apply severity threshold: exclude findings below ZAGWARE_MIN_SEVERITY from both
+    # base and PR scans so the diff only operates on in-scope severities.
+    below = _severities_below()
+    if below:
+        cmd += ["--exclude-severities", ",".join(below)]
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=path)
     if result.returncode not in (0, 50):
@@ -613,6 +634,12 @@ def render_comment(
             "",
         ]
     )
+
+    # Show active severity filter so reviewers know what was excluded
+    if _MIN_SEVERITY and _MIN_SEVERITY in _SEVERITY_ORDER:
+        L.append(f"> 🔎 Severity filter: **{_MIN_SEVERITY} and above** "
+                 f"(`ZAGWARE_MIN_SEVERITY={_MIN_SEVERITY}`)")
+        L.append("")
 
     if not novel:
         L.append("✅ **No new security findings introduced by this PR.**")
@@ -702,6 +729,12 @@ def main() -> int:
         )
         return 1
     log.info("Platform: %s", platform.name())
+    if _MIN_SEVERITY:
+        below = _severities_below()
+        log.info("Severity filter: %s and above (excluding %s)",
+                 _MIN_SEVERITY, ", ".join(below) if below else "nothing")
+    if _FAIL_ON_NEW:
+        log.info("ZAGWARE_FAIL_ON_NEW=true — build will fail on new findings")
 
     clone_url   = platform.clone_url()
     base_branch = platform.base_branch()
