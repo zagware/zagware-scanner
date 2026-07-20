@@ -100,7 +100,128 @@ All other required variables (`CI_JOB_TOKEN`, `CI_PROJECT_PATH`, `CI_PROJECT_ID`
 > **New GitLab.com accounts:** GitLab.com requires identity verification before running CI/CD pipelines. If your pipelines trigger but no jobs appear, visit **https://gitlab.com/-/profile/identity_verification** to complete verification (credit card hold or mobile number — one-time only).
 
 > **To block merges on new findings:** remove `allow_failure: true`.
+
 ---
+
+### GitLab — group-wide enforcement (Pipeline Execution Policy)
+
+If you have a **GitLab Ultimate** license, you can enforce the scanner across every repository in a group without touching individual project CI files. A [Pipeline Execution Policy](https://docs.gitlab.com/user/application_security/policies/pipeline_execution_policies/) injects the scanner job into every MR pipeline automatically — new repos pick it up the moment they are created in the group.
+
+**Prerequisites:**
+- GitLab Ultimate license (or trial)
+- Owner role on the group
+- `GITLAB_TOKEN` with `api` scope (same token as the per-project setup above)
+
+#### Step 1 — Set a group-level CI/CD variable
+
+This covers every project in the group with a single entry.
+
+```
+Group → Settings → CI/CD → Variables → Add variable
+Key:    GITLAB_TOKEN
+Value:  <your group or personal access token with api scope>
+Mask:   ✅
+```
+
+#### Step 2 — Create a shared CI template project
+
+Create a **private** project in the group (e.g. `your-group/ci-templates`) and add the file `zagware-iac-scan.yml`:
+
+```yaml
+# zagware-iac-scan.yml
+# Referenced by the pipeline execution policy — do not add this file
+# to individual projects; the policy injects it automatically.
+
+zagware-iac-scan:
+  stage: .pipeline-policy-pre
+  image: davymcaleer99/zagware-iac-scan:1.0.4
+  script:
+    - /usr/local/bin/zagware-scan
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  allow_failure: true
+```
+
+> **Stage note:** use `stage: .pipeline-policy-pre`. This is a reserved GitLab stage that runs before all project jobs and is always available regardless of what stages a project defines. Using `stage: .pre` alone causes the policy to be silently treated as empty and the job is never injected.
+
+#### Step 3 — Allow the template project to be read by pipelines
+
+For each project in the group that will run the policy (and for the security policy project you create in Step 4), add `ci-templates` to their CI job token allowlist:
+
+```
+ci-templates → Settings → CI/CD → Job token permissions → Allowlist
+Add: <each project that needs to include from ci-templates>
+```
+
+Alternatively, add `ci-templates` as a *target* on the allowlist of each source project:
+
+```
+infra-project → Settings → CI/CD → Job token permissions → This project's allowlist
+Add target: your-group/ci-templates
+```
+
+#### Step 4 — Create and link a security policy project
+
+GitLab requires a dedicated project to store security policies. You can create and link it in one step using the GraphQL API:
+
+```graphql
+mutation {
+  securityPolicyProjectCreate(input: { fullPath: "your-group" }) {
+    project { id fullPath }
+    errors
+  }
+}
+```
+
+Run this at **https://gitlab.com/-/graphql-explorer** (authenticated). GitLab creates a project named `your-group-security-policy-project` and links it to the group automatically.
+
+#### Step 5 — Add the policy YAML
+
+In the newly created security policy project, push `.gitlab/security-policies/policy.yml` via a merge request (the `main` branch is protected — direct push is not allowed):
+
+```yaml
+---
+pipeline_execution_policy:
+  - name: Zagware IaC Scanner
+    description: >-
+      Inject IaC security scanning into every MR pipeline across
+      the group. No per-project configuration required.
+    enabled: true
+    pipeline_config_strategy: inject_policy
+    content:
+      include:
+        - project: your-group/ci-templates
+          file: zagware-iac-scan.yml
+```
+
+Once the MR is merged, GitLab propagates the policy to all projects in the group. Every subsequent MR pipeline in any group project will have `zagware-iac-scan` injected and run automatically.
+
+#### What each project's `.gitlab-ci.yml` looks like
+
+Nothing scanner-related is needed. Projects keep their own CI as normal:
+
+```yaml
+stages:
+  - build
+  - test
+
+my-build-job:
+  stage: build
+  script: make build
+```
+
+The scanner runs alongside `my-build-job` without any reference to it in the project.
+
+#### Common pitfalls
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Scanner job never appears in pipelines | `inject_ci` strategy used — it is deprecated and silently broken | Change to `pipeline_config_strategy: inject_policy` |
+| Policy shows as active in API but no jobs injected | Job uses `stage: .pre` only — GitLab treats `.pre`-only policy pipelines as empty | Use `stage: .pipeline-policy-pre` |
+| `include: project:` silently fails | CI job token scope restrictions prevent cross-project reads | Add `ci-templates` to the allowlist of each source project (Settings → CI/CD → Job token permissions) |
+| Policy YAML ignored (0 active policies) | Invalid `content` format — only `content.include.project:` is accepted | Do not use `content: \|` string blocks or inline job keys directly under `content:` |
+
+> **To block merges on new findings:** remove `allow_failure: true` from the template job, or set `ZAGWARE_FAIL_ON_NEW: "true"` as a group CI/CD variable.
 
 ### Bitbucket Pipelines
 
@@ -376,9 +497,7 @@ No. The container runs entirely within your CI environment. It clones your repos
 | Platform | What's needed | How |
 |---|---|---|
 | **GitHub Actions** | `pull-requests: write` | Add `permissions: pull-requests: write` to the workflow job. `GITHUB_TOKEN` is automatic. |
-| **GitLab CI** | `GITLAB_TOKEN` with `api` scope | Create a project or group access token and add it as a masked CI/CD variable named `GITLAB_TOKEN`. See [GitLab setup](#gitlab-ci) above. |
-| **Bitbucket** | `BITBUCKET_API_TOKEN` (Atlassian API token with repository + pull-request scopes) and `ATLASSIAN_EMAIL` | Create the token at id.atlassian.com with Bitbucket scopes. Add both as repository pipeline variables. See [Bitbucket setup](#bitbucket-pipelines) above. |
-| **Azure DevOps** | `Contribute to pull requests` on the repository | Enable OAuth token in pipeline settings; grant the build service identity the permission in Repository Security. |
+| **GitLab CI** | `GITLAB_TOKEN` with `api` scope | Create a project or group access token and add it as a masked CI/CD variable named `GITLAB_TOKEN`. See [GitLab setup](#gitlab-ci) above. For group-wide enforcement without per-project configuration, see [Pipeline Execution Policy](#gitlab--group-wide-enforcement-pipeline-execution-policy). |
 
 **Can I use it on private repositories?**  
 Yes. The clone uses the token provided by your CI platform, which already has access to your private repository.
