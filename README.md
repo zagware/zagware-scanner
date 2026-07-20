@@ -212,6 +212,61 @@ my-build-job:
 
 The scanner runs alongside `my-build-job` without any reference to it in the project.
 
+#### Excluding or limiting scope
+
+By default the policy applies to every project in the group. Use `policy_scope` in the policy YAML to restrict it.
+
+**Exclude specific projects** (blocklist — everything scanned except the listed repos):
+
+```yaml
+---
+pipeline_execution_policy:
+  - name: Zagware IaC Scanner
+    enabled: true
+    pipeline_config_strategy: inject_policy
+    content:
+      include:
+        - project: your-group/ci-templates
+          file: zagware-iac-scan.yml
+    policy_scope:
+      projects:
+        excluding:
+          - id: 12345678   # legacy-monolith — not yet IaC
+          - id: 87654321   # design-assets — no infrastructure code
+```
+
+Find a project's numeric ID in **Settings → General → Project ID**, or in the URL bar when you open the project on GitLab.
+
+**Scan only specific projects** (allowlist — nothing scanned unless explicitly listed):
+
+```yaml
+    policy_scope:
+      projects:
+        including:
+          - id: 12345678
+          - id: 23456789
+```
+
+**Exclude all archived projects** (useful when a group contains many frozen repos):
+
+```yaml
+    policy_scope:
+      projects:
+        excluding:
+          - type: archived
+```
+
+**Scope to a subgroup** (scan production infra repos but leave sandbox alone):
+
+```yaml
+    policy_scope:
+      groups:
+        including:
+          - id: 98765432   # your-group/production subgroup ID
+```
+
+> **Note:** an empty `including: []` does **not** mean "no projects" — GitLab treats it as if the field were absent, so the policy still applies everywhere. To disable the policy without deleting it, set `enabled: false`.
+
 #### Common pitfalls
 
 | Symptom | Cause | Fix |
