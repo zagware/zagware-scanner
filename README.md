@@ -104,9 +104,27 @@ All other required variables (`CI_JOB_TOKEN`, `CI_PROJECT_PATH`, `CI_PROJECT_ID`
 
 ### Bitbucket Pipelines
 
-**One-time setup:** create a Repository Access Token with *pull request read/write* scope at **Repository settings → Access tokens**, then add it as a repository variable named `BITBUCKET_TOKEN` at **Repository settings → Pipelines → Repository variables**.
+**One-time setup — two repository variables required:**
 
-Add the following to your `bitbucket-pipelines.yml`:
+Bitbucket's auto-injected `BITBUCKET_TOKEN` is an OAuth token scoped only for the current pipeline step and cannot authenticate against the Bitbucket REST API for writing PR comments. You need an Atlassian API token for comment posting.
+
+**Step 1 — Create an Atlassian API token with Bitbucket scopes:**
+
+Go to **https://id.atlassian.com/manage-profile/security/api-tokens** → Create API token → under *Product access*, select **Bitbucket** and enable at minimum:
+- Repositories: **Read** + **Write**
+- Pull Requests: **Read** + **Write**
+- Pipelines: **Read** + **Write**
+
+**Step 2 — Add two repository variables:**
+
+Go to **Repository settings → Pipelines → Repository variables** and add:
+
+| Key | Value | Secured |
+|---|---|:---:|
+| `BITBUCKET_API_TOKEN` | Your Atlassian API token | ✅ |
+| `ATLASSIAN_EMAIL` | Your Atlassian account email | ❌ |
+
+**Step 3 — Add to your `bitbucket-pipelines.yml`:**
 
 ```yaml
 pipelines:
@@ -119,8 +137,9 @@ pipelines:
             - /usr/local/bin/zagware-scan
 ```
 
-All other required variables are auto-injected by Bitbucket Pipelines.
+> **Pipelines must be enabled** on the repository (Repository settings → Pipelines → Settings → Enable Pipelines). Bitbucket requires **Two-step verification** on your Atlassian account before pipelines can be enabled in a workspace.
 
+> **To block merges on new findings:** set the `ZAGWARE_FAIL_ON_NEW` repository variable to `"true"` and remove `allow_failure` (not needed — the step will exit with a non-zero code).
 ---
 
 ### Azure DevOps
@@ -339,7 +358,7 @@ No. The container runs entirely within your CI environment. It clones your repos
 |---|---|---|
 | **GitHub Actions** | `pull-requests: write` | Add `permissions: pull-requests: write` to the workflow job. `GITHUB_TOKEN` is automatic. |
 | **GitLab CI** | `GITLAB_TOKEN` with `api` scope | Create a project or group access token and add it as a masked CI/CD variable named `GITLAB_TOKEN`. See [GitLab setup](#gitlab-ci) above. |
-| **Bitbucket** | Repository Access Token with pull request read/write | Create under Repository settings → Access Tokens. Add as variable `BITBUCKET_TOKEN`. |
+| **Bitbucket** | `BITBUCKET_API_TOKEN` (Atlassian API token with repository + pull-request scopes) and `ATLASSIAN_EMAIL` | Create the token at id.atlassian.com with Bitbucket scopes. Add both as repository pipeline variables. See [Bitbucket setup](#bitbucket-pipelines) above. |
 | **Azure DevOps** | `Contribute to pull requests` on the repository | Enable OAuth token in pipeline settings; grant the build service identity the permission in Repository Security. |
 
 **Can I use it on private repositories?**  
