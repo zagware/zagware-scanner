@@ -110,6 +110,11 @@ class Platform(ABC):
     def post_or_update_comment(self, body: str) -> None:
         """Create a new comment or update the existing one (identified by marker)."""
 
+    def supports_html_details(self) -> bool:
+        """Return True if the platform renders <details>/<summary> in PR comments.
+        GitHub and GitLab support HTML details; Bitbucket does not."""
+        return True
+
 
 class GitHub(Platform):
     """
@@ -297,6 +302,9 @@ class Bitbucket(Platform):
 
     def name(self) -> str:
         return "Bitbucket"
+
+    def supports_html_details(self) -> bool:
+        return False  # Bitbucket renders <details>/<summary> as literal text
 
     @property
     def _api_token(self) -> str:
@@ -569,8 +577,14 @@ def _cell(text: str, limit: int = 80) -> str:
 
 
 def render_comment(
-    base: dict, pr: dict, novel: list[dict], base_label: str, head_label: str
+    base: dict, pr: dict, novel: list[dict], base_label: str, head_label: str,
+    collapsible: bool = True,
 ) -> str:
+    """Render the PR comment markdown.
+
+    collapsible=True  — wrap severity sections in <details>/<summary> (GitHub, GitLab).
+    collapsible=False — use plain ### headings (Bitbucket, which ignores HTML details).
+    """
     total_base = count_findings(base.get("queries", []))
     total_pr   = count_findings(pr.get("queries", []))
     total_new  = count_findings(novel)
@@ -611,9 +625,15 @@ def render_comment(
                 continue
             count = sum(len(q["files"]) for q in qs)
             emoji = _SEVERITY_EMOJI[sev]
-            L += ["<details>",
-                  f"<summary>{emoji} <strong>{sev}</strong> — {count} finding(s)</summary>",
-                  ""]
+
+            # Section header — collapsible on GitHub/GitLab, plain heading on Bitbucket
+            if collapsible:
+                L += ["<details>",
+                      f"<summary>{emoji} <strong>{sev}</strong> — {count} finding(s)</summary>",
+                      ""]
+            else:
+                L += ["---", f"### {emoji} {sev} — {count} finding(s)", ""]
+
             for q in qs:
                 cwe = f" &nbsp;·&nbsp; CWE-{q['cwe']}" if q.get("cwe") else ""
                 ref = (f" &nbsp;·&nbsp; [Reference]({q['query_url']})"
@@ -636,7 +656,9 @@ def render_comment(
                         f" | {_cell(f.get('actual_value', ''))} |"
                     )
                 L.append("")
-            L += ["</details>", ""]
+
+            if collapsible:
+                L += ["</details>", ""]
 
     L += [
         "---",
@@ -726,6 +748,7 @@ def main() -> int:
             base_results, pr_results, novel,
             platform.base_label(),
             platform.head_label(),
+            collapsible=platform.supports_html_details(),
         )
 
         # ── Post ─────────────────────────────────────────────────────────────
