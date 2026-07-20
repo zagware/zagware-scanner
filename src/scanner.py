@@ -278,12 +278,18 @@ class GitLab(Platform):
 
 class Bitbucket(Platform):
     """
-    Required env vars:
-      BITBUCKET_TOKEN   Repository / workspace access token (add as a CI variable)
+    Bitbucket Pipelines injects most variables automatically.
 
-    Auto-injected:
+    Auto-injected by Bitbucket:
       BITBUCKET_WORKSPACE, BITBUCKET_REPO_SLUG, BITBUCKET_PR_ID,
-      BITBUCKET_PR_DESTINATION_BRANCH, BITBUCKET_BRANCH, BITBUCKET_COMMIT
+      BITBUCKET_PR_DESTINATION_BRANCH, BITBUCKET_BRANCH, BITBUCKET_COMMIT,
+      BITBUCKET_TOKEN (OAuth Bearer — usable for git clone only)
+
+    Required repo variables (Repository settings → Pipelines → Repository variables):
+      BITBUCKET_API_TOKEN   Atlassian API token with Bitbucket repository + pull-request scopes.
+                            The auto-injected BITBUCKET_TOKEN is OAuth and cannot post PR
+                            comments; the Atlassian API token uses HTTP Basic auth (email:token).
+      ATLASSIAN_EMAIL       The Atlassian account email paired with BITBUCKET_API_TOKEN.
     """
 
     def detected(self) -> bool:
@@ -293,8 +299,24 @@ class Bitbucket(Platform):
         return "Bitbucket"
 
     @property
-    def _token(self) -> str:
-        return os.environ["BITBUCKET_TOKEN"]
+    def _api_token(self) -> str:
+        """Atlassian API token for REST API calls (Basic auth: email:token)."""
+        return os.environ["BITBUCKET_API_TOKEN"]
+
+    @property
+    def _email(self) -> str:
+        """Atlassian account email — the username component for Basic auth."""
+        return os.environ["ATLASSIAN_EMAIL"]
+
+    @property
+    def _git_user(self) -> str:
+        """Git HTTP username for Atlassian API token auth.
+
+        Bitbucket's HTTP clone URL uses '{workspace}-admin' as the username
+        for workspace-level Atlassian API token authentication.
+        Can be overridden by setting BITBUCKET_GIT_USER.
+        """
+        return os.environ.get("BITBUCKET_GIT_USER", f"{self._workspace}-admin")
 
     @property
     def _workspace(self) -> str:
@@ -305,7 +327,8 @@ class Bitbucket(Platform):
         return os.environ["BITBUCKET_REPO_SLUG"]
 
     def clone_url(self) -> str:
-        return f"https://x-token-auth:{self._token}@bitbucket.org/{self._workspace}/{self._slug}.git"
+        # Atlassian API token git auth: {workspace}-admin:{token}
+        return f"https://{self._git_user}:{self._api_token}@bitbucket.org/{self._workspace}/{self._slug}.git"
 
     def base_branch(self) -> str:
         return os.environ["BITBUCKET_PR_DESTINATION_BRANCH"]
@@ -320,7 +343,9 @@ class Bitbucket(Platform):
         return os.environ.get("BITBUCKET_BRANCH", "PR branch")
 
     def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self._token}"}
+        # Atlassian API tokens require HTTP Basic auth: email:token
+        creds = base64.b64encode(f"{self._email}:{self._api_token}".encode()).decode()
+        return {"Authorization": f"Basic {creds}"}
 
     def post_or_update_comment(self, body: str) -> None:
         pr  = os.environ["BITBUCKET_PR_ID"]
