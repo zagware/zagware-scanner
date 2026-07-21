@@ -132,6 +132,14 @@ class Platform(ABC):
         GitHub and GitLab support HTML details; Bitbucket does not."""
         return True
 
+    def repo(self) -> str:
+        """Full repository name (owner/repo or similar). Empty string if unavailable."""
+        return ''
+
+    def pr_number(self) -> int | None:
+        """PR/MR number as an integer, or None if not a PR pipeline."""
+        return None
+
 
 class GitHub(Platform):
     """
@@ -171,6 +179,13 @@ class GitHub(Platform):
 
     def head_label(self) -> str:
         return os.environ.get("GITHUB_HEAD_REF", "PR branch")
+
+    def repo(self) -> str:
+        return os.environ.get("GITHUB_REPOSITORY", "")
+
+    def pr_number(self) -> int | None:
+        val = os.environ.get("PR_NUMBER", "").strip()
+        return int(val) if val else None
 
     def _headers(self) -> dict:
         return {
@@ -276,6 +291,13 @@ class GitLab(Platform):
     def head_label(self) -> str:
         return os.environ.get("CI_MERGE_REQUEST_SOURCE_BRANCH_NAME", "MR branch")
 
+    def repo(self) -> str:
+        return os.environ.get("CI_PROJECT_PATH", "")
+
+    def pr_number(self) -> int | None:
+        val = os.environ.get("CI_MERGE_REQUEST_IID", "").strip()
+        return int(val) if val else None
+
     def _headers(self) -> dict:
         # PRIVATE-TOKEN header works for both PATs and project/group access tokens.
         return {"PRIVATE-TOKEN": self._api_token}
@@ -367,6 +389,15 @@ class Bitbucket(Platform):
     def head_label(self) -> str:
         return os.environ.get("BITBUCKET_BRANCH", "PR branch")
 
+    def repo(self) -> str:
+        ws   = os.environ.get("BITBUCKET_WORKSPACE", "")
+        slug = os.environ.get("BITBUCKET_REPO_SLUG", "")
+        return f"{ws}/{slug}" if ws and slug else ""
+
+    def pr_number(self) -> int | None:
+        val = os.environ.get("BITBUCKET_PR_ID", "").strip()
+        return int(val) if val else None
+
     def _headers(self) -> dict:
         # Atlassian API tokens require HTTP Basic auth: email:token
         creds = base64.b64encode(f"{self._email}:{self._api_token}".encode()).decode()
@@ -452,6 +483,15 @@ class AzureDevOps(Platform):
     def head_label(self) -> str:
         return (os.environ.get("SYSTEM_PULLREQUEST_SOURCEBRANCH", "PR branch")
                 .replace("refs/heads/", ""))
+
+    def repo(self) -> str:
+        project = os.environ.get("SYSTEM_TEAMPROJECT", "")
+        name    = os.environ.get("BUILD_REPOSITORY_NAME", "")
+        return f"{project}/{name}" if project and name else ""
+
+    def pr_number(self) -> int | None:
+        val = os.environ.get("SYSTEM_PULLREQUEST_PULLREQUESTID", "").strip()
+        return int(val) if val else None
 
     def _headers(self) -> dict:
         creds = base64.b64encode(f":{self._token}".encode()).decode()
@@ -712,6 +752,74 @@ def render_comment(
     return body
 
 
+
+# ── Platform upload ────────────────────────────────────────────────────────────
+
+def upload_to_platform(
+    platform_url: str,
+    platform_token: str,
+    repo: str,
+    base_branch: str,
+    base_sha: str,
+    head_branch: str,
+    head_sha: str,
+    pr_number: int | None,
+    base_results: dict,
+    head_results: dict,
+) -> None:
+    """Upload scan results to the GTP platform. Non-fatal if this fails."""
+    try:
+        headers = {
+            'Authorization': f'Bearer {platform_token}',
+            'Content-Type': 'application/json',
+        }
+
+        def post(payload_dict: dict) -> dict:
+            data = json.dumps(payload_dict).encode('utf-8')
+            req = urllib.request.Request(
+                f'{platform_url}/api/v1/iac/upload',
+                data=data,
+                headers=headers,
+                method='POST',
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+
+        # 1. Upload base scan
+        base_payload = {
+            'repo': repo,
+            'branch': base_branch,
+            'commit_sha': base_sha or None,
+            'scan_type': 'pr_base' if pr_number else 'branch',
+            'pr_number': pr_number,
+            'pr_comparison_id': None,
+            'scanner_version': 'unknown',
+            'results': base_results,
+        }
+        base_resp    = post(base_payload)
+        base_scan_id = base_resp.get('scan_id')
+
+        # 2. Upload head scan (only for PR scans)
+        if pr_number and base_scan_id:
+            head_payload = {
+                'repo': repo,
+                'branch': head_branch,
+                'commit_sha': head_sha or None,
+                'scan_type': 'pr_head',
+                'pr_number': pr_number,
+                'pr_comparison_id': base_scan_id,
+                'scanner_version': 'unknown',
+                'results': head_results,
+            }
+            post(head_payload)
+
+        print(f'[zagware] Scan results uploaded to platform (base scan: {base_scan_id})',
+              file=sys.stderr)
+
+    except Exception as e:
+        print(f'[zagware] Warning: failed to upload scan results to platform: {e}',
+              file=sys.stderr)
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -780,6 +888,24 @@ def main() -> int:
         pr_results   = run_scan(pr_dir, pr_json)
         pr_count     = count_findings(pr_results.get("queries", []))
         log.info("PR:   %d finding(s)", pr_count)
+
+        # ── Upload to GTP platform if configured ─────────────────────────────
+
+        _platform_url   = os.environ.get('ZAGWARE_PLATFORM_URL', '').rstrip('/')
+        _platform_token = os.environ.get('ZAGWARE_PLATFORM_TOKEN', '')
+        if _platform_url and _platform_token:
+            upload_to_platform(
+                _platform_url,
+                _platform_token,
+                platform.repo(),
+                base_branch,
+                '',
+                head_branch,
+                '',
+                platform.pr_number(),
+                base_results,
+                pr_results,
+            )
 
         # ── Diff ─────────────────────────────────────────────────────────────
 

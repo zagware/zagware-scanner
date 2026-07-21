@@ -446,6 +446,8 @@ Set these as environment variables in your CI configuration. All are optional.
 | `ZAGWARE_FAIL_ON_NEW` | `false` | Exit with a non-zero code when new findings exist at or above `ZAGWARE_MIN_SEVERITY`, blocking the PR merge. |
 | `ZAGWARE_EXCLUDE_PATHS` | `.git` | Comma-separated list of paths or glob patterns to skip during scanning. |
 | `ZAGWARE_DEBUG` | _(unset)_ | Set to any value to enable verbose debug logging from the scanner. |
+| `ZAGWARE_PLATFORM_URL`   | _(unset)_ | Base URL of the GTP API, e.g. `https://api.gtp.example.com`. When set together with `ZAGWARE_PLATFORM_TOKEN`, scan results are uploaded to the platform after each run. |
+| `ZAGWARE_PLATFORM_TOKEN` | _(unset)_ | GTP API token (`gtp_...`). Create one at **Settings → API Tokens** in the platform dashboard. |
 
 ### Severity threshold
 
