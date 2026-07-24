@@ -8,7 +8,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     python3 \
-    tar \
     && rm -rf /var/lib/apt/lists/*
 
 # Silence git ownership warnings inside containers
@@ -37,23 +36,21 @@ RUN git clone \
     && git -C /opt/iac-rules sparse-checkout set assets/queries assets/libraries \
     && echo "Loaded $(ls /opt/iac-rules/assets/queries | wc -l | tr -d ' ') query platforms"
 
-# ── Syft (SBOM generator) ────────────────────────────────────────────────────
+# ── Syft (SBOM generator) — install via .deb for reliable redirect handling ───
 ARG SYFT_VERSION=1.19.0
-RUN curl -fsSL \
-    "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
-    -o /tmp/syft.tar.gz \
-    && tar -xzf /tmp/syft.tar.gz -C /usr/local/bin syft \
-    && chmod +x /usr/local/bin/syft \
-    && rm /tmp/syft.tar.gz
+RUN curl -fL \
+    "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.deb" \
+    -o /tmp/syft.deb \
+    && dpkg -i /tmp/syft.deb \
+    && rm /tmp/syft.deb
 
-# ── Grype (vulnerability scanner) ────────────────────────────────────────────
+# ── Grype (vulnerability scanner) — install via .deb ─────────────────────────
 ARG GRYPE_VERSION=0.112.0
-RUN curl -fsSL \
-    "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.tar.gz" \
-    -o /tmp/grype.tar.gz \
-    && tar -xzf /tmp/grype.tar.gz -C /usr/local/bin grype \
-    && chmod +x /usr/local/bin/grype \
-    && rm /tmp/grype.tar.gz
+RUN curl -fL \
+    "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.deb" \
+    -o /tmp/grype.deb \
+    && dpkg -i /tmp/grype.deb \
+    && rm /tmp/grype.deb
 
 # ── Zagware IaC Scanner entrypoint ────────────────────────────────────────────
 COPY src/scanner.py /usr/local/bin/zagware-scan
