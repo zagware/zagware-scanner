@@ -1,5 +1,5 @@
-# Builds and pushes the Zagware IaC Scanner Docker image on every version tag.
-# Push a tag like v1.2.3 to trigger a release.
+# Builds and pushes the Zagware Scanner Docker image on every version tag.
+# Push a tag like v2.0.0 to trigger a release.
 
 name: Publish Docker image
 
@@ -18,15 +18,19 @@ jobs:
   build-and-push:
     name: Build & push
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Log in to DockerHub
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Resolve image tag
         id: tag
@@ -34,17 +38,16 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           else
-            # Strip leading 'v' from the git tag
             echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
+      - name: Build and push to GHCR
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            davymcaleer99/zagware-iac-scan:${{ steps.tag.outputs.value }}
-            davymcaleer99/zagware-iac-scan:latest
+            ghcr.io/zagware/iac-scanner:${{ steps.tag.outputs.value }}
+            ghcr.io/zagware/iac-scanner:latest
           build-args: |
             KICS_VERSION=2.1.20

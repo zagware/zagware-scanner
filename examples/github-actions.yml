@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Zagware IaC Scanner
-        uses: docker://davymcaleer99/zagware-iac-scan:latest
+        uses: docker://ghcr.io/zagware/iac-scanner:latest
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER:    ${{ github.event.pull_request.number }}
