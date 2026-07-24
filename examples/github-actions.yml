@@ -1,37 +1,40 @@
-# Zagware IaC Scanner — GitHub Actions
-# ─────────────────────────────────────
+# Zagware Security Scanner — GitHub Actions
+# ──────────────────────────────────────────
 # Add this file to .github/workflows/ in your repository.
 # No other files are required.
 #
+# Secrets required in your repo:
+#   ZAGWARE_PLATFORM_URL    e.g. https://app.zagware.io
+#   ZAGWARE_PLATFORM_TOKEN  your API token from Settings → API Tokens
+#
 # Optional environment variables (add under env: in the step):
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
-#   ZAGWARE_FAIL_ON_NEW     Set to "true" to fail the job when new findings exist
-#   ZAGWARE_PLATFORM_URL    Zagware GTP platform URL (optional — uploads are skipped if not set)
-#   ZAGWARE_PLATFORM_TOKEN  API token for the platform (optional — uploads are skipped if not set)
+#   ZAGWARE_FAIL_ON_NEW     "true" to fail the job on any new finding
+#   ZAGWARE_MIN_SEVERITY    Minimum severity to report: CRITICAL|HIGH|MEDIUM|LOW
+#   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
 
-name: Zagware IaC Scanner
+name: Zagware Security Scanner
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
 concurrency:
-  group: zagware-iac-${{ github.ref }}
+  group: zagware-scanner-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  pull-requests: write   # required to post the comment
+  pull-requests: write   # required to post the PR comment
 
 jobs:
-  iac-scan:
-    name: IaC security scan
+  security-scan:
+    name: IaC + SCA security scan
     runs-on: ubuntu-latest
     steps:
-      - name: Zagware IaC Scanner
-        uses: docker://ghcr.io/zagware/iac-scanner:latest
+      - name: Zagware Security Scanner
+        uses: docker://zagware/zagware-scanner:latest
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-          PR_NUMBER:    ${{ github.event.pull_request.number }}
-
+          GITHUB_TOKEN:           ${{ github.token }}
+          PR_NUMBER:              ${{ github.event.pull_request.number }}
           ZAGWARE_PLATFORM_URL:   ${{ secrets.ZAGWARE_PLATFORM_URL }}
           ZAGWARE_PLATFORM_TOKEN: ${{ secrets.ZAGWARE_PLATFORM_TOKEN }}
