@@ -36,6 +36,16 @@ RUN git clone \
     && git -C /opt/iac-rules sparse-checkout set assets/queries assets/libraries \
     && echo "Loaded $(ls /opt/iac-rules/assets/queries | wc -l | tr -d ' ') query platforms"
 
+# ── Syft (SBOM generator) ────────────────────────────────────────────────────
+ARG SYFT_VERSION=v1.19.0
+RUN curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+    | sh -s -- -b /usr/local/bin "${SYFT_VERSION}"
+
+# ── Grype (vulnerability scanner) ────────────────────────────────────────────
+ARG GRYPE_VERSION=v0.112.0
+RUN curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+    | sh -s -- -b /usr/local/bin "${GRYPE_VERSION}"
+
 # ── Zagware IaC Scanner entrypoint ────────────────────────────────────────────
 COPY src/scanner.py /usr/local/bin/zagware-scan
 RUN chmod +x /usr/local/bin/zagware-scan

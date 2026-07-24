@@ -30,6 +30,7 @@ import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
+import hashlib
 
 # ── Internal constants ─────────────────────────────────────────────────────────
 
@@ -47,6 +48,20 @@ _SEVERITY_EMOJI = {
     "CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡",
     "LOW":      "🔵", "INFO": "⚪", "TRACE":   "⚫",
 }
+
+# ── SCA (Grype) constants ──────────────────────────────────────────────────────
+_SCA_ENABLED      = os.environ.get("ZAGWARE_SCA_ENABLED", "true").lower() != "false"
+_GRYPE_BIN        = os.environ.get("_ZAGWARE_GRYPE_BIN",  "/usr/local/bin/grype")
+_SYFT_BIN         = os.environ.get("_ZAGWARE_SYFT_BIN",   "/usr/local/bin/syft")
+_SCA_SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NEGLIGIBLE"]
+_SCA_SEVERITY_EMOJI = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "NEGLIGIBLE": "⚪"}
+_SCA_MANIFESTS = [
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "go.sum", "Cargo.lock",
+    "requirements.txt", "Pipfile.lock", "poetry.lock",
+    "Gemfile.lock", "pom.xml", "build.gradle",
+    "composer.lock", "packages.lock.json",
+]
 
 def _severities_below() -> list[str]:
     """Return severities to pass to --exclude-severities based on ZAGWARE_MIN_SEVERITY.
@@ -632,6 +647,123 @@ def count_findings(queries: list[dict]) -> int:
     return sum(len(q.get("files", [])) for q in queries)
 
 
+# ── SCA (Grype) ────────────────────────────────────────────────────────────────
+
+def _sca_sim_id(vuln_id: str, pkg_name: str, pkg_version: str) -> str:
+    return hashlib.sha256(f"{vuln_id}:{pkg_name}:{pkg_version}".encode()).hexdigest()
+
+
+def _has_sca_manifests(path: str) -> bool:
+    p = Path(path)
+    for m in _SCA_MANIFESTS:
+        if next(p.rglob(m), None):
+            return True
+    return False
+
+
+def _run_syft(path: str, sbom_out: str) -> bool:
+    try:
+        r = subprocess.run(
+            [_SYFT_BIN, "scan", f"dir:{path}", "-o", f"syft-json={sbom_out}", "--quiet"],
+            capture_output=True, text=True, timeout=180,
+        )
+        return r.returncode == 0 and Path(sbom_out).exists()
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log.debug("Syft unavailable: %s", e)
+        return False
+
+
+def _run_grype(sbom_path: str, grype_out: str) -> bool:
+    try:
+        r = subprocess.run(
+            [_GRYPE_BIN, f"sbom:{sbom_path}", "-o", "json", "--quiet"],
+            capture_output=True, text=True, timeout=180,
+        )
+        if r.returncode == 0 and r.stdout:
+            Path(grype_out).write_text(r.stdout)
+            return True
+        return False
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log.debug("Grype unavailable: %s", e)
+        return False
+
+
+def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict]:
+    """Run Syft+Grype SCA scan. Returns list of normalised finding dicts."""
+    if not _SCA_ENABLED:
+        return []
+    if not _has_sca_manifests(path):
+        log.debug("SCA: no manifest files in %s — skipping", label)
+        return []
+    sbom_out  = f"{tmp_dir}/sbom_{label}.json"
+    grype_out = f"{tmp_dir}/grype_{label}.json"
+    log.info("SCA: running Syft on %s...", label)
+    if not _run_syft(path, sbom_out):
+        log.warning("SCA: Syft failed for %s", label)
+        return []
+    log.info("SCA: running Grype on %s...", label)
+    if not _run_grype(sbom_out, grype_out):
+        log.warning("SCA: Grype failed for %s", label)
+        return []
+    try:
+        data = json.loads(Path(grype_out).read_text())
+    except Exception as e:
+        log.warning("SCA: could not read Grype output: %s", e)
+        return []
+    findings: list[dict] = []
+    for match in data.get("matches", []):
+        vuln     = match.get("vulnerability", {})
+        artifact = match.get("artifact", {})
+        vuln_id  = vuln.get("id", "")
+        pkg_name = artifact.get("name", "")
+        pkg_ver  = artifact.get("version", "")
+        if not vuln_id or not pkg_name:
+            continue
+        cvss = None
+        for c in vuln.get("cvss", []):
+            b = c.get("metrics", {}).get("baseScore") or c.get("metrics", {}).get("base_score")
+            if b is not None:
+                cvss = float(b); break
+        epss_list = vuln.get("epss", [])
+        epss = float(epss_list[0]["epss"]) if epss_list else None
+        fix  = vuln.get("fix", {})
+        locs = artifact.get("locations", [])
+        mdet = match.get("matchDetails", [])
+        urls = list(vuln.get("urls") or [])
+        for adv in vuln.get("advisories") or []:
+            u = adv.get("url") or adv.get("link") or ""
+            if u and u not in urls:
+                urls.append(u)
+        findings.append({
+            "vulnerability_id": vuln_id,
+            "data_source":      vuln.get("dataSource") or "",
+            "namespace":        vuln.get("namespace")  or "",
+            "severity":         (vuln.get("severity") or "UNKNOWN").upper(),
+            "cvss_score":       cvss,
+            "epss_score":       epss,
+            "kev_listed":       vuln.get("kev") is not None,
+            "risk_score":       vuln.get("riskScore"),
+            "description":      vuln.get("description") or "",
+            "vuln_urls":        urls,
+            "fix_versions":     fix.get("versions") or [],
+            "fix_state":        fix.get("state") or "unknown",
+            "package_name":     pkg_name,
+            "package_version":  pkg_ver,
+            "package_type":     artifact.get("type")     or "",
+            "package_language": artifact.get("language") or "",
+            "package_purl":     artifact.get("purl")     or "",
+            "file_path":        locs[0].get("path", "") if locs else "",
+            "match_type":       mdet[0].get("type", "")  if mdet else "",
+            "similarity_id":    _sca_sim_id(vuln_id, pkg_name, pkg_ver),
+        })
+    log.info("SCA %s: %d finding(s)", label, len(findings))
+    return findings
+
+
+def new_sca_findings(base: list[dict], head: list[dict]) -> list[dict]:
+    base_sims = {f["similarity_id"] for f in base}
+    return [f for f in head if f["similarity_id"] not in base_sims]
+
 # ── Comment rendering ──────────────────────────────────────────────────────────
 
 def _cell(text: str, limit: int = 80) -> str:
@@ -753,6 +885,61 @@ def render_comment(
 
 
 
+def render_sca_section(
+    base_sca: list[dict], head_sca: list[dict], novel_sca: list[dict],
+) -> str:
+    """Return the SCA block to append to the PR comment. Empty string if no SCA data."""
+    if not head_sca and not base_sca:
+        return ""
+    by_sev: dict[str, list[dict]] = {}
+    for f in novel_sca:
+        by_sev.setdefault(f.get("severity", "UNKNOWN"), []).append(f)
+    L = [
+        "", "---", "## 📦 Zagware SCA — Dependency Vulnerabilities", "",
+        "| | Base | This PR | New |",
+        "|---|:---:|:---:|:---:|",
+        f"| Vulnerabilities | {len(base_sca)} | {len(head_sca)} | **{len(novel_sca)}** |",
+        "",
+    ]
+    if not novel_sca:
+        L.append("✅ **No new dependency vulnerabilities introduced by this PR.**")
+    else:
+        summary = " &nbsp;·&nbsp; ".join(
+            f"{_SCA_SEVERITY_EMOJI.get(s, '❓')} **{len(by_sev[s])}** {s}"
+            for s in _SCA_SEVERITY_ORDER if s in by_sev
+        )
+        L += [
+            f"> ⚠️ **{len(novel_sca)} new vulnerability(ies) introduced by this PR**",
+            f"> {summary}", "",
+        ]
+        for sev in _SCA_SEVERITY_ORDER:
+            findings = by_sev.get(sev, [])
+            if not findings:
+                continue
+            emoji = _SCA_SEVERITY_EMOJI.get(sev, "❓")
+            L += [
+                "<details>",
+                f"<summary>{emoji} <strong>{sev}</strong> — {len(findings)} finding(s)</summary>",
+                "",
+                "| CVE / Advisory | Package | Installed | Fix | CVSS | KEV |",
+                "|---|---|:---:|:---:|:---:|:---:|",
+            ]
+            for f in sorted(findings, key=lambda x: -(x.get("cvss_score") or 0)):
+                vuln_url = f["vuln_urls"][0] if f.get("vuln_urls") else ""
+                cve_cell = (f"[{f['vulnerability_id']}]({vuln_url})"
+                            if vuln_url else f["vulnerability_id"])
+                fix = ", ".join(f["fix_versions"]) or f["fix_state"]
+                cvss = f"{f['cvss_score']:.1f}" if f.get("cvss_score") else "—"
+                kev  = "🔴 Yes" if f.get("kev_listed") else "No"
+                pkg  = f"{f['package_name']} ({f['package_type']})"
+                L.append(
+                    f"| {cve_cell} | `{pkg}` | `{f['package_version']}` "
+                    f"| `{fix}` | {cvss} | {kev} |"
+                )
+            L += ["", "</details>", ""]
+    return "\n".join(L)
+
+
 # ── Platform upload ────────────────────────────────────────────────────────────
 
 def upload_to_platform(
@@ -819,6 +1006,42 @@ def upload_to_platform(
     except Exception as e:
         print(f'[zagware] Warning: failed to upload scan results to platform: {e}',
               file=sys.stderr)
+
+def upload_sca_to_platform(
+    platform_url: str, platform_token: str,
+    repo: str, base_branch: str, head_branch: str,
+    pr_number: int | None,
+    base_findings: list[dict], head_findings: list[dict],
+) -> None:
+    """Upload SCA results to the GTP platform. Non-fatal if this fails."""
+    try:
+        headers = {
+            'Authorization': f'Bearer {platform_token}',
+            'Content-Type': 'application/json',
+        }
+
+        def _post(payload: dict) -> dict:
+            data = json.dumps(payload).encode('utf-8')
+            req  = urllib.request.Request(
+                f'{platform_url}/api/v1/sca/upload',
+                data=data, headers=headers, method='POST',
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+
+        base_resp    = _post({'repo': repo, 'branch': base_branch,
+                              'scan_type': 'pr_base' if pr_number else 'branch',
+                              'pr_number': pr_number, 'pr_comparison_id': None,
+                              'scanner_name': 'grype', 'findings': base_findings})
+        base_scan_id = base_resp.get('scan_id')
+        if pr_number and base_scan_id:
+            _post({'repo': repo, 'branch': head_branch,
+                   'scan_type': 'pr_head', 'pr_number': pr_number,
+                   'pr_comparison_id': base_scan_id,
+                   'scanner_name': 'grype', 'findings': head_findings})
+        log.info('SCA results uploaded to platform (base: %s)', base_scan_id)
+    except Exception as e:
+        log.warning('Failed to upload SCA results to platform: %s', e)
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -907,6 +1130,21 @@ def main() -> int:
                 pr_results,
             )
 
+        # ── SCA ─────────────────────────────────────────────────────────────
+        base_sca  = run_sca_scan(base_dir, tmp, "base")
+        head_sca  = run_sca_scan(pr_dir,  tmp, "pr")
+        novel_sca = new_sca_findings(base_sca, head_sca)
+        log.info("SCA new: %d finding(s)", len(novel_sca))
+
+        if _platform_url and _platform_token and (base_sca or head_sca):
+            upload_sca_to_platform(
+                _platform_url, _platform_token,
+                platform.repo(),
+                base_branch, head_branch,
+                platform.pr_number(),
+                base_sca, head_sca,
+            )
+
         # ── Diff ─────────────────────────────────────────────────────────────
 
         novel     = new_findings(base_results, pr_results)
@@ -921,6 +1159,7 @@ def main() -> int:
             platform.head_label(),
             collapsible=platform.supports_html_details(),
         )
+        comment += render_sca_section(base_sca, head_sca, novel_sca)
 
         # ── Post ─────────────────────────────────────────────────────────────
 

@@ -6,6 +6,8 @@
 # Optional environment variables (add under env: in the step):
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
 #   ZAGWARE_FAIL_ON_NEW     Set to "true" to fail the job when new findings exist
+#   ZAGWARE_PLATFORM_URL    Zagware GTP platform URL (optional — uploads are skipped if not set)
+#   ZAGWARE_PLATFORM_TOKEN  API token for the platform (optional — uploads are skipped if not set)
 
 name: Zagware IaC Scanner
 
@@ -30,3 +32,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER:    ${{ github.event.pull_request.number }}
+
+          ZAGWARE_PLATFORM_URL:   ${{ secrets.ZAGWARE_PLATFORM_URL }}
+          ZAGWARE_PLATFORM_TOKEN: ${{ secrets.ZAGWARE_PLATFORM_TOKEN }}
