@@ -548,6 +548,32 @@ class AzureDevOps(Platform):
 _PLATFORMS: list[Platform] = [GitHub(), GitLab(), Bitbucket(), AzureDevOps()]
 
 
+def _repo_base_url() -> str:
+    """Best-effort: compute the web URL of this repo from CI env vars."""
+    # GitHub Actions
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
+        server = os.environ.get('GITHUB_SERVER_URL', 'https://github.com').rstrip('/')
+        repo   = os.environ.get('GITHUB_REPOSITORY', '')
+        return f'{server}/{repo}' if repo else ''
+    # GitLab CI
+    if os.environ.get('GITLAB_CI') == 'true':
+        server = os.environ.get('CI_SERVER_URL', 'https://gitlab.com').rstrip('/')
+        path   = os.environ.get('CI_PROJECT_PATH', '')
+        return f'{server}/{path}' if path else ''
+    # Bitbucket Pipelines
+    if os.environ.get('BITBUCKET_BUILD_NUMBER'):
+        ws   = os.environ.get('BITBUCKET_WORKSPACE', '')
+        slug = os.environ.get('BITBUCKET_REPO_SLUG', '')
+        return f'https://bitbucket.org/{ws}/{slug}' if ws and slug else ''
+    # Azure DevOps
+    if os.environ.get('TF_BUILD') == 'True':
+        collection = os.environ.get('SYSTEM_TEAMFOUNDATIONCOLLECTIONURI', '').rstrip('/')
+        project    = os.environ.get('SYSTEM_TEAMPROJECT', '')
+        repo_name  = os.environ.get('BUILD_REPOSITORY_NAME', '')
+        return f'{collection}/{project}/_git/{repo_name}' if all([collection, project, repo_name]) else ''
+    return ''
+
+
 # ── Git helpers ────────────────────────────────────────────────────────────────
 
 def _git(args: list[str], cwd: str | None = None) -> None:
@@ -982,6 +1008,7 @@ def upload_to_platform(
             'pr_comparison_id': None,
             'scanner_version': 'unknown',
             'results': base_results,
+            'repo_base_url': _repo_base_url() or None,
         }
         base_resp    = post(base_payload)
         base_scan_id = base_resp.get('scan_id')
@@ -997,6 +1024,7 @@ def upload_to_platform(
                 'pr_comparison_id': base_scan_id,
                 'scanner_version': 'unknown',
                 'results': head_results,
+                'repo_base_url': _repo_base_url() or None,
             }
             post(head_payload)
 
@@ -1032,13 +1060,15 @@ def upload_sca_to_platform(
         base_resp    = _post({'repo': repo, 'branch': base_branch,
                               'scan_type': 'pr_base' if pr_number else 'branch',
                               'pr_number': pr_number, 'pr_comparison_id': None,
-                              'scanner_name': 'grype', 'findings': base_findings})
+                              'scanner_name': 'grype', 'findings': base_findings,
+                              'repo_base_url': _repo_base_url() or None})
         base_scan_id = base_resp.get('scan_id')
         if pr_number and base_scan_id:
             _post({'repo': repo, 'branch': head_branch,
                    'scan_type': 'pr_head', 'pr_number': pr_number,
                    'pr_comparison_id': base_scan_id,
-                   'scanner_name': 'grype', 'findings': head_findings})
+                   'scanner_name': 'grype', 'findings': head_findings,
+                   'repo_base_url': _repo_base_url() or None})
         log.info('SCA results uploaded to platform (base: %s)', base_scan_id)
     except Exception as e:
         log.warning('Failed to upload SCA results to platform: %s', e)
