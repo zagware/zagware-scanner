@@ -36,18 +36,20 @@ RUN git clone \
     && git -C /opt/iac-rules sparse-checkout set assets/queries assets/libraries \
     && echo "Loaded $(ls /opt/iac-rules/assets/queries | wc -l | tr -d ' ') query platforms"
 
-# ── Syft (SBOM generator) — install via .deb for reliable redirect handling ───
-ARG SYFT_VERSION=1.19.0
-RUN curl -fL \
-    "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.deb" \
+# ── Syft (SBOM generator) ────────────────────────────────────────────────────
+ARG SYFT_VERSION=v1.19.0
+RUN SYFT_VER="${SYFT_VERSION#v}" && \
+    curl -fL \
+    "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_linux_amd64.deb" \
     -o /tmp/syft.deb \
     && dpkg -i /tmp/syft.deb \
     && rm /tmp/syft.deb
 
-# ── Grype (vulnerability scanner) — install via .deb ─────────────────────────
-ARG GRYPE_VERSION=0.112.0
-RUN curl -fL \
-    "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.deb" \
+# ── Grype (vulnerability scanner) ────────────────────────────────────────────
+ARG GRYPE_VERSION=v0.112.0
+RUN GRYPE_VER="${GRYPE_VERSION#v}" && \
+    curl -fL \
+    "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_linux_amd64.deb" \
     -o /tmp/grype.deb \
     && dpkg -i /tmp/grype.deb \
     && rm /tmp/grype.deb
