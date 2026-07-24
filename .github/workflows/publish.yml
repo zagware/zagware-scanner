@@ -1,5 +1,5 @@
-# Builds and pushes zagware/zagware-scanner to DockerHub on every version tag.
-# Requires secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+# Builds and pushes davymcaleer99/zagware-scanner to DockerHub on every version tag.
+# Requires secrets: DOCKERHUB_USERNAME (davymcaleer99), DOCKERHUB_TOKEN
 # To release: git tag v2.0.1 && git push origin v2.0.1
 
 name: Publish zagware-scanner
@@ -17,7 +17,7 @@ on:
 
 jobs:
   build-and-push:
-    name: Build & push zagware/zagware-scanner
+    name: Build & push davymcaleer99/zagware-scanner
     runs-on: ubuntu-latest
 
     steps:
@@ -44,8 +44,8 @@ jobs:
           context: .
           push: true
           tags: |
-            zagware/zagware-scanner:${{ steps.tag.outputs.value }}
-            zagware/zagware-scanner:latest
+            davymcaleer99/zagware-scanner:${{ steps.tag.outputs.value }}
+            davymcaleer99/zagware-scanner:latest
           build-args: |
             KICS_VERSION=2.1.20
             SYFT_VERSION=v1.19.0

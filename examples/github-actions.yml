@@ -3,14 +3,15 @@
 # Add this file to .github/workflows/ in your repository.
 # No other files are required.
 #
-# Secrets required in your repo:
+# Optional: set these secrets to upload results to the Zagware platform.
+# The scanner works standalone (PR comments only) without them.
 #   ZAGWARE_PLATFORM_URL    e.g. https://app.zagware.io
 #   ZAGWARE_PLATFORM_TOKEN  your API token from Settings → API Tokens
 #
-# Optional environment variables (add under env: in the step):
+# Optional env vars:
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
 #   ZAGWARE_FAIL_ON_NEW     "true" to fail the job on any new finding
-#   ZAGWARE_MIN_SEVERITY    Minimum severity to report: CRITICAL|HIGH|MEDIUM|LOW
+#   ZAGWARE_MIN_SEVERITY    Minimum severity: CRITICAL|HIGH|MEDIUM|LOW
 #   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
 
 name: Zagware Security Scanner
@@ -32,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Zagware Security Scanner
-        uses: docker://zagware/zagware-scanner:latest
+        uses: docker://davymcaleer99/zagware-scanner:latest
         env:
           GITHUB_TOKEN:           ${{ github.token }}
           PR_NUMBER:              ${{ github.event.pull_request.number }}
