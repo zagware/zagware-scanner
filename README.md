@@ -268,10 +268,10 @@ Both approaches mean:
 
 ```yaml
 # GitHub Actions — pin by version tag
-uses: docker://davymcaleer99/zagware-scanner:2.0.0
+uses: docker://davymcaleer99/zagware-scanner:2.0.4
 
 # GitLab CI / Bitbucket
-image: davymcaleer99/zagware-scanner:2.0.0
+image: davymcaleer99/zagware-scanner:2.0.4
 ```
 
 ---
