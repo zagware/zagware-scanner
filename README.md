@@ -1,7 +1,7 @@
 # Zagware Scanner
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/Docker-ghcr.io%2Fzagware%2Fzagware--scanner-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/davymcaleer99/zagware-scanner)
+[![Docker](https://img.shields.io/badge/Docker-ghcr.io%2Fzagware%2Fzagware--scanner-2496ED?logo=docker&logoColor=white)](https://github.com/zagware/zagware-scanner/pkgs/container/zagware-scanner)
 [![Platforms](https://img.shields.io/badge/CI-GitHub%20%7C%20GitLab%20%7C%20Bitbucket%20%7C%20Azure%20DevOps-555)](https://github.com/zagware/zagware-scanner)
 
 **Catch security issues before they reach your main branch.**
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Zagware Security Scanner
-        uses: docker://davymcaleer99/zagware-scanner:latest
+        uses: docker://ghcr.io/zagware/zagware-scanner:latest
         env:
           GITHUB_TOKEN:           ${{ github.token }}
           PR_NUMBER:              ${{ github.event.pull_request.number }}
@@ -82,7 +82,7 @@ Add to `.gitlab-ci.yml`:
 
 ```yaml
 zagware-scanner:
-  image: davymcaleer99/zagware-scanner:latest
+  image: ghcr.io/zagware/zagware-scanner:latest
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   variables:
@@ -116,7 +116,7 @@ pipelines:
     '**':
       - step:
           name: Zagware Security Scanner
-          image: davymcaleer99/zagware-scanner:latest
+          image: ghcr.io/zagware/zagware-scanner:latest
           script:
             - zagware-scan
 ```
@@ -153,7 +153,7 @@ steps:
         -e TF_BUILD \
         -e ZAGWARE_PLATFORM_URL=https://app.zagware.io \
         -e ZAGWARE_PLATFORM_TOKEN=$(ZAGWARE_PLATFORM_TOKEN) \
-        davymcaleer99/zagware-scanner:latest
+        ghcr.io/zagware/zagware-scanner:latest
     displayName: Zagware Security Scanner
     env:
       SYSTEM_ACCESSTOKEN: $(System.AccessToken)
@@ -270,13 +270,13 @@ Pin by tag for reproducibility. Pin by digest for the strongest guarantee:
 
 ```yaml
 # GitHub Actions — pin by version tag
-uses: docker://davymcaleer99/zagware-scanner:2.0.5
+uses: docker://ghcr.io/zagware/zagware-scanner:2.0.5
 
 # GitLab CI / Bitbucket — pin by tag
-image: davymcaleer99/zagware-scanner:2.0.5
+image: ghcr.io/zagware/zagware-scanner:2.0.5
 
 # Pin by digest (strongest — immune to tag mutation)
-uses: docker://davymcaleer99/zagware-scanner@sha256:<digest>
+uses: docker://ghcr.io/zagware/zagware-scanner@sha256:<digest>
 ```
 
 Digests are in the [releases](https://github.com/zagware/zagware-scanner/releases) notes
@@ -286,7 +286,7 @@ and in the build summary of each [publish workflow run](https://github.com/zagwa
 
 ## Supply chain security
 
-Every release of `davymcaleer99/zagware-scanner` is built with a verifiable supply chain:
+Every release of `ghcr.io/zagware/zagware-scanner` is built with a verifiable supply chain:
 
 ### What we do
 
@@ -318,16 +318,16 @@ Our mitigations:
 
 ```bash
 # Verify the image signature
-cosign verify davymcaleer99/zagware-scanner:latest \
+cosign verify ghcr.io/zagware/zagware-scanner:latest \
   --certificate-identity-regexp "https://github.com/zagware/zagware-scanner" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 # Verify the SLSA provenance
-gh attestation verify oci://davymcaleer99/zagware-scanner:latest \
+gh attestation verify oci://ghcr.io/zagware/zagware-scanner:latest \
   --repo zagware/zagware-scanner
 
 # Inspect the SBOM
-cosign download attestation davymcaleer99/zagware-scanner:latest \
+cosign download attestation ghcr.io/zagware/zagware-scanner:latest \
   | jq -r '.payload' | base64 -d | jq .predicate.components[].name
 ```
 
@@ -343,7 +343,7 @@ docker push your-registry/zagware-scanner:latest
 ```
 
 Then substitute `your-registry/zagware-scanner:latest` wherever this documentation references
-`davymcaleer99/zagware-scanner:latest`.
+`ghcr.io/zagware/zagware-scanner:latest`.
 
 The image requires internet access at build time to download KICS, Syft, and Grype from their
 public GitHub releases. At scan time, it only needs access to clone your repository and post

@@ -1,18 +1,22 @@
 # Zagware Security Scanner — GitHub Actions
 # ──────────────────────────────────────────
-# Add this file to .github/workflows/ in your repository.
-# No other files are required.
+# Add this file to .github/workflows/ in your repository. No other files needed.
 #
-# Optional: set these secrets to upload results to the Zagware platform.
-# The scanner works standalone (PR comments only) without them.
-#   ZAGWARE_PLATFORM_URL    e.g. https://app.zagware.io
-#   ZAGWARE_PLATFORM_TOKEN  your API token from Settings → API Tokens
+# Secrets required:
+#   ZAGWARE_PLATFORM_URL    https://app.zagware.io
+#   ZAGWARE_PLATFORM_TOKEN  API token from Settings → API Tokens
 #
-# Optional env vars:
+# Optional env vars (add under env: in the step):
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
 #   ZAGWARE_FAIL_ON_NEW     "true" to fail the job on any new finding
-#   ZAGWARE_MIN_SEVERITY    Minimum severity: CRITICAL|HIGH|MEDIUM|LOW
+#   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW (default: all)
 #   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
+#
+# Image: ghcr.io/zagware/zagware-scanner
+# Source: https://github.com/zagware/zagware-scanner
+# Verify: cosign verify ghcr.io/zagware/zagware-scanner:latest \
+#           --certificate-identity-regexp "https://github.com/zagware/zagware-scanner" \
+#           --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 name: Zagware Security Scanner
 
@@ -25,7 +29,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  pull-requests: write   # required to post the PR comment
+  pull-requests: write
 
 jobs:
   security-scan:
@@ -33,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Zagware Security Scanner
-        uses: docker://davymcaleer99/zagware-scanner:latest
+        uses: docker://ghcr.io/zagware/zagware-scanner:latest
         env:
           GITHUB_TOKEN:           ${{ github.token }}
           PR_NUMBER:              ${{ github.event.pull_request.number }}

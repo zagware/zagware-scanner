@@ -1,26 +1,28 @@
-# Zagware IaC Scanner — Bitbucket Pipelines
-# ──────────────────────────────────────────
-# Add or merge this into your bitbucket-pipelines.yml.
+# Zagware Security Scanner — Bitbucket Pipelines
+# ─────────────────────────────────────────────────
+# Add or merge into your bitbucket-pipelines.yml.
 #
-# Prerequisites:
-#   1. Create a Repository Access Token (or app password) with pull request
-#      read/write scope at Repository settings → Access tokens.
-#   2. Add it as a repository variable named BITBUCKET_TOKEN
-#      at Repository settings → Pipelines → Repository variables.
-#
-# All other required variables (BITBUCKET_WORKSPACE, BITBUCKET_REPO_SLUG,
-# BITBUCKET_PR_ID, BITBUCKET_PR_DESTINATION_BRANCH, BITBUCKET_BRANCH,
-# BITBUCKET_COMMIT) are auto-injected by Bitbucket.
+# One-time setup — repository variables (Settings → Pipelines → Repository variables):
+#   BITBUCKET_API_TOKEN   Atlassian API token with Bitbucket repo + PR read/write scopes
+#                         Create at: https://id.atlassian.com/manage-profile/security/api-tokens
+#   ATLASSIAN_EMAIL       Your Atlassian account email
+#   ZAGWARE_PLATFORM_URL  https://app.zagware.io
+#   ZAGWARE_PLATFORM_TOKEN  API token from Settings → API Tokens
 #
 # Optional repository variables:
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
-#   ZAGWARE_FAIL_ON_NEW     Set to "true" to fail the step when new findings exist
+#   ZAGWARE_FAIL_ON_NEW     "true" to fail on any new finding
+#   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW (default: all)
+#   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
+#
+# Image: ghcr.io/zagware/zagware-scanner
+# Source: https://github.com/zagware/zagware-scanner
 
 pipelines:
   pull-requests:
     '**':
       - step:
-          name: Zagware IaC Scanner
-          image: davymcaleer99/zagware-iac-scan:latest
+          name: Zagware Security Scanner (IaC + SCA)
+          image: ghcr.io/zagware/zagware-scanner:latest
           script:
-            - /usr/local/bin/zagware-scan
+            - zagware-scan

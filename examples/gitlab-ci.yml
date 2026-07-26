@@ -1,5 +1,5 @@
-# Zagware IaC Scanner — GitLab CI
-# ─────────────────────────────────
+# Zagware Security Scanner — GitLab CI
+# ─────────────────────────────────────
 # Merge into your existing .gitlab-ci.yml, or use as a standalone file.
 #
 # One-time setup:
@@ -7,22 +7,25 @@
 #   Create a project or group access token with 'api' scope and add it as a
 #   CI/CD variable named GITLAB_TOKEN:
 #     Settings → CI/CD → Variables → Add variable
-#     Key: GITLAB_TOKEN  |  Value: <your token>  |  Mask: ✅  |  Protect: optional
-#
-# All other required variables (CI_JOB_TOKEN, CI_PROJECT_PATH, CI_PROJECT_ID,
-# CI_MERGE_REQUEST_IID, CI_MERGE_REQUEST_TARGET_BRANCH_NAME,
-# CI_MERGE_REQUEST_SOURCE_BRANCH_NAME, CI_SERVER_URL) are injected
-# automatically by GitLab for merge request pipelines.
+#     Key: GITLAB_TOKEN  |  Value: <your token>  |  Mask: ✅
 #
 # Optional variables (set in Settings → CI/CD → Variables):
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
-#   ZAGWARE_FAIL_ON_NEW     Set to "true" to fail the job when new findings exist
+#   ZAGWARE_FAIL_ON_NEW     "true" to fail the job when new findings exist
+#   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW (default: all)
+#   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
+#
+# Image: ghcr.io/zagware/zagware-scanner
+# Source: https://github.com/zagware/zagware-scanner
 
-zagware-iac-scan:
+zagware-scanner:
   stage: test
-  image: davymcaleer99/zagware-iac-scan:latest
+  image: ghcr.io/zagware/zagware-scanner:latest
+  variables:
+    ZAGWARE_PLATFORM_URL:   $ZAGWARE_PLATFORM_URL
+    ZAGWARE_PLATFORM_TOKEN: $ZAGWARE_PLATFORM_TOKEN
   script:
-    - /usr/local/bin/zagware-scan
+    - zagware-scan
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   allow_failure: true   # remove to gate merges on the scan result

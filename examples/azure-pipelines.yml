@@ -1,47 +1,53 @@
-# Zagware IaC Scanner — Azure DevOps Pipelines
-# ──────────────────────────────────────────────
-# Add or merge this into your azure-pipelines.yml.
+# Zagware Security Scanner — Azure DevOps
+# ──────────────────────────────────────────
+# Add to your azure-pipelines.yml.
 #
-# Prerequisites:
-#   1. In your pipeline, enable "Allow scripts to access the OAuth token"
-#      (Pipeline → Edit → Triggers → YAML → Additional options) so that
-#      $(System.AccessToken) has pull request comment write permission.
-#   2. Ensure the build service identity has "Contribute to pull requests"
-#      permission on the repository.
+# One-time setup:
+# 1. Enable "Allow scripts to access the OAuth token":
+#    Pipeline → Edit → Triggers → YAML → Additional options
+# 2. Grant the Build Service account "Contribute to pull requests" on the repository:
+#    Project settings → Repositories → Security → Build Service
 #
-# Optional pipeline variables:
+# Pipeline variables (Pipelines → Library or inline):
+#   ZAGWARE_PLATFORM_URL    https://app.zagware.io
+#   ZAGWARE_PLATFORM_TOKEN  API token from Settings → API Tokens (mark as secret)
+#
+# Optional variables:
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
-#   ZAGWARE_FAIL_ON_NEW     Set to "true" to fail the task when new findings exist
+#   ZAGWARE_FAIL_ON_NEW     "true" to fail on any new finding
+#   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW (default: all)
+#   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
+#
+# Image: ghcr.io/zagware/zagware-scanner
+# Source: https://github.com/zagware/zagware-scanner
 
-trigger: none   # run only on pull requests
+trigger: none
 
 pr:
   branches:
     include:
       - '*'
 
-jobs:
-  - job: ZagwareIaCScan
-    displayName: IaC security scan
-    pool:
-      vmImage: ubuntu-latest
-    steps:
-      - script: |
-          docker run --rm \
-            -e SYSTEM_ACCESSTOKEN \
-            -e SYSTEM_TEAMFOUNDATIONCOLLECTIONURI \
-            -e SYSTEM_TEAMPROJECT \
-            -e BUILD_REPOSITORY_ID \
-            -e BUILD_REPOSITORY_URI \
-            -e BUILD_SOURCEVERSION \
-            -e SYSTEM_PULLREQUEST_TARGETBRANCH \
-            -e SYSTEM_PULLREQUEST_SOURCEBRANCH \
-            -e SYSTEM_PULLREQUEST_PULLREQUESTID \
-            -e TF_BUILD \
-            -e ZAGWARE_EXCLUDE_PATHS \
-            -e ZAGWARE_FAIL_ON_NEW \
-            davymcaleer99/zagware-iac-scan:latest
-        displayName: Zagware IaC Scanner
-        env:
-          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-        continueOnError: true   # remove to gate merges on the scan result
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - script: |
+      docker run --rm \
+        -e SYSTEM_ACCESSTOKEN \
+        -e SYSTEM_TEAMFOUNDATIONCOLLECTIONURI \
+        -e SYSTEM_TEAMPROJECT \
+        -e BUILD_REPOSITORY_ID \
+        -e BUILD_REPOSITORY_URI \
+        -e BUILD_SOURCEVERSION \
+        -e SYSTEM_PULLREQUEST_TARGETBRANCH \
+        -e SYSTEM_PULLREQUEST_SOURCEBRANCH \
+        -e SYSTEM_PULLREQUEST_PULLREQUESTID \
+        -e TF_BUILD \
+        -e ZAGWARE_PLATFORM_URL=$(ZAGWARE_PLATFORM_URL) \
+        -e ZAGWARE_PLATFORM_TOKEN=$(ZAGWARE_PLATFORM_TOKEN) \
+        ghcr.io/zagware/zagware-scanner:latest
+    displayName: Zagware Security Scanner (IaC + SCA)
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    continueOnError: true   # remove to gate PRs on the scan result
