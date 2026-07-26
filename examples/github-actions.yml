@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Zagware Security Scanner
-        uses: docker://ghcr.io/zagware/zagware-scanner:latest
+        uses: docker://ghcr.io/davymcaleer99/zagware-scanner:latest
         env:
           GITHUB_TOKEN:           ${{ github.token }}
           PR_NUMBER:              ${{ github.event.pull_request.number }}

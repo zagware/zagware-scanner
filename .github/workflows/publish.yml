@@ -1,4 +1,4 @@
-# Builds, signs, and pushes ghcr.io/zagware/zagware-scanner on every version tag.
+# Builds, signs, and pushes ghcr.io/davymcaleer99/zagware-scanner on every version tag.
 # Requires no external secrets — uses GITHUB_TOKEN throughout.
 # Produces:
 #   - Signed image via cosign (keyless, GitHub OIDC / sigstore)
@@ -6,7 +6,7 @@
 #   - SLSA provenance attestation (attached to image)
 #
 # Verify the published image:
-#   cosign verify ghcr.io/zagware/zagware-scanner:latest \
+#   cosign verify ghcr.io/davymcaleer99/zagware-scanner:latest \
 #     --certificate-identity-regexp "https://github.com/zagware/zagware-scanner" \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 #
@@ -101,7 +101,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: davymcaleer99
           password: ${{ secrets.GH_PAT_PACKAGES }}
 
       - name: Set image tag
@@ -117,7 +117,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/zagware/zagware-scanner
+          images: ghcr.io/davymcaleer99/zagware-scanner
           tags: |
             type=raw,value=${{ steps.tag.outputs.value }}
             type=raw,value=latest
@@ -147,18 +147,18 @@ jobs:
 
       # ── Sign the image with cosign (keyless via GitHub OIDC) ────────────────
       # The signature is published to the sigstore Rekor transparency log.
-      # Anyone can verify: cosign verify ghcr.io/zagware/zagware-scanner@<digest>
+      # Anyone can verify: cosign verify ghcr.io/davymcaleer99/zagware-scanner@<digest>
       - name: Sign image
         run: |
           cosign sign --yes \
-            "ghcr.io/zagware/zagware-scanner@${{ steps.build.outputs.digest }}"
+            "ghcr.io/davymcaleer99/zagware-scanner@${{ steps.build.outputs.digest }}"
           echo "✓ Image signed: ${{ steps.build.outputs.digest }}"
 
       # ── SLSA provenance via GitHub attestations (separate from Docker) ──────
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: ghcr.io/zagware/zagware-scanner
+          subject-name: ghcr.io/davymcaleer99/zagware-scanner
           subject-digest: ${{ steps.build.outputs.digest }}
 
       - name: Build summary
@@ -167,12 +167,12 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| | |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Image** | \`ghcr.io/zagware/zagware-scanner:${{ steps.tag.outputs.value }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`ghcr.io/davymcaleer99/zagware-scanner:${{ steps.tag.outputs.value }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Digest** | \`${{ steps.build.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Verify" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-          echo "cosign verify ghcr.io/zagware/zagware-scanner@${{ steps.build.outputs.digest }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "cosign verify ghcr.io/davymcaleer99/zagware-scanner@${{ steps.build.outputs.digest }} \\" >> $GITHUB_STEP_SUMMARY
           echo "  --certificate-identity-regexp 'https://github.com/zagware/zagware-scanner' \\" >> $GITHUB_STEP_SUMMARY
           echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
