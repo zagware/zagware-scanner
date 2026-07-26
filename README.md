@@ -1,7 +1,7 @@
 # Zagware Scanner
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/Docker-davymcaleer99%2Fzagware--scanner-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/davymcaleer99/zagware-scanner)
+[![Docker](https://img.shields.io/badge/Docker-ghcr.io%2Fzagware%2Fzagware--scanner-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/ghcr.io/zagware/zagware-scanner)
 [![Platforms](https://img.shields.io/badge/CI-GitHub%20%7C%20GitLab%20%7C%20Bitbucket%20%7C%20Azure%20DevOps-555)](https://github.com/zagware/zagware-scanner)
 
 **Catch security issues before they reach your main branch.**
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Zagware Security Scanner
-        uses: docker://davymcaleer99/zagware-scanner:latest
+        uses: docker://ghcr.io/zagware/zagware-scanner:latest
         env:
           GITHUB_TOKEN:           ${{ github.token }}
           PR_NUMBER:              ${{ github.event.pull_request.number }}
@@ -82,7 +82,7 @@ Add to `.gitlab-ci.yml`:
 
 ```yaml
 zagware-scanner:
-  image: davymcaleer99/zagware-scanner:latest
+  image: ghcr.io/zagware/zagware-scanner:latest
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   variables:
@@ -116,7 +116,7 @@ pipelines:
     '**':
       - step:
           name: Zagware Security Scanner
-          image: davymcaleer99/zagware-scanner:latest
+          image: ghcr.io/zagware/zagware-scanner:latest
           script:
             - zagware-scan
 ```
@@ -153,7 +153,7 @@ steps:
         -e TF_BUILD \
         -e ZAGWARE_PLATFORM_URL=https://app.zagware.io \
         -e ZAGWARE_PLATFORM_TOKEN=$(ZAGWARE_PLATFORM_TOKEN) \
-        davymcaleer99/zagware-scanner:latest
+        ghcr.io/zagware/zagware-scanner:latest
     displayName: Zagware Security Scanner
     env:
       SYSTEM_ACCESSTOKEN: $(System.AccessToken)
@@ -266,12 +266,69 @@ Both approaches mean:
 
 ## Pinning to a specific version
 
+Pin by tag for reproducibility. Pin by digest for the strongest guarantee:
+
 ```yaml
 # GitHub Actions — pin by version tag
-uses: docker://davymcaleer99/zagware-scanner:2.0.4
+uses: docker://ghcr.io/zagware/zagware-scanner:2.0.5
 
-# GitLab CI / Bitbucket
-image: davymcaleer99/zagware-scanner:2.0.4
+# GitLab CI / Bitbucket — pin by tag
+image: ghcr.io/zagware/zagware-scanner:2.0.5
+
+# Pin by digest (strongest — immune to tag mutation)
+uses: docker://ghcr.io/zagware/zagware-scanner@sha256:<digest>
+```
+
+Digests are in the [releases](https://github.com/zagware/zagware-scanner/releases) notes
+and in the build summary of each [publish workflow run](https://github.com/zagware/zagware-scanner/actions).
+
+---
+
+## Supply chain security
+
+Every release of `ghcr.io/zagware/zagware-scanner` is built with a verifiable supply chain:
+
+### What we do
+
+| Layer | How |
+|---|---|
+| **KICS binary** | SHA256 checksum verified at build time; GPG signature on `checksums.txt` verified against Checkmarx's published signing key |
+| **Syft binary** | SHA256 checksum verified at build time; cosign signature on checksums verified in CI before build |
+| **Grype binary** | SHA256 checksum verified at build time; cosign signature on checksums verified in CI before build |
+| **Our image** | Signed with cosign (keyless, GitHub OIDC → sigstore Rekor transparency log) |
+| **SBOM** | CycloneDX SBOM generated at build time and attached as an OCI attestation |
+| **Provenance** | SLSA Build Level 3 provenance attestation — links the image digest to this exact source commit and workflow run |
+
+### Why this matters (TeamPCP context)
+
+In March–April 2026, the TeamPCP campaign compromised KICS GitHub Actions (March 23),
+KICS Docker Hub images (April 22), and downstream packages using stolen tokens.
+
+Our mitigations:
+- We build from **source-controlled release tarballs on GitHub**, not Docker Hub
+- KICS 2.1.20 was published March 3, 2026 — before the compromise windows
+- Every binary is **content-addressed by SHA256 checksum** pinned in the Dockerfile.
+  A tag being moved or a release artifact being swapped will break the build with
+  a clear checksum mismatch error — not a silent supply chain compromise
+- The cosign signatures for Syft and Grype are verified in CI **before the Docker
+  build starts**, ensuring the checksums file itself was produced by a legitimate
+  GitHub Actions run in the anchore org
+
+### Verify the image you're running
+
+```bash
+# Verify the image signature
+cosign verify ghcr.io/zagware/zagware-scanner:latest \
+  --certificate-identity-regexp "https://github.com/zagware/zagware-scanner" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# Verify the SLSA provenance
+gh attestation verify oci://ghcr.io/zagware/zagware-scanner:latest \
+  --repo zagware/zagware-scanner
+
+# Inspect the SBOM
+cosign download attestation ghcr.io/zagware/zagware-scanner:latest \
+  | jq -r '.payload' | base64 -d | jq .predicate.components[].name
 ```
 
 ---
@@ -286,7 +343,7 @@ docker push your-registry/zagware-scanner:latest
 ```
 
 Then substitute `your-registry/zagware-scanner:latest` wherever this documentation references
-`davymcaleer99/zagware-scanner:latest`.
+`ghcr.io/zagware/zagware-scanner:latest`.
 
 The image requires internet access at build time to download KICS, Syft, and Grype from their
 public GitHub releases. At scan time, it only needs access to clone your repository and post

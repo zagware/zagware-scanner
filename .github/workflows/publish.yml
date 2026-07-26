@@ -1,6 +1,21 @@
-# Builds and pushes davymcaleer99/zagware-scanner to DockerHub on every version tag.
-# Requires secrets: DOCKERHUB_USERNAME (davymcaleer99), DOCKERHUB_TOKEN
-# To release: git tag v2.0.1 && git push origin v2.0.1
+# Builds, signs, and pushes ghcr.io/zagware/zagware-scanner on every version tag.
+# Requires no external secrets — uses GITHUB_TOKEN throughout.
+# Produces:
+#   - Signed image via cosign (keyless, GitHub OIDC / sigstore)
+#   - Docker SBOM attestation (CycloneDX, attached to image)
+#   - SLSA provenance attestation (attached to image)
+#
+# Verify the published image:
+#   cosign verify ghcr.io/zagware/zagware-scanner:latest \
+#     --certificate-identity-regexp "https://github.com/zagware/zagware-scanner" \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#
+# To upgrade a pinned tool version (KICS/Syft/Grype):
+#   1. Download the new release artifact
+#   2. Run: sha256sum <artifact>
+#   3. Update the ARG KICS/SYFT/GRYPE_CHECKSUM in Dockerfile
+#   4. Update the version ARG in Dockerfile and the build-args below
+#   5. Tag a new release
 
 name: Publish zagware-scanner
 
@@ -11,23 +26,79 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag (e.g. latest or 2.0.1)'
+        description: 'Image tag (e.g. latest or 2.0.5)'
         required: true
         default: 'latest'
 
 jobs:
-  build-and-push:
-    name: Build & push davymcaleer99/zagware-scanner
+  build-sign-push:
+    name: Build · Sign · Push
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # push to GHCR
+      id-token: write        # cosign keyless signing via GitHub OIDC
+      attestations: write    # SLSA provenance attestation
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Log in to DockerHub
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # ── Verify Syft and Grype release signatures before building ─────────────
+      # Anchore publishes cosign signatures for their checksums files.
+      # This verifies the checksums were produced by a GitHub Actions run
+      # in the anchore/syft and anchore/grype repos — catching any artifact swap
+      # before we bake the binaries into our image.
+      - name: Verify Syft release signature
+        env:
+          SYFT_VERSION: v1.19.0
+          SYFT_VER: 1.19.0
+        run: |
+          curl -sL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_checksums.txt" \
+            -o syft_checksums.txt
+          curl -sL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_checksums.txt.pem" \
+            -o syft_checksums.txt.pem
+          curl -sL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_checksums.txt.sig" \
+            -o syft_checksums.txt.sig
+          cosign verify-blob \
+            --certificate syft_checksums.txt.pem \
+            --signature syft_checksums.txt.sig \
+            --certificate-identity-regexp "https://github.com/anchore/syft" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            syft_checksums.txt
+          echo "✓ Syft ${SYFT_VERSION} checksums verified via cosign"
+          rm syft_checksums.txt syft_checksums.txt.pem syft_checksums.txt.sig
+
+      - name: Verify Grype release signature
+        env:
+          GRYPE_VERSION: v0.112.0
+          GRYPE_VER: 0.112.0
+        run: |
+          curl -sL "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_checksums.txt" \
+            -o grype_checksums.txt
+          curl -sL "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_checksums.txt.pem" \
+            -o grype_checksums.txt.pem
+          curl -sL "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_checksums.txt.sig" \
+            -o grype_checksums.txt.sig
+          cosign verify-blob \
+            --certificate grype_checksums.txt.pem \
+            --signature grype_checksums.txt.sig \
+            --certificate-identity-regexp "https://github.com/anchore/grype" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            grype_checksums.txt
+          echo "✓ Grype ${GRYPE_VERSION} checksums verified via cosign"
+          rm grype_checksums.txt grype_checksums.txt.pem grype_checksums.txt.sig
+
+      # ── Log in and build ────────────────────────────────────────────────────
+
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set image tag
         id: tag
@@ -38,15 +109,66 @@ jobs:
             echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build and push
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/zagware/zagware-scanner
+          tags: |
+            type=raw,value=${{ steps.tag.outputs.value }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=Zagware Security Scanner
+            org.opencontainers.image.description=IaC (KICS) + SCA (Grype) security scanner for CI pipelines
+            org.opencontainers.image.vendor=Zagware Ltd
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push (with SBOM + provenance attestations)
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            davymcaleer99/zagware-scanner:${{ steps.tag.outputs.value }}
-            davymcaleer99/zagware-scanner:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             KICS_VERSION=2.1.20
+            KICS_CHECKSUM=8a5aa375ccfdc0ddd1114eddf1f9638ad7f6122e98d12a592207509dbe6d81f8
             SYFT_VERSION=v1.19.0
+            SYFT_CHECKSUM=f3667d6abfa97a1e5614882f81e0a0b090f0047e0df7025b568fa87b6d95ac58
             GRYPE_VERSION=v0.112.0
+            GRYPE_CHECKSUM=434bae8af635b6308d7a33ea842c6216dc382d4ec49fe3873f927b7805cc69e2
+          sbom: true          # generates CycloneDX SBOM and attaches as attestation
+          provenance: true    # generates SLSA provenance attestation
+
+      # ── Sign the image with cosign (keyless via GitHub OIDC) ────────────────
+      # The signature is published to the sigstore Rekor transparency log.
+      # Anyone can verify: cosign verify ghcr.io/zagware/zagware-scanner@<digest>
+      - name: Sign image
+        run: |
+          cosign sign --yes \
+            "ghcr.io/zagware/zagware-scanner@${{ steps.build.outputs.digest }}"
+          echo "✓ Image signed: ${{ steps.build.outputs.digest }}"
+
+      # ── SLSA provenance via GitHub attestations (separate from Docker) ──────
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/zagware/zagware-scanner
+          subject-digest: ${{ steps.build.outputs.digest }}
+
+      - name: Build summary
+        run: |
+          echo "## Image published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`ghcr.io/zagware/zagware-scanner:${{ steps.tag.outputs.value }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Digest** | \`${{ steps.build.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Verify" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "cosign verify ghcr.io/zagware/zagware-scanner@${{ steps.build.outputs.digest }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --certificate-identity-regexp 'https://github.com/zagware/zagware-scanner' \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
