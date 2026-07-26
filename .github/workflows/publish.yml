@@ -93,6 +93,10 @@ jobs:
 
       # ── Log in and build ────────────────────────────────────────────────────
 
+      # sbom: true and provenance: true require the docker-container buildx driver,
+      # not the default docker driver shipped on the GitHub runner.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
