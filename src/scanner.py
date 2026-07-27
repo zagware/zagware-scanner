@@ -714,13 +714,19 @@ def _run_grype(sbom_path: str, grype_out: str) -> bool:
         return False
 
 
-def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict]:
-    """Run Syft+Grype SCA scan. Returns list of normalised finding dicts."""
+def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
+    """Run Syft+Grype SCA scan.
+
+    Returns:
+        None  — SCA disabled or no manifest files found (skipped, not scanned).
+        []    — Scanned successfully, zero vulnerabilities found.
+        [...]  — Scanned successfully, vulnerabilities found.
+    """
     if not _SCA_ENABLED:
-        return []
+        return None
     if not _has_sca_manifests(path):
         log.debug("SCA: no manifest files in %s — skipping", label)
-        return []
+        return None
     sbom_out  = f"{tmp_dir}/sbom_{label}.json"
     grype_out = f"{tmp_dir}/grype_{label}.json"
     log.info("SCA: running Syft on %s...", label)
@@ -786,9 +792,9 @@ def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict]:
     return findings
 
 
-def new_sca_findings(base: list[dict], head: list[dict]) -> list[dict]:
-    base_sims = {f["similarity_id"] for f in base}
-    return [f for f in head if f["similarity_id"] not in base_sims]
+def new_sca_findings(base: list[dict] | None, head: list[dict] | None) -> list[dict]:
+    base_sims = {f["similarity_id"] for f in (base or [])}
+    return [f for f in (head or []) if f["similarity_id"] not in base_sims]
 
 # ── Comment rendering ──────────────────────────────────────────────────────────
 
@@ -1166,13 +1172,14 @@ def main() -> int:
         novel_sca = new_sca_findings(base_sca, head_sca)
         log.info("SCA new: %d finding(s)", len(novel_sca))
 
-        if _platform_url and _platform_token and (base_sca or head_sca):
+        # Upload when at least one side was actually scanned (None = skipped).
+        if _platform_url and _platform_token and (base_sca is not None or head_sca is not None):
             upload_sca_to_platform(
                 _platform_url, _platform_token,
                 platform.repo(),
                 base_branch, head_branch,
                 platform.pr_number(),
-                base_sca, head_sca,
+                base_sca or [], head_sca or [],
             )
 
         # ── Diff ─────────────────────────────────────────────────────────────
