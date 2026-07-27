@@ -693,7 +693,10 @@ def _run_syft(path: str, sbom_out: str) -> bool:
             [_SYFT_BIN, "scan", f"dir:{path}", "-o", f"syft-json={sbom_out}", "--quiet"],
             capture_output=True, text=True, timeout=180,
         )
-        return r.returncode == 0 and Path(sbom_out).exists()
+        if r.returncode != 0:
+            log.warning("Syft exited %d: %s", r.returncode, (r.stderr or r.stdout or "").strip()[:400])
+        # Accept output even on non-zero exit (Syft may emit warnings as errors)
+        return Path(sbom_out).exists() and Path(sbom_out).stat().st_size > 0
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         log.debug("Syft unavailable: %s", e)
         return False
