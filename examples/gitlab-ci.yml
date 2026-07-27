@@ -10,10 +10,16 @@
 #     Key: GITLAB_TOKEN  |  Value: <your token>  |  Mask: ✅
 #
 # Optional variables (set in Settings → CI/CD → Variables):
+#   ZAGWARE_PLATFORM_URL    https://app.zagware.io    (optional — omit for standalone)
+#   ZAGWARE_PLATFORM_TOKEN  API token (optional)
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
 #   ZAGWARE_FAIL_ON_NEW     "true" to fail the job when new findings exist
 #   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW (default: all)
 #   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
+#
+# Artifacts saved to zagware-scan-results/ and kept for 30 days:
+#   iac-base.json, iac-head.json, sca-base.json, sca-head.json,
+#   sca-new.json, pr-comment.md, summary.json (includes timings)
 #
 # Image: ghcr.io/zagware/zagware-scanner
 # Source: https://github.com/zagware/zagware-scanner
@@ -26,6 +32,12 @@ zagware-scanner:
     ZAGWARE_PLATFORM_TOKEN: $ZAGWARE_PLATFORM_TOKEN
   script:
     - zagware-scan
+  artifacts:
+    name: zagware-scan-results-mr$CI_MERGE_REQUEST_IID
+    paths:
+      - zagware-scan-results/
+    expire_in: 30 days
+    when: always
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   allow_failure: true   # remove to gate merges on the scan result

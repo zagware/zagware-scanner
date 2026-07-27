@@ -6,14 +6,18 @@
 #   BITBUCKET_API_TOKEN   Atlassian API token with Bitbucket repo + PR read/write scopes
 #                         Create at: https://id.atlassian.com/manage-profile/security/api-tokens
 #   ATLASSIAN_EMAIL       Your Atlassian account email
-#   ZAGWARE_PLATFORM_URL  https://app.zagware.io
-#   ZAGWARE_PLATFORM_TOKEN  API token from Settings → API Tokens
+#   ZAGWARE_PLATFORM_URL  https://app.zagware.io    (optional — omit for standalone)
+#   ZAGWARE_PLATFORM_TOKEN  API token (optional)
 #
 # Optional repository variables:
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
 #   ZAGWARE_FAIL_ON_NEW     "true" to fail on any new finding
 #   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW (default: all)
 #   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
+#
+# Artifacts saved to zagware-scan-results/ and kept for 30 days:
+#   iac-base.json, iac-head.json, sca-base.json, sca-head.json,
+#   sca-new.json, pr-comment.md, summary.json (includes timings)
 #
 # Image: ghcr.io/zagware/zagware-scanner
 # Source: https://github.com/zagware/zagware-scanner
@@ -26,3 +30,5 @@ pipelines:
           image: ghcr.io/zagware/zagware-scanner:latest
           script:
             - zagware-scan
+          artifacts:
+            - zagware-scan-results/**

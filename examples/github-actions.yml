@@ -3,14 +3,24 @@
 # Add this file to .github/workflows/ in your repository. No other files needed.
 #
 # Secrets required:
-#   ZAGWARE_PLATFORM_URL    https://app.zagware.io
-#   ZAGWARE_PLATFORM_TOKEN  API token from Settings → API Tokens
+#   ZAGWARE_PLATFORM_URL    https://app.zagware.io    (optional — omit for standalone)
+#   ZAGWARE_PLATFORM_TOKEN  API token from Settings → API Tokens (optional)
 #
 # Optional env vars (add under env: in the step):
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
 #   ZAGWARE_FAIL_ON_NEW     "true" to fail the job on any new finding
 #   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW (default: all)
 #   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
+#   ZAGWARE_OUTPUT_DIR      Directory for scan artifacts (default: zagware-scan-results)
+#
+# Artifacts saved to zagware-scan-results/ on every run (uploaded for 30 days):
+#   iac-base.json     KICS findings on base branch
+#   iac-head.json     KICS findings on PR branch
+#   sca-base.json     Grype findings on base branch (normalised)
+#   sca-head.json     Grype findings on PR branch
+#   sca-new.json      Net-new SCA findings introduced by this PR
+#   pr-comment.md     The rendered markdown comment posted to the PR
+#   summary.json      Metadata + per-phase timings (seconds)
 #
 # Image: ghcr.io/zagware/zagware-scanner
 # Source: https://github.com/zagware/zagware-scanner
@@ -43,3 +53,12 @@ jobs:
           PR_NUMBER:              ${{ github.event.pull_request.number }}
           ZAGWARE_PLATFORM_URL:   ${{ secrets.ZAGWARE_PLATFORM_URL }}
           ZAGWARE_PLATFORM_TOKEN: ${{ secrets.ZAGWARE_PLATFORM_TOKEN }}
+
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zagware-scan-results-pr${{ github.event.pull_request.number }}
+          path: zagware-scan-results/
+          retention-days: 30
+          if-no-files-found: warn

@@ -9,14 +9,18 @@
 #    Project settings → Repositories → Security → Build Service
 #
 # Pipeline variables (Pipelines → Library or inline):
-#   ZAGWARE_PLATFORM_URL    https://app.zagware.io
-#   ZAGWARE_PLATFORM_TOKEN  API token from Settings → API Tokens (mark as secret)
+#   ZAGWARE_PLATFORM_URL    https://app.zagware.io    (optional — omit for standalone)
+#   ZAGWARE_PLATFORM_TOKEN  API token (optional, mark as secret)
 #
 # Optional variables:
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
 #   ZAGWARE_FAIL_ON_NEW     "true" to fail on any new finding
 #   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW (default: all)
 #   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
+#
+# Artifacts saved to zagware-scan-results/ and published to the pipeline run:
+#   iac-base.json, iac-head.json, sca-base.json, sca-head.json,
+#   sca-new.json, pr-comment.md, summary.json (includes timings)
 #
 # Image: ghcr.io/zagware/zagware-scanner
 # Source: https://github.com/zagware/zagware-scanner
@@ -46,8 +50,17 @@ steps:
         -e TF_BUILD \
         -e ZAGWARE_PLATFORM_URL=$(ZAGWARE_PLATFORM_URL) \
         -e ZAGWARE_PLATFORM_TOKEN=$(ZAGWARE_PLATFORM_TOKEN) \
+        -v "$(Build.SourcesDirectory)/zagware-scan-results:/zagware-scan-results" \
+        -e ZAGWARE_OUTPUT_DIR=/zagware-scan-results \
         ghcr.io/zagware/zagware-scanner:latest
     displayName: Zagware Security Scanner (IaC + SCA)
     env:
       SYSTEM_ACCESSTOKEN: $(System.AccessToken)
     continueOnError: true   # remove to gate PRs on the scan result
+
+  - task: PublishBuildArtifacts@1
+    displayName: Publish scan artifacts
+    condition: always()
+    inputs:
+      pathToPublish: zagware-scan-results
+      artifactName: zagware-scan-results-pr$(System.PullRequest.PullRequestId)

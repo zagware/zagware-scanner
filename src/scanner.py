@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -42,6 +43,7 @@ _MAX_COMMENT   = 60_000
 _FAIL_ON_NEW   = os.environ.get("ZAGWARE_FAIL_ON_NEW", "false").lower() == "true"
 _EXCLUDE_PATHS = os.environ.get("ZAGWARE_EXCLUDE_PATHS", ".git")
 _MIN_SEVERITY  = os.environ.get("ZAGWARE_MIN_SEVERITY", "").upper().strip()
+_OUTPUT_DIR    = os.environ.get("ZAGWARE_OUTPUT_DIR", "zagware-scan-results")
 
 _SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "TRACE"]
 _SEVERITY_EMOJI = {
@@ -1086,7 +1088,52 @@ def upload_sca_to_platform(
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+def _write_artifacts(
+    out_dir: str,
+    comment: str,
+    base_results: dict,
+    pr_results: dict,
+    base_sca: list[dict] | None,
+    head_sca: list[dict] | None,
+    novel_sca: list[dict],
+    timings: dict[str, float],
+    meta: dict,
+) -> None:
+    """Write scan evidence to out_dir. Non-fatal: logs warning on any error."""
+    try:
+        d = Path(out_dir)
+        d.mkdir(parents=True, exist_ok=True)
+
+        # IaC findings (raw KICS JSON for base and PR branch)
+        (d / "iac-base.json").write_text(
+            json.dumps(base_results, indent=2, ensure_ascii=False), encoding="utf-8")
+        (d / "iac-head.json").write_text(
+            json.dumps(pr_results,  indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # SCA findings (normalized Grype output)
+        (d / "sca-base.json").write_text(
+            json.dumps(base_sca or [], indent=2, ensure_ascii=False), encoding="utf-8")
+        (d / "sca-head.json").write_text(
+            json.dumps(head_sca or [], indent=2, ensure_ascii=False), encoding="utf-8")
+        (d / "sca-new.json").write_text(
+            json.dumps(novel_sca,  indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # Rendered PR comment (markdown)
+        (d / "pr-comment.md").write_text(comment, encoding="utf-8")
+
+        # Timing + metadata summary
+        summary = {**meta, "timings_seconds": {k: round(v, 2) for k, v in timings.items()}}
+        (d / "summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        log.info("Artifacts written to %s/ (%d files)",
+                 out_dir, len(list(d.iterdir())))
+    except Exception as exc:
+        log.warning("Failed to write artifacts: %s", exc)
+
+
 def main() -> int:
+    t_start = time.perf_counter()
     log.info("Zagware IaC Scanner starting")
 
     # Detect platform
@@ -1114,14 +1161,16 @@ def main() -> int:
     log.info("Repository: %s", clone_url.split("@", 1)[-1])  # redact credentials
     log.info("Base → %s  |  Head → %s", base_branch, head_branch)
 
+    timings: dict[str, float] = {}
+
     with tempfile.TemporaryDirectory() as tmp:
-        base_dir    = f"{tmp}/base"
-        pr_dir      = f"{tmp}/pr"
-        base_json   = f"{tmp}/base.json"
-        pr_json     = f"{tmp}/pr.json"
+        base_dir  = f"{tmp}/base"
+        pr_dir    = f"{tmp}/pr"
+        base_json = f"{tmp}/base.json"
+        pr_json   = f"{tmp}/pr.json"
 
         # ── Clone ────────────────────────────────────────────────────────────
-
+        t0 = time.perf_counter()
         log.info("Cloning base branch '%s'…", base_branch)
         try:
             clone_branch(clone_url, base_branch, base_dir)
@@ -1133,52 +1182,57 @@ def main() -> int:
         try:
             clone_branch(clone_url, head_branch, pr_dir)
         except subprocess.CalledProcessError:
-            # head_branch might be a SHA rather than a branch name
             log.debug("Branch clone failed — attempting SHA checkout")
             try:
                 clone_and_checkout_sha(clone_url, base_branch, head_branch, pr_dir)
             except subprocess.CalledProcessError as exc:
                 log.error("Clone failed for PR branch/SHA: %s", exc.stderr)
                 return 1
+        timings["clone"] = time.perf_counter() - t0
 
-        # ── Scan ─────────────────────────────────────────────────────────────
-
+        # ── IaC scan ─────────────────────────────────────────────────────────
+        t0 = time.perf_counter()
         log.info("Scanning base branch…")
         base_results = run_scan(base_dir, base_json)
         base_count   = count_findings(base_results.get("queries", []))
         log.info("Base: %d finding(s)", base_count)
+        timings["iac_base"] = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         log.info("Scanning PR branch…")
-        pr_results   = run_scan(pr_dir, pr_json)
-        pr_count     = count_findings(pr_results.get("queries", []))
+        pr_results = run_scan(pr_dir, pr_json)
+        pr_count   = count_findings(pr_results.get("queries", []))
         log.info("PR:   %d finding(s)", pr_count)
+        timings["iac_head"] = time.perf_counter() - t0
 
-        # ── Upload to GTP platform if configured ─────────────────────────────
-
+        # ── Platform upload (IaC) ─────────────────────────────────────────────
         _platform_url   = os.environ.get('ZAGWARE_PLATFORM_URL', '').rstrip('/')
         _platform_token = os.environ.get('ZAGWARE_PLATFORM_TOKEN', '')
         if _platform_url and _platform_token:
+            t0 = time.perf_counter()
             upload_to_platform(
-                _platform_url,
-                _platform_token,
+                _platform_url, _platform_token,
                 platform.repo(),
-                base_branch,
-                '',
-                head_branch,
-                '',
+                base_branch, '', head_branch, '',
                 platform.pr_number(),
-                base_results,
-                pr_results,
+                base_results, pr_results,
             )
+            timings["platform_upload_iac"] = time.perf_counter() - t0
 
-        # ── SCA ─────────────────────────────────────────────────────────────
-        base_sca  = run_sca_scan(base_dir, tmp, "base")
-        head_sca  = run_sca_scan(pr_dir,  tmp, "pr")
+        # ── SCA ──────────────────────────────────────────────────────────────
+        t0 = time.perf_counter()
+        base_sca = run_sca_scan(base_dir, tmp, "base")
+        timings["sca_base"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        head_sca = run_sca_scan(pr_dir, tmp, "pr")
+        timings["sca_head"] = time.perf_counter() - t0
+
         novel_sca = new_sca_findings(base_sca, head_sca)
         log.info("SCA new: %d finding(s)", len(novel_sca))
 
-        # Upload when at least one side was actually scanned (None = skipped).
         if _platform_url and _platform_token and (base_sca is not None or head_sca is not None):
+            t0 = time.perf_counter()
             upload_sca_to_platform(
                 _platform_url, _platform_token,
                 platform.repo(),
@@ -1186,25 +1240,58 @@ def main() -> int:
                 platform.pr_number(),
                 base_sca or [], head_sca or [],
             )
+            timings["platform_upload_sca"] = time.perf_counter() - t0
 
-        # ── Diff ─────────────────────────────────────────────────────────────
-
+        # ── Diff + render ─────────────────────────────────────────────────────
         novel     = new_findings(base_results, pr_results)
         new_count = count_findings(novel)
         log.info("New:  %d finding(s)", new_count)
 
-        # ── Render ───────────────────────────────────────────────────────────
-
         comment = render_comment(
             base_results, pr_results, novel,
-            platform.base_label(),
-            platform.head_label(),
+            platform.base_label(), platform.head_label(),
             collapsible=platform.supports_html_details(),
         )
         comment += render_sca_section(base_sca, head_sca, novel_sca)
 
-        # ── Post ─────────────────────────────────────────────────────────────
+        # ── Save artifacts ────────────────────────────────────────────────────
+        timings["total"] = time.perf_counter() - t_start
+        meta = {
+            "repo":        platform.repo(),
+            "base_branch": base_branch,
+            "head_branch": head_branch,
+            "pr_number":   platform.pr_number(),
+            "iac_base_findings": base_count,
+            "iac_head_findings": pr_count,
+            "iac_new_findings":  count_findings(novel),
+            "sca_base_findings": len(base_sca)  if base_sca  is not None else None,
+            "sca_head_findings": len(head_sca)  if head_sca  is not None else None,
+            "sca_new_findings":  len(novel_sca),
+        }
+        _write_artifacts(
+            _OUTPUT_DIR, comment,
+            base_results, pr_results,
+            base_sca, head_sca, novel_sca,
+            timings, meta,
+        )
 
+        # ── Print timing summary ──────────────────────────────────────────────
+        log.info("Timings:")
+        labels = {
+            "clone":                "  Clone",
+            "iac_base":             "  IaC base",
+            "iac_head":             "  IaC head",
+            "sca_base":             "  SCA base (Syft+Grype)",
+            "sca_head":             "  SCA head (Syft+Grype)",
+            "platform_upload_iac":  "  Platform upload (IaC)",
+            "platform_upload_sca":  "  Platform upload (SCA)",
+            "total":                "  Total",
+        }
+        for key, label in labels.items():
+            if key in timings:
+                log.info("%s: %.1fs", label, timings[key])
+
+        # ── Post comment ──────────────────────────────────────────────────────
         try:
             platform.post_or_update_comment(comment)
         except Exception as exc:
