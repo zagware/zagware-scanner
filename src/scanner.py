@@ -921,10 +921,12 @@ def render_comment(
 
 
 def render_sca_section(
-    base_sca: list[dict], head_sca: list[dict], novel_sca: list[dict],
+    base_sca: list[dict] | None, head_sca: list[dict] | None, novel_sca: list[dict],
 ) -> str:
     """Return the SCA block to append to the PR comment. Empty string if no SCA data."""
-    if not head_sca and not base_sca:
+    base_list = base_sca or []
+    head_list = head_sca or []
+    if not head_list and not base_list:
         return ""
     by_sev: dict[str, list[dict]] = {}
     for f in novel_sca:
@@ -933,7 +935,7 @@ def render_sca_section(
         "", "---", "## 📦 Zagware SCA — Dependency Vulnerabilities", "",
         "| | Base | This PR | New |",
         "|---|:---:|:---:|:---:|",
-        f"| Vulnerabilities | {len(base_sca)} | {len(head_sca)} | **{len(novel_sca)}** |",
+        f"| Vulnerabilities | {len(base_list)} | {len(head_list)} | **{len(novel_sca)}** |",
         "",
     ]
     if not novel_sca:
