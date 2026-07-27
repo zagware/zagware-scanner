@@ -51,8 +51,8 @@ _SEVERITY_EMOJI = {
 
 # ── SCA (Grype) constants ──────────────────────────────────────────────────────
 _SCA_ENABLED      = os.environ.get("ZAGWARE_SCA_ENABLED", "true").lower() != "false"
-_GRYPE_BIN        = os.environ.get("_ZAGWARE_GRYPE_BIN",  "/usr/local/bin/grype")
-_SYFT_BIN         = os.environ.get("_ZAGWARE_SYFT_BIN",   "/usr/local/bin/syft")
+_GRYPE_BIN        = os.environ.get("_ZAGWARE_GRYPE_BIN",  "/usr/bin/grype")
+_SYFT_BIN         = os.environ.get("_ZAGWARE_SYFT_BIN",   "/usr/bin/syft")
 _SCA_SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NEGLIGIBLE"]
 _SCA_SEVERITY_EMOJI = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "NEGLIGIBLE": "⚪"}
 _SCA_MANIFESTS = [
