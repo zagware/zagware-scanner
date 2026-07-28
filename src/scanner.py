@@ -909,12 +909,41 @@ def parse_suppression_commands(comments: list[str]) -> list[tuple[str, str]]:
             m = _SUPPRESS_CMD_RE.search(line.strip())
             if m:
                 sim_id = m.group(1).strip()
+                # Strip trailing non-hex characters (e.g. a copy-pasted "…" truncation marker)
+                sim_id = _re.sub(r'[^0-9a-fA-F]+$', '', sim_id)
+                if not sim_id:
+                    continue
                 reason = m.group(2).strip() or "Suppressed via PR comment"
                 # Strip "reason:" prefix if present
                 if reason.lower().startswith("reason:"):
                     reason = reason[7:].strip()
                 commands.append((sim_id, reason))
     return commands
+
+
+def resolve_suppression_id(
+    prefix: str, novel: list[dict], novel_sca: list[dict],
+) -> str | None:
+    """Resolve a (possibly truncated) similarity_id prefix against current novel findings.
+
+    Returns the full similarity_id if exactly one unambiguous match exists, else None.
+    Exact matches always qualify; prefix matches require at least 6 hex characters
+    to avoid over-matching on garbage input.
+    """
+    candidates: set[str] = set()
+    is_prefix_ok = len(prefix) >= 6
+    for q in novel:
+        for f in q.get("files", []):
+            sid = f.get("similarity_id", "")
+            if sid == prefix or (is_prefix_ok and sid.startswith(prefix)):
+                candidates.add(sid)
+    for f in novel_sca:
+        sid = f.get("similarity_id", "")
+        if sid == prefix or (is_prefix_ok and sid.startswith(prefix)):
+            candidates.add(sid)
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    return None
 
 
 def apply_suppression_commands(
@@ -1146,34 +1175,6 @@ def render_comment(
             if collapsible:
                 L += ["</details>", ""]
 
-    # ── Suppression hints: list similarity IDs for interactive suppression ──────
-    if novel:
-        if collapsible:
-            L += ["<details>", "<summary>📋 Suppress findings</summary>", ""]
-        else:
-            L += ["---", "### 📋 Suppress findings", ""]
-        L += [
-            "To suppress a finding, comment on this PR:",
-            "",
-            "```",
-            "/zagware suppress <similarity_id> <reason>",
-            "```",
-            "",
-            "**Available IDs from this scan:**",
-            "",
-        ]
-        for q in novel[:20]:  # cap at 20 to avoid huge comment
-            for f in q.get("files", [])[:5]:
-                sim = f.get("similarity_id", "")[:16] + "…"
-                desc = q.get("query_name", "")[:60]
-                loc  = f.get("file_name", "")
-                L.append(f"- `{sim}` — {desc} (`{loc}`)")
-        if total_new > 100:
-            L.append(f"\n_… and {total_new - 100} more (see scan artifacts for full list)_")
-        L.append("")
-        if collapsible:
-            L += ["</details>", ""]
-
     footer = [
         "---",
         "<sub>Zagware IaC Scanner &nbsp;·&nbsp; "
@@ -1251,6 +1252,60 @@ def render_sca_section(
                 L += ["", "</details>", ""]
             else:
                 L.append("")
+    return "\n".join(L)
+
+
+def render_suppression_hints(
+    novel: list[dict], novel_sca: list[dict], collapsible: bool = True,
+) -> str:
+    """Render a collapsible section listing similarity IDs for /zagware suppress commands.
+
+    Covers both IaC (novel) and SCA (novel_sca) findings. IDs are shown as a 16-char
+    prefix; the scanner resolves prefixes >=6 chars against real findings, so the
+    truncated display is always safe to copy-paste.
+    """
+    items: list[tuple[str, str, str]] = []  # (similarity_id, description, location)
+    for q in novel:
+        for f in q.get("files", []):
+            items.append((
+                f.get("similarity_id", ""),
+                q.get("query_name", "")[:60],
+                f.get("file_name", ""),
+            ))
+    for f in novel_sca:
+        items.append((
+            f.get("similarity_id", ""),
+            f"{f.get('vulnerability_id', '')} in {f.get('package_name', '')}",
+            f.get("file_path", "") or f.get("package_name", ""),
+        ))
+    if not items:
+        return ""
+
+    L: list[str] = []
+    if collapsible:
+        L += ["", "<details>", "<summary>📋 Suppress findings</summary>", ""]
+    else:
+        L += ["", "---", "### 📋 Suppress findings", ""]
+    L += [
+        "To suppress a finding, comment on this PR:",
+        "",
+        "```",
+        "/zagware suppress <id> <reason>",
+        "```",
+        "",
+        "The id can be the first 6+ characters shown below — no need to copy the full hash.",
+        "",
+        "**Available IDs from this scan:**",
+        "",
+    ]
+    for sim, desc, loc in items[:100]:
+        short = sim[:16] if sim else "?"
+        L.append(f"- `{short}` — {desc} (`{loc}`)")
+    if len(items) > 100:
+        L.append(f"\n_… and {len(items) - 100} more (see scan artifacts for full list)_")
+    L.append("")
+    if collapsible:
+        L += ["</details>", ""]
     return "\n".join(L)
 
 
@@ -1469,23 +1524,7 @@ def main() -> int:
                 return 1
         timings["clone"] = time.perf_counter() - t0
 
-        # ── Check for interactive suppression commands in PR comments ────────
-        if platform.pr_number() is not None:
-            try:
-                comments = platform.read_pr_comments()
-                commands = parse_suppression_commands(comments)
-                if commands:
-                    log.info("Found %d suppression command(s) in PR comments", len(commands))
-                    pushed = apply_suppression_commands(
-                        pr_dir, clone_url, head_branch, commands,
-                    )
-                    if pushed:
-                        log.info("Suppression file pushed — pipeline will re-run with suppressions applied")
-                        return 0  # Exit; the push triggers a new pipeline run
-            except Exception as exc:
-                log.warning("Failed to process suppression commands: %s", exc)
-
-        # ── Load suppressions from PR branch ─────────────────────────────────
+        # ── Load existing suppressions from PR branch ────────────────────────
         suppressed_ids = load_suppressions(pr_dir)
 
         # ── IaC scan ─────────────────────────────────────────────────────────
@@ -1534,8 +1573,7 @@ def main() -> int:
         head_sca = run_sca_scan(pr_dir, tmp, "pr")
         timings["sca_head"] = time.perf_counter() - t0
 
-        novel_sca = new_sca_findings(base_sca, head_sca, suppressed_ids)
-        log.info("SCA new: %d finding(s)", len(novel_sca))
+        # (novel_sca computed later in the Diff section, after suppression commands resolve)
 
         if _platform_url and _platform_token and (base_sca is not None or head_sca is not None):
             t0 = time.perf_counter()
@@ -1548,20 +1586,67 @@ def main() -> int:
             )
             timings["platform_upload_sca"] = time.perf_counter() - t0
 
-        # ── Diff + render ─────────────────────────────────────────────────────
+        # ── Diff ─────────────────────────────────────────────────────────────
         novel     = new_findings(base_results, pr_results, suppressed_ids)
+        novel_sca = new_sca_findings(base_sca, head_sca, suppressed_ids)
+
+        # ── Check for interactive suppression commands in PR comments ────────
+        # Resolve against THIS scan's novel findings (both IaC and SCA), apply,
+        # then recompute novel/novel_sca so the same run reflects the result —
+        # relying on the push to auto-retrigger doesn't work (GITHUB_TOKEN pushes
+        # don't fire new workflow runs on GitHub).
+        just_suppressed: list[tuple[str, str]] = []  # (id, reason)
+        if platform.pr_number() is not None:
+            try:
+                comments = platform.read_pr_comments()
+                commands = parse_suppression_commands(comments)
+                resolved: list[tuple[str, str]] = []
+                for raw_id, reason in commands:
+                    full_id = resolve_suppression_id(raw_id, novel, novel_sca)
+                    if full_id:
+                        resolved.append((full_id, reason))
+                    elif raw_id not in suppressed_ids:
+                        log.warning(
+                            "Suppress command '%s' doesn't match any current finding "
+                            "(already fixed, already suppressed, or a bad id)", raw_id,
+                        )
+                if resolved:
+                    log.info("Resolved %d suppression command(s)", len(resolved))
+                    pushed = apply_suppression_commands(pr_dir, clone_url, head_branch, resolved)
+                    if pushed:
+                        suppressed_ids |= {sid for sid, _ in resolved}
+                        just_suppressed = resolved
+                        # Recompute with the updated suppression set
+                        novel     = new_findings(base_results, pr_results, suppressed_ids)
+                        novel_sca = new_sca_findings(base_sca, head_sca, suppressed_ids)
+                        log.info("Applied — recomputed: %d IaC new, %d SCA new",
+                                 count_findings(novel), len(novel_sca))
+            except Exception as exc:
+                log.warning("Failed to process suppression commands: %s", exc)
+
         new_count = count_findings(novel)
         log.info("New:  %d finding(s)", new_count)
         if suppressed_ids:
             log.info("Suppressed: %d finding(s) (see .zagware/suppressions.yaml)", len(suppressed_ids))
 
-        comment = render_comment(
+        comment = ""
+        if just_suppressed:
+            ids_str = ", ".join(f"`{sid[:16]}`" for sid, _ in just_suppressed[:5])
+            comment += (
+                f"> ✅ **{len(just_suppressed)} finding(s) suppressed** via `/zagware suppress` "
+                f"— {ids_str} — committed to `.zagware/suppressions.yaml`\n\n"
+            )
+        comment += render_comment(
             base_results, pr_results, novel,
             platform.base_label(), platform.head_label(),
             collapsible=platform.supports_html_details(),
         )
         comment += render_sca_section(
             base_sca, head_sca, novel_sca,
+            collapsible=platform.supports_html_details(),
+        )
+        comment += render_suppression_hints(
+            novel, novel_sca,
             collapsible=platform.supports_html_details(),
         )
 

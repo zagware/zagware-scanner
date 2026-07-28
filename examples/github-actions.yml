@@ -22,10 +22,18 @@
 #   pr-comment.md     The rendered markdown comment posted to the PR
 #   summary.json      Metadata + per-phase timings (seconds)
 #
+# Interactive suppression: reviewers can comment `/zagware suppress <id> <reason>`
+# on a PR (copy the id shown in the "📋 Suppress findings" section of the scan
+# comment) to mute a finding. This requires the issue_comment trigger below —
+# GitHub only sends pull_request events for pushes/opens, not for comments.
+# contents: write is required so the scanner can commit the suppression entry
+# to .zagware/suppressions.yaml on the PR branch. Only PR authors/collaborators
+# (author_association OWNER/MEMBER/COLLABORATOR) can trigger a suppression.
+#
 # Image: ghcr.io/zagware/zagware-scanner
 # Source: https://github.com/zagware/zagware-scanner
 # Verify: cosign verify ghcr.io/zagware/zagware-scanner:latest \
-#           --certificate-identity-regexp "https://github.com/zagware/zagware-scanner" \
+#           --certificate-identity-regexp "^https://github.com/zagware/zagware-scanner/.+$" \
 #           --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 name: Zagware Security Scanner
@@ -33,24 +41,47 @@ name: Zagware Security Scanner
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
 
 concurrency:
-  group: zagware-scanner-${{ github.ref }}
+  group: zagware-scanner-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
 permissions:
   pull-requests: write
+  contents: write   # required for /zagware suppress to commit suppressions.yaml
 
 jobs:
   security-scan:
     name: IaC + SCA security scan
     runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '/zagware suppress') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     steps:
+      # issue_comment events don't carry PR base/head refs the way pull_request
+      # events do (GITHUB_BASE_REF/GITHUB_HEAD_REF are unset) — look them up.
+      - name: Resolve PR refs (comment-triggered runs only)
+        if: github.event_name == 'issue_comment'
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_JSON=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")
+          echo "base_ref=$(echo "$PR_JSON" | jq -r .base.ref)" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$(echo "$PR_JSON" | jq -r .head.ref)" >> "$GITHUB_OUTPUT"
+
       - name: Zagware Security Scanner
         uses: docker://ghcr.io/zagware/zagware-scanner:latest
         env:
           GITHUB_TOKEN:           ${{ github.token }}
-          PR_NUMBER:              ${{ github.event.pull_request.number }}
+          PR_NUMBER:              ${{ github.event.pull_request.number || github.event.issue.number }}
+          GITHUB_BASE_REF:        ${{ github.base_ref || steps.pr.outputs.base_ref }}
+          GITHUB_HEAD_REF:        ${{ github.head_ref || steps.pr.outputs.head_ref }}
           ZAGWARE_PLATFORM_URL:   ${{ secrets.ZAGWARE_PLATFORM_URL }}
           ZAGWARE_PLATFORM_TOKEN: ${{ secrets.ZAGWARE_PLATFORM_TOKEN }}
 
@@ -58,7 +89,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zagware-scan-results-pr${{ github.event.pull_request.number }}
+          name: zagware-scan-results-pr${{ github.event.pull_request.number || github.event.issue.number }}
           path: zagware-scan-results/
           retention-days: 30
           if-no-files-found: warn

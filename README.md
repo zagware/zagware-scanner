@@ -44,24 +44,45 @@ name: Zagware Security Scanner
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]      # enables /zagware suppress comments
 
 concurrency:
-  group: zagware-scanner-${{ github.ref }}
+  group: zagware-scanner-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
 permissions:
   pull-requests: write
+  contents: write   # required for /zagware suppress to commit suppressions.yaml
 
 jobs:
   security-scan:
     name: IaC + SCA security scan
     runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '/zagware suppress') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     steps:
+      - name: Resolve PR refs (comment-triggered runs only)
+        if: github.event_name == 'issue_comment'
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_JSON=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")
+          echo "base_ref=$(echo "$PR_JSON" | jq -r .base.ref)" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$(echo "$PR_JSON" | jq -r .head.ref)" >> "$GITHUB_OUTPUT"
+
       - name: Zagware Security Scanner
         uses: docker://ghcr.io/zagware/zagware-scanner:latest
         env:
           GITHUB_TOKEN:           ${{ github.token }}
-          PR_NUMBER:              ${{ github.event.pull_request.number }}
+          PR_NUMBER:              ${{ github.event.pull_request.number || github.event.issue.number }}
+          GITHUB_BASE_REF:        ${{ github.base_ref || steps.pr.outputs.base_ref }}
+          GITHUB_HEAD_REF:        ${{ github.head_ref || steps.pr.outputs.head_ref }}
           ZAGWARE_PLATFORM_URL:   ${{ secrets.ZAGWARE_PLATFORM_URL }}
           ZAGWARE_PLATFORM_TOKEN: ${{ secrets.ZAGWARE_PLATFORM_TOKEN }}
 ```
@@ -69,6 +90,11 @@ jobs:
 `GITHUB_TOKEN` is provided automatically by GitHub — no secrets to configure for the scanner itself.
 `ZAGWARE_PLATFORM_URL` and `ZAGWARE_PLATFORM_TOKEN` are optional; omit them to run the scanner
 standalone (PR comment only, no platform upload).
+
+The `issue_comment` trigger and `contents: write` permission are required for the
+[interactive suppression](#suppressions) feature (`/zagware suppress <id> <reason>` PR comments).
+If you don't need that, you can omit them and keep just the `pull_request` trigger with
+`permissions: pull-requests: write`.
 
 ---
 
@@ -385,22 +411,44 @@ are optional — omit them and the scanner works without any platform account.
 ---
 ## Suppressions
 
-Suppress false positives or accepted-risk findings so they don't appear as "new" on every PR.
-Create a `.zagware/suppressions.yaml` file in your repository:
+Suppress false positives or accepted-risk findings so they don't reappear as "new" on every PR.
+
+### The easy way — comment on the PR
+
+Every scan comment includes a **📋 Suppress findings** section listing each new finding with a
+short id. To suppress one, copy the command shown and post it as a PR comment:
+
+```
+/zagware suppress 96e6e0d1 false positive — test resource, not production
+```
+
+You only need the first 6+ characters of the id — the scanner resolves it against the current
+scan's findings. On GitHub, this requires the `issue_comment` trigger and `contents: write`
+permission shown in the [Quick start](#github-actions) snippet above, and only PR
+authors/collaborators (not external contributors) can trigger a suppression.
+
+> **Currently GitHub-only.** GitLab, Bitbucket, and Azure DevOps don't yet support reading PR
+> comments back into the scanner — use the manual file method below on those platforms.
+
+What happens: the scanner re-runs (same PR, comment-triggered), resolves the id, writes it to
+`.zagware/suppressions.yaml` on the PR branch, commits and pushes, then **continues the same run**
+with the suppression applied — the updated comment shows the finding suppressed and a
+confirmation banner (`✅ 1 finding(s) suppressed …`) immediately, no need to wait for a second run.
+
+### The manual way — edit the file directly
+
+Create or edit `.zagware/suppressions.yaml` in your repository:
 
 ```yaml
 # .zagware/suppressions.yaml
-- id: abc123def456...      # similarity_id from the scan results
+- id: abc123def456...      # similarity_id from the scan results (full or 6+ char prefix)
   reason: "False positive — test resource, not production"
-  expires: "2026-12-31"    # optional: auto-expires on this date
 
 - id: def789abc012...
   reason: "Accepted risk — mitigated by network policy"
 ```
 
-Copyright 2026 Zagware Ltd.
-
-The `similarity_id` is a SHA256 fingerprint that uniquely identifies a finding. Find it in:
+Find the full `similarity_id` in:
 
 1. **Scan artifacts** — `zagware-scan-results/summary.json` (downloaded from the pipeline run)
 2. **Platform** — the findings detail view on `app.zagware.io`
@@ -477,4 +525,4 @@ Please open an issue before starting significant work so we can discuss approach
 
 Apache License 2.0 — see [LICENSE](LICENSE) for the full text.
 
-Copyright 2024 Zagware Ltd.
+Copyright 2026 Zagware Ltd.
