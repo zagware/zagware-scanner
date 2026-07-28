@@ -10,19 +10,20 @@ Zagware Scanner runs on every pull request and posts a focused comment showing o
 findings *introduced by that PR* — not the hundreds that may already exist in the codebase.
 Your team sees exactly what they need to act on, nothing more.
 
-Two scan engines, one container:
+Three scan engines, one container:
 
 | Engine | What it scans | Detects |
 |---|---|---|
 | **KICS** (Checkmarx) | Infrastructure-as-code files (Terraform, Kubernetes, Dockerfile, CloudFormation…) | Misconfigurations, insecure defaults, open ports, missing encryption |
 | **Grype** (Anchore) | Package manifests and lockfiles (npm, pip, Go, Maven, Gem…) | CVEs, GHSA advisories — with CVSS, EPSS, and KEV catalog status |
+| **betterleaks** | Filesystem contents (working-tree state) | Leaked credentials — API keys, tokens, private keys, and other secret patterns |
 
 ---
 
 ## How it works
 
 1. **Clone** your base branch and the PR branch (using your CI token — no extra credentials needed).
-2. **Scan both** — KICS on IaC files, Syft+Grype on package manifests — in parallel.
+2. **Scan both** — KICS on IaC files, Syft+Grype on package manifests, betterleaks on the working tree — in parallel.
 3. **Diff by fingerprint**, not line number. A finding that existed in the base branch is never
    reported as new, even after refactoring or line shifts.
 4. **Post the delta** directly as a PR comment, updated in place on every push.
@@ -233,6 +234,22 @@ Comparing `main` → `feat/add-storage`
 |CVE|Package|Installed|Fix|CVSS|KEV|
 |---|---|:---:|:---:|:---:|:---:|
 |CVE-2023-1234|lodash (npm)|4.17.20|4.17.21|9.8|No|
+
+---
+
+## 🔑 Zagware Secrets — Leaked Credentials
+
+| | Base | This PR | New |
+|---|:---:|:---:|:---:|
+| Findings | 2 | 3 | 1 |
+
+> 🌐 **PUBLIC REPOSITORY** — any leaked secret here is immediately exposed to the world. Rotate affected credentials before merging.
+
+> 🔴 **1 new secret(s) introduced by this PR**
+
+| Rule | File | Line | Validation |
+|---|---|:---:|:---:|
+|`stripe-access-token`|`config/payments.rb`|5|🔴 Valid|
 ```
 
 If the PR is clean: **✅ No new security findings introduced by this PR.**
@@ -278,6 +295,26 @@ SCA scanning is enabled by default when manifest files are detected. Set `ZAGWAR
 
 ---
 
+## Secrets detection (betterleaks)
+
+[betterleaks](https://github.com/betterleaks/betterleaks) scans the working-tree contents of both
+branches for leaked credentials — API keys, tokens, private keys, and other secret patterns. Unlike
+IaC/SCA, betterleaks has no severity taxonomy; instead, findings are prioritized by **repository
+visibility** — a secret leaked in a public repo is immediately exposed to the world, so public repos
+are always treated as urgent regardless of `ZAGWARE_FAIL_ON_NEW`. See
+[`ZAGWARE_SECRETS_FAIL_ON_PUBLIC`](#configuration) below.
+
+Secrets scanning runs against the current filesystem state only (`betterleaks dir` mode), matching
+the same shallow-clone/working-tree-diff architecture already used for IaC and SCA — not full git
+history. If your secret was introduced and later removed within the PR's history, it won't be
+re-flagged once removed from the working tree; use `betterleaks git` locally for full history scans.
+
+Findings never include the raw secret value in the PR comment, platform upload, or scan artifacts —
+only the rule id, file path, line number, tags, and validation status (whether betterleaks confirmed
+the credential is live). Set `ZAGWARE_SECRETS_ENABLED=false` to disable it.
+
+---
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -288,6 +325,8 @@ SCA scanning is enabled by default when manifest files are detected. Set `ZAGWAR
 | `ZAGWARE_FAIL_ON_NEW` | `false` | Exit 1 when new findings are found at or above `ZAGWARE_MIN_SEVERITY`. Blocks the merge when set to `true`. |
 | `ZAGWARE_EXCLUDE_PATHS` | `.git` | Comma-separated paths or globs to exclude from IaC scanning. |
 | `ZAGWARE_SCA_ENABLED` | `true` | Set `false` to skip Grype dependency scanning entirely. |
+| `ZAGWARE_SECRETS_ENABLED` | `true` | Set `false` to skip betterleaks secrets scanning entirely. |
+| `ZAGWARE_SECRETS_FAIL_ON_PUBLIC` | `true` | Exit 1 when a new secret is found in a **public** repository, regardless of `ZAGWARE_FAIL_ON_NEW`. Betterleaks has no severity to gate on, so repo visibility is the priority signal instead. |
 | `ZAGWARE_TELEMETRY` | _(on)_ | Set `off` to disable anonymous usage telemetry. See [Telemetry](#telemetry). |
 | `ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME` | `false` | Set `true` to send your org/repo name in clear instead of a one-way hash. |
 
@@ -299,6 +338,9 @@ Each IaC finding is identified by a content-based fingerprint (KICS *similarity 
 the rule, the resource path, and the file content at the flagged location.
 
 Each SCA finding is fingerprinted as `sha256(cve_id:package_name:package_version)`.
+
+Each Secrets finding is fingerprinted by betterleaks itself (`file_path:rule_id:line`), read from
+the report's `Fingerprint` field — never derived from the secret value.
 
 Both approaches mean:
 - Code reformatting or line shifts do not create spurious new findings.
@@ -338,6 +380,7 @@ Every release of `ghcr.io/zagware/zagware-scanner` is built with a verifiable su
 | **KICS binary** | SHA256 checksum hardcoded in the Dockerfile and verified at build time. GPG signature is intentionally NOT used — downloading the signing key from the same endpoint as the binary provides no independent trust (both could be swapped together) |
 | **Syft binary** | SHA256 checksum verified at build time; cosign signature on checksums verified in CI before build |
 | **Grype binary** | SHA256 checksum verified at build time; cosign signature on checksums verified in CI before build |
+| **betterleaks binary** | SHA256 checksum hardcoded in the Dockerfile and verified at build time; cosign sigstore-bundle signature verified in CI before build |
 | **Our image** | Signed with cosign (keyless, GitHub OIDC → sigstore Rekor transparency log) |
 | **SBOM** | SPDX SBOM generated at build time and attached as an OCI attestation |
 | **Provenance** | SLSA Build Level 3 provenance attestation — links the image digest to this exact source commit and workflow run |
@@ -388,9 +431,9 @@ docker push your-registry/zagware-scanner:latest
 Then substitute `your-registry/zagware-scanner:latest` wherever this documentation references
 `ghcr.io/zagware/zagware-scanner:latest`.
 
-The image requires internet access at build time to download KICS, Syft, and Grype from their
-public GitHub releases. At scan time, it only needs access to clone your repository and post
-the PR comment.
+The image requires internet access at build time to download KICS, Syft, Grype, and betterleaks
+from their public GitHub releases. At scan time, it only needs access to clone your repository
+and post the PR comment.
 
 **Note:** Self-hosted builds verify binary SHA256 checksums but do NOT verify the upstream
 cosign signatures on Syft/Grype `checksums.txt` (that step runs in our publish CI only).
@@ -414,6 +457,9 @@ what the PR under review introduces.
 
 **Can I disable SCA without disabling IaC?**
 Yes — set `ZAGWARE_SCA_ENABLED=false` in the environment.
+
+**Can I disable secrets scanning without disabling IaC/SCA?**
+Yes — set `ZAGWARE_SECRETS_ENABLED=false` in the environment.
 
 **Can I use it without the Zagware platform?**
 Yes. The scanner posts PR comments standalone. `ZAGWARE_PLATFORM_URL` and `ZAGWARE_PLATFORM_TOKEN`
@@ -474,13 +520,14 @@ Find the full `similarity_id` in:
 2. **Platform** — the findings detail view on `app.zagware.io`
 3. **Raw KICS JSON** — `zagware-scan-results/iac-head.json` → `queries[].files[].similarity_id`
 
-For SCA findings, the `similarity_id` is `sha256(cve_id:package_name:package_version)`.
+For SCA findings, the `similarity_id` is `sha256(cve_id:package_name:package_version)`. For Secrets
+findings, the `similarity_id` is betterleaks' own `Fingerprint` (`file_path:rule_id:line`).
 
 ### How suppressions work
 
 - The scanner reads `.zagware/suppressions.yaml` from the **PR branch** (not main)
 - Suppressed findings are excluded from the "new findings" diff — they won't appear in the PR comment
-- Suppressed IaC/SCA findings are still uploaded to the platform's scan history (for audit trail) but marked as suppressed
+- Suppressed IaC/SCA/Secrets findings are still uploaded to the platform's scan history (for audit trail) but marked as suppressed
 - The suppression count is logged in the scan output
 
 ### Suppression audit trail
@@ -488,10 +535,10 @@ For SCA findings, the `similarity_id` is `sha256(cve_id:package_name:package_ver
 When `ZAGWARE_PLATFORM_URL`/`ZAGWARE_PLATFORM_TOKEN` are configured, every scan uploads the
 **full current set of active suppressions** for the repo to the platform — a durable, queryable
 record of who suppressed what, when, and why, independent of the git history in
-`.zagware/suppressions.yaml`. This is for compliance auditing and to spot which IaC/SCA rules get
+`.zagware/suppressions.yaml`. This is for compliance auditing and to spot which IaC/SCA/Secrets rules get
 suppressed so often across repos that the underlying policy may need tightening.
 
-Each record captures: repo, PR number, category (`iac`/`sca`), the finding (name + file), the
+Each record captures: repo, PR number, category (`iac`/`sca`/`secrets`), the finding (name + file), the
 reason, and **who added it**:
 
 - Suppressed via a `/zagware suppress` PR comment → exact attribution: the commenter's git
@@ -529,6 +576,9 @@ env:
 When `ZAGWARE_FAIL_ON_NEW=true`, the scanner exits 1 (breaking CI) if any **new** finding at or
 above the configured threshold is introduced by the PR. This applies to both IaC and SCA findings.
 Existing findings on the base branch are ignored — only net-new findings gate the merge.
+
+Secrets findings are unaffected by `ZAGWARE_MIN_SEVERITY` (betterleaks has no severity taxonomy) —
+see [`ZAGWARE_SECRETS_FAIL_ON_PUBLIC`](#configuration) for the equivalent gate on secrets.
 
 ---
 
@@ -568,14 +618,14 @@ credentials are ever sent.** Full transparency below — this is exactly what le
 | `platform` | `"github"` | Which CI provider (github / gitlab / bitbucket / azure_devops) |
 | `repo_id`, `org_id` | `"cea56b328a1226dd"` | SHA-256 hash (16 chars) of your repo/org — **not** the plaintext name (see opt-in below) |
 | `is_pr` | `true` | Whether this run scanned a PR/MR |
-| `sca_enabled`, `iac_scanned`, `sca_scanned` | `true` | Which scan types ran |
+| `sca_enabled`, `secrets_enabled`, `iac_scanned`, `sca_scanned`, `secrets_scanned` | `true` | Which scan types ran |
 | `has_platform_integration` | `false` | Whether `ZAGWARE_PLATFORM_URL`/`TOKEN` are configured (not their values) |
 | `min_severity_filter`, `fail_on_new` | `"HIGH"`, `false` | Your configured thresholds |
 | `duration_seconds` | `93.9` | Total scan time |
-| `iac_new_findings_bucket`, `sca_new_findings_bucket` | `"1-5"` | **Bucketed**, not exact — `0`, `1-5`, `6-20`, `21+`. We deliberately never transmit a precise vulnerability count tied to your org, only a coarse usage signal |
+| `iac_new_findings_bucket`, `sca_new_findings_bucket`, `secrets_new_findings_bucket` | `"1-5"` | **Bucketed**, not exact — `0`, `1-5`, `6-20`, `21+`. We deliberately never transmit a precise vulnerability count tied to your org, only a coarse usage signal |
 | `suppressions_used` | `true` | Whether `.zagware/suppressions.yaml` had any entries |
 | `exit_code` | `0` | 0 or 1 |
-| `scanner_version` | `"2.7.0"` | For understanding rollout/adoption of new releases |
+| `scanner_version` | `"2.8.0"` | For understanding rollout/adoption of new releases |
 
 ### What is never sent
 
@@ -609,7 +659,7 @@ PostHog endpoint is completely unreachable, the scan result and exit code are un
 
 Issues and pull requests are welcome. The scanner logic lives in
 [`src/scanner.py`](src/scanner.py) — a single-file Python script with no external dependencies.
-KICS, Syft, and Grype are bundled in the Docker image.
+KICS, Syft, Grype, and betterleaks are bundled in the Docker image.
 
 Please open an issue before starting significant work so we can discuss approach.
 

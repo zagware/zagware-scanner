@@ -12,6 +12,9 @@ ARG SYFT_CHECKSUM=f3667d6abfa97a1e5614882f81e0a0b090f0047e0df7025b568fa87b6d95ac
 ARG GRYPE_VERSION=v0.112.0
 ARG GRYPE_CHECKSUM=434bae8af635b6308d7a33ea842c6216dc382d4ec49fe3873f927b7805cc69e2
 
+ARG BETTERLEAKS_VERSION=1.7.2
+ARG BETTERLEAKS_CHECKSUM=ea9ed6a4aa2845ac2e00c0eafbc841057631321d53c061d5a435cf33e6e9ddaf
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/*
@@ -62,6 +65,15 @@ RUN GRYPE_VER="${GRYPE_VERSION#v}" && \
     && dpkg -i /tmp/grype.deb \
     && rm /tmp/grype.deb
 
+# ── Betterleaks binary — SHA256-verified (release also cosign-signed; see
+# publish.yml for the sigstore-bundle verification run before this build) ──────
+RUN curl -fsSL \
+        "https://github.com/betterleaks/betterleaks/releases/download/v${BETTERLEAKS_VERSION}/betterleaks_${BETTERLEAKS_VERSION}_linux_x64.tar.gz" \
+        -o /tmp/betterleaks.tar.gz \
+    && echo "${BETTERLEAKS_CHECKSUM}  /tmp/betterleaks.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/betterleaks.tar.gz -C /tmp betterleaks \
+    && rm /tmp/betterleaks.tar.gz
+
 # ── Final stage: minimal runtime image (no curl) ──────────────────────────────
 FROM debian:bookworm-slim
 
@@ -79,6 +91,7 @@ COPY --from=builder /tmp/kics         /usr/local/bin/kics
 COPY --from=builder /tmp/iac-rules    /opt/iac-rules
 COPY --from=builder /usr/bin/syft     /usr/bin/syft
 COPY --from=builder /usr/bin/grype    /usr/bin/grype
+COPY --from=builder /tmp/betterleaks  /usr/local/bin/betterleaks
 
 # ── Zagware scanner entrypoint ────────────────────────────────────────────────
 COPY src/scanner.py /usr/local/bin/zagware-scan
@@ -86,7 +99,7 @@ RUN chmod +x /usr/local/bin/zagware-scan
 
 # ── OCI labels — links package to repo; GHCR inherits repo visibility ─────────
 LABEL org.opencontainers.image.source="https://github.com/zagware/zagware-scanner"
-LABEL org.opencontainers.image.description="Zagware Security Scanner — IaC (KICS) + SCA (Grype) for CI pipelines"
+LABEL org.opencontainers.image.description="Zagware Security Scanner — IaC (KICS) + SCA (Grype) + Secrets (betterleaks) for CI pipelines"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 ENV ZAGWARE_QUERIES_PATH=/opt/iac-rules/assets/queries

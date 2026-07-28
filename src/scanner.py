@@ -39,7 +39,7 @@ import hashlib
 
 
 # ── Internal constants ─────────────────────────────────────────────────────────
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
@@ -70,6 +70,14 @@ _SCA_MANIFESTS = [
     "Gemfile.lock", "pom.xml", "build.gradle",
     "composer.lock", "packages.lock.json",
 ]
+
+# ── Secrets (betterleaks) constants ────────────────────────────────────────────
+_SECRETS_ENABLED = os.environ.get("ZAGWARE_SECRETS_ENABLED", "true").lower() != "false"
+_SECRETS_BIN     = os.environ.get("_ZAGWARE_SECRETS_BIN", "/usr/local/bin/betterleaks")
+# Fail the build if a NEW secret lands in a PUBLIC repo, regardless of ZAGWARE_FAIL_ON_NEW.
+# Betterleaks has no severity taxonomy, so repo visibility is the priority signal instead —
+# a leaked credential in a public repo is immediately exposed to the world.
+_SECRETS_FAIL_ON_PUBLIC = os.environ.get("ZAGWARE_SECRETS_FAIL_ON_PUBLIC", "true").lower() != "false"
 
 def _severities_below() -> list[str]:
     """Return severities to pass to --exclude-severities based on ZAGWARE_MIN_SEVERITY.
@@ -214,11 +222,13 @@ def telemetry_flush(timeout: float = 2.0) -> None:
 def track_scan_started(
     platform_name: str, repo: str, is_pr: bool, sca_enabled: bool,
     has_platform_integration: bool, min_severity: str, fail_on_new: bool,
+    secrets_enabled: bool = False,
 ) -> None:
     distinct_id, props = _telemetry_identity(platform_name, repo)
     props.update({
         "is_pr":                    is_pr,
         "sca_enabled":               sca_enabled,
+        "secrets_enabled":           secrets_enabled,
         "has_platform_integration":  has_platform_integration,
         "min_severity_filter":       min_severity or "none",
         "fail_on_new":               fail_on_new,
@@ -231,17 +241,20 @@ def track_scan_completed(
     platform_name: str, repo: str, duration_seconds: float,
     iac_new: int, sca_new: int | None, iac_scanned: bool, sca_scanned: bool,
     suppressions_used: bool, exit_code: int,
+    secrets_new: int | None = None, secrets_scanned: bool = False,
 ) -> None:
     distinct_id, props = _telemetry_identity(platform_name, repo)
     props.update({
-        "duration_seconds":       round(duration_seconds, 1),
-        "iac_new_findings_bucket": _bucket_count(iac_new),
-        "sca_new_findings_bucket": _bucket_count(sca_new) if sca_scanned and sca_new is not None else "not_scanned",
-        "iac_scanned":            iac_scanned,
-        "sca_scanned":            sca_scanned,
-        "suppressions_used":      suppressions_used,
-        "exit_code":              exit_code,
-        "_distinct_id":           distinct_id,
+        "duration_seconds":           round(duration_seconds, 1),
+        "iac_new_findings_bucket":    _bucket_count(iac_new),
+        "sca_new_findings_bucket":    _bucket_count(sca_new) if sca_scanned and sca_new is not None else "not_scanned",
+        "secrets_new_findings_bucket": _bucket_count(secrets_new) if secrets_scanned and secrets_new is not None else "not_scanned",
+        "iac_scanned":                iac_scanned,
+        "sca_scanned":                sca_scanned,
+        "secrets_scanned":            secrets_scanned,
+        "suppressions_used":          suppressions_used,
+        "exit_code":                  exit_code,
+        "_distinct_id":               distinct_id,
     })
     _send_telemetry_event("scan_completed", props)
 
@@ -327,6 +340,15 @@ class Platform(ABC):
         showing the interactive suppress hint there would be misleading (the
         command would silently do nothing)."""
         return False
+
+    def repo_visibility(self) -> str:
+        """Return 'public' | 'private' | 'internal' | 'unknown' — best-effort repo
+        visibility. Used as the priority signal for secrets findings in place of a
+        severity level (betterleaks has no severity taxonomy): a leaked credential
+        in a public repo is immediately exposed to the world, so public repos are
+        treated as materially higher urgency than private ones. Never raises —
+        network/auth failures fall back to 'unknown' rather than breaking the scan."""
+        return "unknown"
 
     def repo(self) -> str:
         """Full repository name (owner/repo or similar). Empty string if unavailable."""
@@ -458,6 +480,16 @@ class GitHub(Platform):
     def supports_interactive_suppression(self) -> bool:
         return True  # GitHub is the only platform with read_pr_comments() implemented
 
+    def repo_visibility(self) -> str:
+        try:
+            owner, repo = self._repo.split("/", 1)
+            data = _http("GET", f"https://api.github.com/repos/{owner}/{repo}", headers=self._headers())
+            assert isinstance(data, dict)
+            return "private" if data.get("private") else "public"
+        except Exception as exc:
+            log.debug("Could not determine repo visibility: %s", exc)
+            return "unknown"
+
 
 class GitLab(Platform):
     """
@@ -528,6 +560,11 @@ class GitLab(Platform):
 
     def repo(self) -> str:
         return os.environ.get("CI_PROJECT_PATH", "")
+
+    def repo_visibility(self) -> str:
+        # GitLab CI injects this automatically — no API call needed.
+        vis = os.environ.get("CI_PROJECT_VISIBILITY", "").strip().lower()
+        return vis if vis in ("public", "private", "internal") else "unknown"
 
     def pr_number(self) -> int | None:
         val = os.environ.get("CI_MERGE_REQUEST_IID", "").strip()
@@ -629,6 +666,16 @@ class Bitbucket(Platform):
         slug = os.environ.get("BITBUCKET_REPO_SLUG", "")
         return f"{ws}/{slug}" if ws and slug else ""
 
+    def repo_visibility(self) -> str:
+        try:
+            api = f"https://api.bitbucket.org/2.0/repositories/{self._workspace}/{self._slug}"
+            data = _http("GET", api, headers=self._headers())
+            assert isinstance(data, dict)
+            return "private" if data.get("is_private") else "public"
+        except Exception as exc:
+            log.debug("Could not determine repo visibility: %s", exc)
+            return "unknown"
+
     def pr_number(self) -> int | None:
         val = os.environ.get("BITBUCKET_PR_ID", "").strip()
         return int(val) if val else None
@@ -723,6 +770,17 @@ class AzureDevOps(Platform):
         project = os.environ.get("SYSTEM_TEAMPROJECT", "")
         name    = os.environ.get("BUILD_REPOSITORY_NAME", "")
         return f"{project}/{name}" if project and name else ""
+
+    def repo_visibility(self) -> str:
+        try:
+            api = f"{self._org_url}/_apis/projects/{urllib.parse.quote(self._project, safe='')}?api-version=7.1"
+            data = _http("GET", api, headers=self._headers())
+            assert isinstance(data, dict)
+            vis = (data.get("visibility") or "").strip().lower()
+            return vis if vis in ("public", "private") else "unknown"
+        except Exception as exc:
+            log.debug("Could not determine repo visibility: %s", exc)
+            return "unknown"
 
     def pr_number(self) -> int | None:
         val = os.environ.get("SYSTEM_PULLREQUEST_PULLREQUESTID", "").strip()
@@ -1083,6 +1141,99 @@ def new_sca_findings(
             if f["similarity_id"] not in base_sims
             and f["similarity_id"] not in supp]
 
+# ── Secrets (betterleaks) ────────────────────────────────────────────────────
+
+def run_secrets_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
+    """Run betterleaks against the current working-tree state of *path*.
+
+    Scans filesystem state only (betterleaks `dir` mode) — not git history. This
+    matches the same shallow-clone / working-tree-diff architecture already used
+    for IaC (KICS) and SCA (Syft+Grype): the scanner clones base and head branches
+    shallow and diffs their checked-out state, so a `git`-mode history scan isn't
+    applicable here (and would defeat the point of the shallow clone).
+
+    SECURITY: betterleaks' JSON report includes the raw secret value in `Secret`/
+    `Match` fields — `--redact` only affects console/log output, not the report
+    file (confirmed against betterleaks source, since its help text says "redact
+    secrets from logs and stdout"). This function reads ONLY rule_id/description/
+    file_path/line/tags/validation_status/fingerprint from each finding and never
+    touches Secret/Match/MatchContext/CaptureGroups/Line — those must never be
+    stored, logged, or transmitted anywhere downstream of this function.
+
+    Returns:
+        None  — secrets scanning disabled (ZAGWARE_SECRETS_ENABLED=false).
+        []    — scanned successfully (zero findings), or the scan tool failed.
+        [...] — scanned successfully, findings present.
+    """
+    if not _SECRETS_ENABLED:
+        return None
+
+    out_json = f"{tmp_dir}/secrets_{label}.json"
+    cmd = [
+        _SECRETS_BIN, "dir", ".",
+        "--report-path", out_json,
+        "--report-format", "json",
+        "--exit-code", "0",  # report file is the source of truth, not the exit code
+        "--no-color",
+        "--no-banner",
+    ]
+    log.info("Secrets: running betterleaks on %s...", label)
+    try:
+        # cwd=path + "." (not the absolute path) so the Fingerprint's embedded
+        # file path is relative and stable across base/head's different tmp dirs —
+        # otherwise every finding would show as "new" even when unchanged.
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=path, timeout=300)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log.warning("Secrets: betterleaks unavailable for %s: %s", label, e)
+        return []
+    if result.returncode != 0:
+        log.warning("Secrets: betterleaks exited %d for %s: %s", result.returncode, label,
+                    (result.stderr or result.stdout or "").strip()[:400])
+
+    try:
+        raw = json.loads(Path(out_json).read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        log.warning("Secrets: could not read betterleaks output for %s: %s", label, e)
+        return []
+    if not raw:  # betterleaks writes the literal JSON `null` when zero findings
+        log.info("Secrets %s: 0 finding(s)", label)
+        return []
+
+    findings: list[dict] = []
+    for f in raw:
+        try:
+            rule_id     = f.get("RuleID", "")
+            fingerprint = f.get("Fingerprint", "")
+            if not rule_id or not fingerprint:
+                continue
+            findings.append({
+                "rule_id":           rule_id,
+                "description":       f.get("Description", ""),
+                "file_path":         f.get("File") or (f.get("Attributes") or {}).get("path", ""),
+                "line":              f.get("StartLine"),
+                "tags":              list(f.get("Tags") or []),
+                "validation_status": (f.get("ValidationStatus") or "unknown").lower(),
+                "similarity_id":     fingerprint,
+            })
+            # NEVER read f["Secret"], f["Match"], f["MatchContext"], f["CaptureGroups"], f["Line"] here.
+        except Exception as e:
+            log.warning("Secrets: skipping malformed finding: %s", e)
+            continue
+    log.info("Secrets %s: %d finding(s)", label, len(findings))
+    return findings
+
+
+def new_secrets_findings(
+    base: list[dict] | None, head: list[dict] | None,
+    suppressed: set[str] | None = None,
+) -> list[dict]:
+    base_sims = {f["similarity_id"] for f in (base or [])}
+    supp = suppressed or set()
+    return [f for f in (head or [])
+            if f["similarity_id"] not in base_sims
+            and f["similarity_id"] not in supp]
+
+
 # ── Interactive suppression from PR comments ──────────────────────────────────
 
 _SUPPRESS_CMD_RE = _re.compile(
@@ -1119,7 +1270,7 @@ def parse_suppression_commands(comments: list[dict]) -> list[tuple[str, str, str
 
 
 def resolve_suppression_id(
-    prefix: str, novel: list[dict], novel_sca: list[dict],
+    prefix: str, novel: list[dict], novel_sca: list[dict], novel_secrets: list[dict] | None = None,
 ) -> str | None:
     """Resolve a (possibly truncated) similarity_id prefix against current novel findings.
 
@@ -1135,6 +1286,10 @@ def resolve_suppression_id(
             if sid == prefix or (is_prefix_ok and sid.startswith(prefix)):
                 candidates.add(sid)
     for f in novel_sca:
+        sid = f.get("similarity_id", "")
+        if sid == prefix or (is_prefix_ok and sid.startswith(prefix)):
+            candidates.add(sid)
+    for f in (novel_secrets or []):
         sid = f.get("similarity_id", "")
         if sid == prefix or (is_prefix_ok and sid.startswith(prefix)):
             candidates.add(sid)
@@ -1536,14 +1691,79 @@ def render_sca_section(
     return "\n".join(L)
 
 
+def render_secrets_section(
+    base_secrets: list[dict] | None, head_secrets: list[dict] | None, novel_secrets: list[dict],
+    is_public: bool, collapsible: bool = True,
+) -> str:
+    """Return the Secrets block to append to the PR comment. Empty string if no
+    secrets data.
+
+    Betterleaks has no severity taxonomy, so unlike the IaC/SCA sections there is
+    no per-severity breakdown. Instead, a public-repo exposure banner is shown
+    when the repo is public and new secrets were found — a leaked credential in a
+    public repo is immediately exposed to the world, which is the priority signal
+    used in place of severity (see Platform.repo_visibility()).
+
+    Never renders the secret value itself — only rule_id/file_path/line/tags/
+    validation_status, matching what run_secrets_scan() reads from the report.
+    """
+    base_list = base_secrets or []
+    head_list = head_secrets or []
+    if not head_list and not base_list:
+        return ""
+    L = [
+        "", "---", "## 🔑 Zagware Secrets — Leaked Credentials", "",
+        "| | Base | This PR | New |",
+        "|---|:---:|:---:|:---:|",
+        f"| Findings | {len(base_list)} | {len(head_list)} | **{len(novel_secrets)}** |",
+        "",
+    ]
+    if not novel_secrets:
+        L.append("✅ **No new secrets introduced by this PR.**")
+        return "\n".join(L)
+
+    if is_public:
+        L += [
+            "> 🌐 **PUBLIC REPOSITORY** — any leaked secret here is immediately exposed to the "
+            "world. Rotate affected credentials before merging.",
+            "",
+        ]
+    L += [f"> 🔴 **{len(novel_secrets)} new secret(s) introduced by this PR**", ""]
+
+    if collapsible:
+        L += ["<details>",
+              f"<summary>🔑 <strong>Secrets</strong> — {len(novel_secrets)} finding(s)</summary>", ""]
+    else:
+        L += ["---", f"### 🔑 Secrets — {len(novel_secrets)} finding(s)", ""]
+    L += [
+        "| Rule | File | Line | Validation |",
+        "|---|---|:---:|:---:|",
+    ]
+    _VALIDATION_CELL = {"valid": "🔴 Valid", "invalid": "⚪ Invalid", "unknown": "❓ Unknown"}
+    for f in novel_secrets:
+        tags = ", ".join(f.get("tags") or [])
+        rule_cell = f.get("rule_id", "") + (f" ({tags})" if tags else "")
+        vs_cell = _VALIDATION_CELL.get(f.get("validation_status", "unknown"), "❓ Unknown")
+        L.append(f"| `{rule_cell}` | `{f.get('file_path', '')}` | {f.get('line', '—')} | {vs_cell} |")
+    if collapsible:
+        L += ["", "</details>"]
+    L += [
+        "",
+        "> ⚠️ Never paste the secret value in a PR comment — rotate the credential, "
+        "then remove it from the code.",
+    ]
+    return "\n".join(L)
+
+
 def render_suppression_hints(
-    novel: list[dict], novel_sca: list[dict], collapsible: bool = True,
+    novel: list[dict], novel_sca: list[dict], novel_secrets: list[dict] | None = None,
+    collapsible: bool = True,
 ) -> str:
     """Render a collapsible section listing similarity IDs for /zagware suppress commands.
 
-    Covers both IaC (novel) and SCA (novel_sca) findings. IDs are shown as a 16-char
-    prefix; the scanner resolves prefixes >=6 chars against real findings, so the
-    truncated display is always safe to copy-paste.
+    Covers IaC (novel), SCA (novel_sca), and Secrets (novel_secrets) findings. IDs are
+    shown as a 16-char prefix; the scanner resolves prefixes >=6 chars against real
+    findings, so the truncated display is always safe to copy-paste.
     """
     items: list[tuple[str, str, str]] = []  # (similarity_id, description, location)
     for q in novel:
@@ -1558,6 +1778,12 @@ def render_suppression_hints(
             f.get("similarity_id", ""),
             f"{f.get('vulnerability_id', '')} in {f.get('package_name', '')}",
             f.get("file_path", "") or f.get("package_name", ""),
+        ))
+    for f in (novel_secrets or []):
+        items.append((
+            f.get("similarity_id", ""),
+            f.get("rule_id", ""),
+            f.get("file_path", ""),
         ))
     if not items:
         return ""
@@ -1596,6 +1822,7 @@ def collect_suppression_records(
     pr_dir: str,
     pr_results: dict,
     head_sca: list[dict] | None,
+    head_secrets: list[dict] | None,
     suppressed_ids: set[str],
     just_suppressed: list[tuple[str, str, str, str]],
 ) -> list[dict]:
@@ -1613,7 +1840,7 @@ def collect_suppression_records(
 
     Uploaded to the platform (see upload_suppressions_to_platform) so suppressions
     are auditable by repo/PR/user, and so widely-suppressed findings across many
-    repos surface as candidates for tightening the underlying IaC/SCA policy.
+    repos surface as candidates for tightening the underlying IaC/SCA/Secrets policy.
     """
     finding_info: dict[str, tuple[str, str, str]] = {}
     for q in pr_results.get("queries", []):
@@ -1629,6 +1856,10 @@ def collect_suppression_records(
                 f.get("file_path", "") or f.get("package_name", ""),
                 "sca",
             )
+    for f in (head_secrets or []):
+        sid = f.get("similarity_id", "")
+        if sid:
+            finding_info[sid] = (f.get("rule_id", ""), f.get("file_path", ""), "secrets")
 
     file_records = _parse_suppressions_file(pr_dir)
     just_by_id = {sid: (reason, author, created_at)
@@ -1803,6 +2034,52 @@ def upload_sca_to_platform(
     except Exception as e:
         log.warning('Failed to upload SCA results to platform: %s', e)
 
+def upload_secrets_to_platform(
+    platform_url: str, platform_token: str,
+    repo: str, base_branch: str, head_branch: str,
+    pr_number: int | None, repo_visibility: str,
+    base_findings: list[dict], head_findings: list[dict],
+) -> None:
+    """Upload secrets scan results to the GTP platform. Non-fatal if this fails."""
+    try:
+        headers = {
+            'Authorization': f'Bearer {platform_token}',
+            'Content-Type': 'application/json',
+        }
+
+        def _post(payload: dict) -> dict:
+            data = json.dumps(payload).encode('utf-8')
+            req  = urllib.request.Request(
+                f'{platform_url}/api/v1/secrets/upload',
+                data=data, headers=headers, method='POST',
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+
+        base_resp = _post({
+            'repo': repo, 'branch': base_branch,
+            'scan_type': 'pr_base' if pr_number else 'branch',
+            'pr_number': pr_number, 'pr_comparison_id': None,
+            'scanner_version': __version__,
+            'repo_visibility': repo_visibility,
+            'repo_base_url': _repo_base_url() or None,
+            'findings': base_findings,
+        })
+        base_scan_id = base_resp.get('scan_id')
+        if pr_number and base_scan_id:
+            _post({
+                'repo': repo, 'branch': head_branch,
+                'scan_type': 'pr_head', 'pr_number': pr_number,
+                'pr_comparison_id': base_scan_id,
+                'scanner_version': __version__,
+                'repo_visibility': repo_visibility,
+                'repo_base_url': _repo_base_url() or None,
+                'findings': head_findings,
+            })
+        log.info('Secrets results uploaded to platform (base: %s)', base_scan_id)
+    except Exception as e:
+        log.warning('Failed to upload secrets results to platform: %s', e)
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def _write_artifacts(
@@ -1813,6 +2090,9 @@ def _write_artifacts(
     base_sca: list[dict] | None,
     head_sca: list[dict] | None,
     novel_sca: list[dict],
+    base_secrets: list[dict] | None,
+    head_secrets: list[dict] | None,
+    novel_secrets: list[dict],
     timings: dict[str, float],
     meta: dict,
 ) -> None:
@@ -1833,7 +2113,16 @@ def _write_artifacts(
         (d / "sca-head.json").write_text(
             json.dumps(head_sca or [], indent=2, ensure_ascii=False), encoding="utf-8")
         (d / "sca-new.json").write_text(
-            json.dumps(novel_sca,  indent=2, ensure_ascii=False), encoding="utf-8")
+            json.dumps(novel_sca, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # Secrets findings (redaction unnecessary — run_secrets_scan() never carries
+        # the raw secret value in the first place, only rule_id/file_path/line/tags)
+        (d / "secrets-base.json").write_text(
+            json.dumps(base_secrets or [], indent=2, ensure_ascii=False), encoding="utf-8")
+        (d / "secrets-head.json").write_text(
+            json.dumps(head_secrets or [], indent=2, ensure_ascii=False), encoding="utf-8")
+        (d / "secrets-new.json").write_text(
+            json.dumps(novel_secrets, indent=2, ensure_ascii=False), encoding="utf-8")
 
         # Rendered PR comment (markdown)
         (d / "pr-comment.md").write_text(comment, encoding="utf-8")
@@ -1887,7 +2176,7 @@ def main() -> int:
     _has_platform = bool(os.environ.get('ZAGWARE_PLATFORM_URL')) and bool(os.environ.get('ZAGWARE_PLATFORM_TOKEN'))
     track_scan_started(
         platform.name(), platform.repo(), platform.pr_number() is not None,
-        _SCA_ENABLED, _has_platform, _MIN_SEVERITY, _FAIL_ON_NEW,
+        _SCA_ENABLED, _has_platform, _MIN_SEVERITY, _FAIL_ON_NEW, _SECRETS_ENABLED,
     )
 
     timings: dict[str, float] = {}
@@ -1985,9 +2274,42 @@ def main() -> int:
             )
             timings["platform_upload_sca"] = time.perf_counter() - t0
 
+        # ── Secrets (betterleaks) ───────────────────────────────────────────────
+        t0 = time.perf_counter()
+        base_secrets = run_secrets_scan(base_dir, tmp, "base")
+        timings["secrets_base"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        head_secrets = run_secrets_scan(pr_dir, tmp, "pr")
+        timings["secrets_head"] = time.perf_counter() - t0
+
+        # Only pay for the visibility lookup (an API call on GitHub/Bitbucket/Azure)
+        # when secrets scanning actually ran.
+        repo_visibility = "unknown"
+        if base_secrets is not None or head_secrets is not None:
+            repo_visibility = platform.repo_visibility()
+            if repo_visibility == "public":
+                log.warning("Repository visibility: PUBLIC — leaked secrets here are immediately exposed")
+            else:
+                log.info("Repository visibility: %s", repo_visibility)
+
+        # (novel_secrets computed later in the Diff section, after suppression commands resolve)
+
+        if _platform_url and _platform_token and (base_secrets is not None or head_secrets is not None):
+            t0 = time.perf_counter()
+            upload_secrets_to_platform(
+                _platform_url, _platform_token,
+                platform.repo(),
+                base_branch, head_branch,
+                platform.pr_number(), repo_visibility,
+                base_secrets or [], head_secrets or [],
+            )
+            timings["platform_upload_secrets"] = time.perf_counter() - t0
+
         # ── Diff ─────────────────────────────────────────────────────────────
         novel     = new_findings(base_results, pr_results, suppressed_ids)
         novel_sca = new_sca_findings(base_sca, head_sca, suppressed_ids)
+        novel_secrets = new_secrets_findings(base_secrets, head_secrets, suppressed_ids)
 
         # ── Check for interactive suppression commands in PR comments ────────
         # Resolve against THIS scan's novel findings (both IaC and SCA), apply,
@@ -2001,7 +2323,7 @@ def main() -> int:
                 commands = parse_suppression_commands(comments)
                 resolved: list[tuple[str, str, str, str]] = []
                 for raw_id, reason, author, created_at in commands:
-                    full_id = resolve_suppression_id(raw_id, novel, novel_sca)
+                    full_id = resolve_suppression_id(raw_id, novel, novel_sca, novel_secrets)
                     if full_id:
                         resolved.append((full_id, reason, author, created_at))
                     elif raw_id not in suppressed_ids:
@@ -2016,11 +2338,11 @@ def main() -> int:
                         suppressed_ids |= {sid for sid, _, _, _ in resolved}
                         just_suppressed = resolved
                         track_suppression_applied(platform.name(), platform.repo(), len(resolved))
-                        # Recompute with the updated suppression set
                         novel     = new_findings(base_results, pr_results, suppressed_ids)
                         novel_sca = new_sca_findings(base_sca, head_sca, suppressed_ids)
-                        log.info("Applied — recomputed: %d IaC new, %d SCA new",
-                                 count_findings(novel), len(novel_sca))
+                        novel_secrets = new_secrets_findings(base_secrets, head_secrets, suppressed_ids)
+                        log.info("Applied — recomputed: %d IaC new, %d SCA new, %d Secrets new",
+                                 count_findings(novel), len(novel_sca), len(novel_secrets))
             except Exception as exc:
                 log.warning("Failed to process suppression commands: %s", exc)
 
@@ -2031,7 +2353,7 @@ def main() -> int:
             if _platform_url and _platform_token:
                 t0 = time.perf_counter()
                 suppression_records = collect_suppression_records(
-                    pr_dir, pr_results, head_sca, suppressed_ids, just_suppressed,
+                    pr_dir, pr_results, head_sca, head_secrets, suppressed_ids, just_suppressed,
                 )
                 upload_suppressions_to_platform(
                     _platform_url, _platform_token,
@@ -2056,9 +2378,14 @@ def main() -> int:
             base_sca, head_sca, novel_sca,
             collapsible=platform.supports_html_details(),
         )
+        comment += render_secrets_section(
+            base_secrets, head_secrets, novel_secrets,
+            repo_visibility == "public",
+            collapsible=platform.supports_html_details(),
+        )
         if platform.supports_interactive_suppression():
             comment += render_suppression_hints(
-                novel, novel_sca,
+                novel, novel_sca, novel_secrets,
                 collapsible=platform.supports_html_details(),
             )
 
@@ -2074,17 +2401,22 @@ def main() -> int:
             "base_branch": base_branch,
             "head_branch": head_branch,
             "pr_number":   platform.pr_number(),
+            "repo_visibility": repo_visibility,
             "iac_base_findings": base_count,
             "iac_head_findings": pr_count,
             "iac_new_findings":  count_findings(novel),
             "sca_base_findings": len(base_sca)  if base_sca  is not None else None,
             "sca_head_findings": len(head_sca)  if head_sca  is not None else None,
             "sca_new_findings":  len(novel_sca),
+            "secrets_base_findings": len(base_secrets) if base_secrets is not None else None,
+            "secrets_head_findings": len(head_secrets) if head_secrets is not None else None,
+            "secrets_new_findings":  len(novel_secrets),
         }
         _write_artifacts(
             _OUTPUT_DIR, comment,
             base_results, pr_results,
             base_sca, head_sca, novel_sca,
+            base_secrets, head_secrets, novel_secrets,
             timings, meta,
         )
 
@@ -2096,8 +2428,11 @@ def main() -> int:
             "iac_head":             "  IaC head",
             "sca_base":             "  SCA base (Syft+Grype)",
             "sca_head":             "  SCA head (Syft+Grype)",
+            "secrets_base":         "  Secrets base (betterleaks)",
+            "secrets_head":         "  Secrets head (betterleaks)",
             "platform_upload_iac":          "  Platform upload (IaC)",
             "platform_upload_sca":          "  Platform upload (SCA)",
+            "platform_upload_secrets":      "  Platform upload (Secrets)",
             "platform_upload_suppressions": "  Platform upload (Suppressions)",
             "total":                "  Total",
         }
@@ -2116,16 +2451,24 @@ def main() -> int:
         else:
             log.info("No PR detected — skipping comment post")
 
-    # ── Fail-on-new gate (IaC + SCA combined) ─────────────────────────────────
-    new_total  = new_count + len(novel_sca)
+    # ── Fail-on-new gate (IaC + SCA + Secrets combined) ───────────────────────
+    new_total  = new_count + len(novel_sca) + len(novel_secrets)
     exit_code  = 1 if (_FAIL_ON_NEW and new_total > 0) else 0
-    if exit_code:
+    # Public-repo secrets are always fail-worthy regardless of ZAGWARE_FAIL_ON_NEW —
+    # betterleaks has no severity to gate on, so repo visibility is the priority
+    # signal instead, and a leaked credential in a public repo is urgent by definition.
+    if _SECRETS_FAIL_ON_PUBLIC and repo_visibility == "public" and novel_secrets:
+        exit_code = 1
+        log.warning("Exiting 1 — %d new secret(s) in a PUBLIC repository (ZAGWARE_SECRETS_FAIL_ON_PUBLIC=true)",
+                     len(novel_secrets))
+    elif exit_code:
         log.warning("Exiting 1 — %d new finding(s) (ZAGWARE_FAIL_ON_NEW=true)", new_total)
 
     track_scan_completed(
         platform.name(), platform.repo(), timings.get("total", 0.0),
         new_count, len(novel_sca), True, (base_sca is not None or head_sca is not None),
         bool(suppressed_ids), exit_code,
+        secrets_new=len(novel_secrets), secrets_scanned=(base_secrets is not None or head_secrets is not None),
     )
 
     log.info("Done.")
