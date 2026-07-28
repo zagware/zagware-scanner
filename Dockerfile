@@ -1,9 +1,10 @@
-FROM debian:bookworm-slim
+# ── Builder stage: download and verify all binaries ──────────────────────────
+# curl is only needed here; the final stage omits it to reduce attack surface.
+FROM debian:bookworm-slim AS builder
 
-# ── Pinned versions — update together with the checksums below ────────────────
-# To upgrade: download the new release artifact, run `sha256sum <file>`, update ARG.
 ARG KICS_VERSION=2.1.20
 ARG KICS_CHECKSUM=8a5aa375ccfdc0ddd1114eddf1f9638ad7f6122e98d12a592207509dbe6d81f8
+ARG KICS_RULES_COMMIT=e1f23cad9640f55b963f22a116b04906b8c16ac6
 
 ARG SYFT_VERSION=v1.19.0
 ARG SYFT_CHECKSUM=f3667d6abfa97a1e5614882f81e0a0b090f0047e0df7025b568fa87b6d95ac58
@@ -11,50 +12,39 @@ ARG SYFT_CHECKSUM=f3667d6abfa97a1e5614882f81e0a0b090f0047e0df7025b568fa87b6d95ac
 ARG GRYPE_VERSION=v0.112.0
 ARG GRYPE_CHECKSUM=434bae8af635b6308d7a33ea842c6216dc382d4ec49fe3873f927b7805cc69e2
 
-# ── System dependencies ────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    git \
-    python3 \
+    ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/*
 
-# Silence git ownership warnings inside containers
-RUN git config --global safe.directory '*' \
-    && git config --global advice.detachedHead false
-
-# ── KICS binary — download and verify SHA256 ──────────────────────────────────
-# Supply chain note: KICS GitHub Actions and Docker Hub images were compromised
-# in March–April 2026 (TeamPCP campaign). KICS v2.1.20 was published 2026-03-03,
-# before those windows. We verify by hardcoded SHA256 (KICS_CHECKSUM) rather than
-# the KICS GPG signature because downloading the signing key from the same endpoint
-# as the binary gives no independent trust — both could be swapped together.
-# The SHA256 value comes from us, verified against a known-good download, and
-# committed to our source tree.
+# ── KICS binary — SHA256-verified (not GPG — see supply chain note below) ──────
+# KICS GitHub Actions and Docker Hub images were compromised in March–April 2026
+# (TeamPCP campaign). KICS v2.1.20 was published 2026-03-03, before those windows.
+# We verify by hardcoded SHA256 rather than the KICS GPG signature because
+# downloading the signing key from the same endpoint as the binary gives no
+# independent trust — both could be swapped together.
 RUN curl -fsSL \
         "https://github.com/Checkmarx/kics/releases/download/v${KICS_VERSION}/kics_${KICS_VERSION}_linux_amd64.tar.gz" \
         -o /tmp/kics.tar.gz \
     && echo "${KICS_CHECKSUM}  /tmp/kics.tar.gz" | sha256sum -c - \
-    && tar -xzf /tmp/kics.tar.gz -C /usr/local/bin kics \
-    && chmod +x /usr/local/bin/kics \
+    && tar -xzf /tmp/kics.tar.gz -C /tmp kics \
     && rm /tmp/kics.tar.gz
 
-# ── KICS query rules ─────────────────────────────────────────────────────────
-# Sparse-clone at the exact version tag — rules are not bundled in the binary.
-RUN git clone \
-      --depth=1 \
-      --filter=blob:none \
-      --sparse \
-      --branch "v${KICS_VERSION}" \
-      https://github.com/Checkmarx/kics.git \
-      /opt/iac-rules \
-    && git -C /opt/iac-rules sparse-checkout set assets/queries assets/libraries \
-    && echo "Loaded $(ls /opt/iac-rules/assets/queries | wc -l | tr -d ' ') query platforms"
+# ── KICS query rules — pinned to immutable commit SHA (not mutable tag) ────────
+# The Checkmarx/kics repo was compromised in TeamPCP. A mutable tag could be
+# force-updated to a malicious commit. We pin to the exact commit SHA that the
+# v2.1.20 tag pointed to at build time, verified independently.
+RUN git init /tmp/iac-rules \
+    && cd /tmp/iac-rules \
+    && git remote add origin https://github.com/Checkmarx/kics.git \
+    && git fetch --depth=1 origin ${KICS_RULES_COMMIT} \
+    && git sparse-checkout init --cone \
+    && git sparse-checkout set assets/queries assets/libraries \
+    && git checkout ${KICS_RULES_COMMIT} \
+    && rm -rf .git
 
-# ── Syft — download and verify SHA256 ────────────────────────────────────────
-# Anchore's cosign signatures for checksums.txt are verified in publish.yml
-# BEFORE this Dockerfile is built. Here we verify the .deb matches our pinned
-# SHA256, giving a content-addressed guarantee independent of tag mutability.
+# ── Syft — SHA256-verified .deb ───────────────────────────────────────────────
+# Anchore's cosign signatures on checksums.txt are verified in publish.yml
+# BEFORE this Dockerfile is built.
 RUN SYFT_VER="${SYFT_VERSION#v}" && \
     curl -fL \
         "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_linux_amd64.deb" \
@@ -63,8 +53,7 @@ RUN SYFT_VER="${SYFT_VERSION#v}" && \
     && dpkg -i /tmp/syft.deb \
     && rm /tmp/syft.deb
 
-# ── Grype — download and verify SHA256 ───────────────────────────────────────
-# Same approach as Syft. Cosign signature on checksums verified in publish CI.
+# ── Grype — SHA256-verified .deb ──────────────────────────────────────────────
 RUN GRYPE_VER="${GRYPE_VERSION#v}" && \
     curl -fL \
         "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_linux_amd64.deb" \
@@ -72,6 +61,24 @@ RUN GRYPE_VER="${GRYPE_VERSION#v}" && \
     && echo "${GRYPE_CHECKSUM}  /tmp/grype.deb" | sha256sum -c - \
     && dpkg -i /tmp/grype.deb \
     && rm /tmp/grype.deb
+
+# ── Final stage: minimal runtime image (no curl) ──────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Scope git safe.directory to /tmp (where scanner clones repos) instead of '*'
+# to preserve the CVE-2022-24765 ownership check for other paths.
+RUN git config --global safe.directory '/tmp/*' \
+    && git config --global advice.detachedHead false
+
+# ── Copy verified binaries from builder ───────────────────────────────────────
+COPY --from=builder /tmp/kics         /usr/local/bin/kics
+COPY --from=builder /tmp/iac-rules    /opt/iac-rules
+COPY --from=builder /usr/bin/syft     /usr/bin/syft
+COPY --from=builder /usr/bin/grype    /usr/bin/grype
 
 # ── Zagware scanner entrypoint ────────────────────────────────────────────────
 COPY src/scanner.py /usr/local/bin/zagware-scan

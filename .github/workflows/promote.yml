@@ -1,0 +1,190 @@
+# Promotes the :latest image to :stable and :secure after a 14-day cooling period
+# and a clean CVE scan. Runs daily via cron, or manually via workflow_dispatch.
+#
+# Tag semantics:
+#   :<version>  — immutable per release
+#   :latest     — newest release (not security-vetted)
+#   :stable     — promoted from :latest after 14-day cooling + clean CVE scan
+#   :secure     — identical digest to :stable (security-audited marker)
+#
+# If CVEs are found during promotion, a GitHub issue is opened and promotion is blocked.
+
+name: Promote to Stable
+
+on:
+  schedule:
+    # Daily at 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to promote (e.g. 2.2.0). Leave empty to auto-detect.'
+        required: false
+        default: ''
+
+jobs:
+  promote:
+    name: Promote latest → stable
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # open issues, commit README updates
+      packages: write       # re-tag images
+      id-token: write       # cosign keyless signing
+      attestations: write   # promotion attestation
+      issues: write         # open blocked-promotion issues
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GH_PAT_PACKAGES }}
+
+      - name: Resolve latest tag digest and age
+        id: latest
+        run: |
+          # Get the manifest digest of :latest
+          LATEST_DIGEST=$(docker buildx imagetools inspect \
+            ghcr.io/zagware/zagware-scanner:latest \
+            --format '{{.Manifest.Digest}}' 2>/dev/null)
+
+          if [ -z "$LATEST_DIGEST" ]; then
+            echo "No :latest tag found — nothing to promote"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "digest=$LATEST_DIGEST" >> "$GITHUB_OUTPUT"
+
+          # Get the creation date of the :latest tag from GHCR via GitHub API
+          TAG_DATE=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT_PACKAGES }}" \
+            "https://api.github.com/orgs/zagware/packages/container/zagware-scanner/versions?per_page=100" \
+            | jq -r --arg digest "${LATEST_DIGEST#sha256:}" \
+              '.[] | select(.metadata.container.tags | index("latest")) | .created_at')
+
+          if [ -z "$TAG_DATE" ]; then
+            echo "Could not determine :latest creation date — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TAG_TS=$(date -d "$TAG_DATE" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%SZ" "$TAG_DATE" +%s)
+          NOW_TS=$(date +%s)
+          AGE_DAYS=$(( (NOW_TS - TAG_TS) / 86400 ))
+
+          echo "Latest digest: $LATEST_DIGEST"
+          echo "Latest tag age: ${AGE_DAYS} days"
+
+          # Check if :stable already points to this digest
+          STABLE_DIGEST=$(docker buildx imagetools inspect \
+            ghcr.io/zagware/zagware-scanner:stable \
+            --format '{{.Manifest.Digest}}' 2>/dev/null || echo "")
+
+          if [ "$STABLE_DIGEST" = "$LATEST_DIGEST" ]; then
+            echo ":stable already points to this digest — nothing to promote"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$AGE_DAYS" -lt 14 ]; then
+            echo "Latest tag is only ${AGE_DAYS} days old — needs 14-day cooling period"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "age_days=$AGE_DAYS" >> "$GITHUB_OUTPUT"
+
+      - name: Skip promotion
+        if: steps.latest.outputs.skip == 'true'
+        run: echo "Skipping promotion — see previous step output for reason."
+
+      - name: Scan image for CVEs (Grype)
+        if: steps.latest.outputs.skip != 'true'
+        id: scan
+        run: |
+          echo "Scanning ghcr.io/zagware/zagware-scanner@${{ steps.latest.outputs.digest }} for CVEs..."
+          SCAN_OUTPUT=$(grype "ghcr.io/zagware/zagware-scanner@${{ steps.latest.outputs.digest }}" \
+            -o json --fail-on high 2>&1) || true
+
+          HIGH_COUNT=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length' 2>/dev/null || echo "999")
+
+          echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$HIGH_COUNT" != "0" ]; then
+            echo "Found $HIGH_COUNT HIGH/CRITICAL vulnerabilities — promotion blocked"
+            echo "scan_failed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No HIGH/CRITICAL vulnerabilities found — safe to promote"
+            echo "scan_failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open issue for blocked promotion
+        if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Promotion blocked: ${{ steps.latest.outputs.digest }} has ${{ steps.scan.outputs.high_count }} HIGH/CRITICAL CVEs`,
+              body: `The promotion of \`ghcr.io/zagware/zagware-scanner@${{ steps.latest.outputs.digest }}\` to :stable was blocked because Grype found ${{ steps.scan.outputs.high_count }} HIGH/CRITICAL vulnerabilities.\n\nThe image remains on :latest. Once the CVEs are resolved (either by patching the base image or bumping affected packages), re-run this workflow to retry promotion.`,
+              labels: ['security', 'promotion-blocked']
+            });
+
+      - name: Promote to stable and secure
+        if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'
+        run: |
+          DIGEST="${{ steps.latest.outputs.digest }}"
+
+          echo "Promoting $DIGEST to :stable and :secure..."
+
+          # Re-tag :stable → @digest (no rebuild — just copies the manifest pointer)
+          docker buildx imagetools create \
+            --tag ghcr.io/zagware/zagware-scanner:stable \
+            "ghcr.io/zagware/zagware-scanner@${DIGEST}"
+
+          # Re-tag :secure → @digest (same digest as :stable)
+          docker buildx imagetools create \
+            --tag ghcr.io/zagware/zagware-scanner:secure \
+            "ghcr.io/zagware/zagware-scanner@${DIGEST}"
+
+          echo "✓ Promoted to :stable and :secure"
+
+      - name: Sign promoted tags
+        if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'
+        run: |
+          DIGEST="${{ steps.latest.outputs.digest }}"
+
+          cosign sign --yes "ghcr.io/zagware/zagware-scanner:stable@${DIGEST}"
+          cosign sign --yes "ghcr.io/zagware/zagware-scanner:secure@${DIGEST}"
+
+          echo "✓ Signed :stable and :secure"
+
+      - name: Attest promotion
+        if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'
+        uses: actions/attest@ce27ba3b4a9a139d9a20a4a07d69fabb52f1e5bc # v2
+        with:
+          subject-name: ghcr.io/zagware/zagware-scanner
+          subject-digest: ${{ steps.latest.outputs.digest }}
+
+      - name: Promotion summary
+        if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'
+        run: |
+          echo "## Promoted to :stable and :secure" >> $GITHUB_STEP_SUMMARY
+          echo "**Digest:** \`${{ steps.latest.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Cooling period:** ${{ steps.latest.outputs.age_days }} days" >> $GITHUB_STEP_SUMMARY
+          echo "**CVE scan:** Clean (0 HIGH/CRITICAL)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "cosign verify ghcr.io/zagware/zagware-scanner:stable \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --certificate-identity-regexp '^https://github.com/zagware/zagware-scanner/.+\$' \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

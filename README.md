@@ -292,11 +292,11 @@ Every release of `ghcr.io/zagware/zagware-scanner` is built with a verifiable su
 
 | Layer | How |
 |---|---|
-| **KICS binary** | SHA256 checksum verified at build time; GPG signature on `checksums.txt` verified against Checkmarx's published signing key |
+| **KICS binary** | SHA256 checksum hardcoded in the Dockerfile and verified at build time. GPG signature is intentionally NOT used — downloading the signing key from the same endpoint as the binary provides no independent trust (both could be swapped together) |
 | **Syft binary** | SHA256 checksum verified at build time; cosign signature on checksums verified in CI before build |
 | **Grype binary** | SHA256 checksum verified at build time; cosign signature on checksums verified in CI before build |
 | **Our image** | Signed with cosign (keyless, GitHub OIDC → sigstore Rekor transparency log) |
-| **SBOM** | CycloneDX SBOM generated at build time and attached as an OCI attestation |
+| **SBOM** | SPDX SBOM generated at build time and attached as an OCI attestation |
 | **Provenance** | SLSA Build Level 3 provenance attestation — links the image digest to this exact source commit and workflow run |
 
 ### Why this matters (TeamPCP context)
@@ -317,18 +317,18 @@ Our mitigations:
 ### Verify the image you're running
 
 ```bash
-# Verify the image signature
+# Verify the image signature (anchored identity to prevent substring matches)
 cosign verify ghcr.io/zagware/zagware-scanner:latest \
-  --certificate-identity-regexp "https://github.com/zagware/zagware-scanner" \
+  --certificate-identity-regexp "^https://github.com/zagware/zagware-scanner/.+$" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 # Verify the SLSA provenance
 gh attestation verify oci://ghcr.io/zagware/zagware-scanner:latest \
   --repo zagware/zagware-scanner
 
-# Inspect the SBOM
+# Inspect the SBOM (SPDX format)
 cosign download attestation ghcr.io/zagware/zagware-scanner:latest \
-  | jq -r '.payload' | base64 -d | jq .predicate.components[].name
+  | jq -r '.payload' | base64 -d | jq .predicate.packages[].name
 ```
 
 ---
@@ -348,6 +348,11 @@ Then substitute `your-registry/zagware-scanner:latest` wherever this documentati
 The image requires internet access at build time to download KICS, Syft, and Grype from their
 public GitHub releases. At scan time, it only needs access to clone your repository and post
 the PR comment.
+
+**Note:** Self-hosted builds verify binary SHA256 checksums but do NOT verify the upstream
+cosign signatures on Syft/Grype `checksums.txt` (that step runs in our publish CI only).
+If you need that guarantee, run the `cosign verify-blob` steps from
+`.github/workflows/publish.yml` manually before building.
 
 ---
 
@@ -378,6 +383,85 @@ are optional — omit them and the scanner works without any platform account.
 | Azure DevOps | Build Service: Contribute to pull requests + OAuth token access |
 
 ---
+## Suppressions
+
+Suppress false positives or accepted-risk findings so they don't appear as "new" on every PR.
+Create a `.zagware/suppressions.yaml` file in your repository:
+
+```yaml
+# .zagware/suppressions.yaml
+- id: abc123def456...      # similarity_id from the scan results
+  reason: "False positive — test resource, not production"
+  expires: "2026-12-31"    # optional: auto-expires on this date
+
+- id: def789abc012...
+  reason: "Accepted risk — mitigated by network policy"
+```
+
+### How to find the `similarity_id`
+
+The `similarity_id` is a SHA256 fingerprint that uniquely identifies a finding. Find it in:
+
+1. **Scan artifacts** — `zagware-scan-results/summary.json` (downloaded from the pipeline run)
+2. **Platform** — the findings detail view on `app.zagware.io`
+3. **Raw KICS JSON** — `zagware-scan-results/iac-head.json` → `queries[].files[].similarity_id`
+
+For SCA findings, the `similarity_id` is `sha256(cve_id:package_name:package_version)`.
+
+### How suppressions work
+
+- The scanner reads `.zagware/suppressions.yaml` from the **PR branch** (not main)
+- Suppressed findings are excluded from the "new findings" diff — they won't appear in the PR comment
+- Suppressed findings are still uploaded to the platform (for audit trail) but marked as suppressed
+- The suppression count is logged in the scan output
+
+---
+
+## Severity filtering
+
+Control which severity levels the scanner reports and acts on:
+
+```yaml
+env:
+  ZAGWARE_MIN_SEVERITY: HIGH    # Only report HIGH and above (IaC + SCA)
+  ZAGWARE_FAIL_ON_NEW: "true"   # Break CI if new findings at or above the threshold
+```
+
+| `ZAGWARE_MIN_SEVERITY` | IaC findings shown | SCA findings shown |
+---|---|---|
+| _(unset)_ | All (HIGH, MEDIUM, LOW, INFO) | All (CRITICAL, HIGH, MEDIUM, LOW, NEGLIGIBLE) |
+| `HIGH` | HIGH only | CRITICAL, HIGH |
+| `MEDIUM` | HIGH, MEDIUM | CRITICAL, HIGH, MEDIUM |
+| `LOW` | HIGH, MEDIUM, LOW | CRITICAL, HIGH, MEDIUM, LOW |
+
+When `ZAGWARE_FAIL_ON_NEW=true`, the scanner exits 1 (breaking CI) if any **new** finding at or
+above the configured threshold is introduced by the PR. This applies to both IaC and SCA findings.
+Existing findings on the base branch are ignored — only net-new findings gate the merge.
+
+---
+
+## Image tags and release channels
+
+| Tag | Description |
+---|---|
+| `:<version>` (e.g. `:2.2.0`) | Immutable per release. Pin by digest for the strongest guarantee. |
+| `:latest` | Newest release. Moves on every tag push. **Not** security-vetted. |
+| `:stable` | Promoted from `:latest` after a 14-day cooling period + clean CVE scan. Moves only on promotion. |
+| `:secure` | Identical digest to `:stable`. Explicitly marks the security-audited image. |
+
+**Recommendation:** Pin `:stable` (or `:secure`) by digest for production CI. Use `:latest` for
+experimentation and getting the newest scanner features.
+
+### Promotion workflow
+
+1. A new version is tagged → image builds as `:<version>` and `:latest`
+2. After 14 days, the promotion workflow runs Grype + Trivy against the `:latest` digest
+3. If no HIGH/CRITICAL CVEs are found → `:stable` and `:secure` are re-tagged to the same digest
+4. If CVEs are found → promotion is blocked, a GitHub issue is opened, `:latest` stays
+5. A weekly audit workflow re-scans `:stable` for post-promotion CVE disclosures
+
+---
+
 
 ## Contributing
 

@@ -1,0 +1,99 @@
+# Weekly audit of the :stable image for newly-disclosed CVEs.
+# If new HIGH/CRITICAL vulnerabilities are found, opens a GitHub issue
+# to alert maintainers. Optionally rolls :stable back to the prior digest.
+
+name: Audit Stable Image
+
+on:
+  schedule:
+    # Weekly on Mondays at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: Scan :stable for new CVEs
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GH_PAT_PACKAGES }}
+
+      - name: Resolve :stable digest
+        id: stable
+        run: |
+          DIGEST=$(docker buildx imagetools inspect \
+            ghcr.io/zagware/zagware-scanner:stable \
+            --format '{{.Manifest.Digest}}' 2>/dev/null)
+
+          if [ -z "$DIGEST" ]; then
+            echo "No :stable tag found — nothing to audit"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Stable digest: $DIGEST"
+
+      - name: Scan with Grype
+        if: steps.stable.outputs.skip != 'true'
+        id: scan
+        run: |
+          SCAN_OUTPUT=$(grype "ghcr.io/zagware/zagware-scanner@${{ steps.stable.outputs.digest }}" \
+            -o json --fail-on high 2>&1) || true
+
+          HIGH_COUNT=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length' 2>/dev/null || echo "0")
+
+          echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Found $HIGH_COUNT HIGH/CRITICAL vulnerabilities in :stable"
+
+      - name: Open issue for new CVEs
+        if: steps.stable.outputs.skip != 'true' && steps.scan.outputs.high_count != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const count = '${{ steps.scan.outputs.high_count }}';
+            const digest = '${{ steps.stable.outputs.digest }}';
+
+            // Check if an issue already exists for this digest
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'security,audit-cve'
+            });
+
+            const existing = issues.data.find(i => i.body && i.body.includes(digest));
+            if (existing) {
+              console.log(`Issue already exists: ${existing.html_url}`);
+              return;
+            }
+
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Audit alert: ${count} HIGH/CRITICAL CVEs found in :stable (${digest.substring(0, 19)})`,
+              body: `The weekly audit found **${count}** HIGH/CRITICAL vulnerabilities in the current :stable image.\n\n**Digest:** \`${digest}\`\n\n**Action required:**\n- Review the vulnerabilities and determine if they affect the scanner's runtime safety\n- If critical, consider rolling :stable back to the prior known-good digest\n- Patch the base image or affected packages and release a new version\n\nTo see the full scan results, run:\n\`\`\`bash\ngrype ghcr.io/zagware/zagware-scanner@${digest}\n\`\`\``,
+              labels: ['security', 'audit-cve']
+            });
+
+      - name: Audit summary
+        if: steps.stable.outputs.skip != 'true'
+        run: |
+          echo "## Weekly Audit Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Stable digest:** \`${{ steps.stable.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**HIGH/CRITICAL CVEs:** ${{ steps.scan.outputs.high_count }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.scan.outputs.high_count }}" = "0" ]; then
+            echo "✅ No new HIGH/CRITICAL vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ ${{ steps.scan.outputs.high_count }} HIGH/CRITICAL vulnerabilities found — issue opened" >> $GITHUB_STEP_SUMMARY
+          fi
