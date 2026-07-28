@@ -560,17 +560,35 @@ class AzureDevOps(Platform):
             if existing_thread:
                 break
 
-        if existing_thread and existing_comment:
-            url = f"{api}/threads/{existing_thread}/comments/{existing_comment}{ver}"
-            _http("PATCH", url, {"content": body}, self._headers())
-            log.info("Updated ADO comment on thread %d, PR #%s", existing_thread, pr)
-        else:
+        def _post_new_thread() -> None:
             payload = {
                 "comments": [{"parentCommentId": 0, "content": body, "commentType": 1}],
                 "status":   1,
             }
             _http("POST", f"{api}/threads{ver}", payload, self._headers())
             log.info("Posted ADO thread on PR #%s", pr)
+
+        if existing_thread and existing_comment:
+            url = f"{api}/threads/{existing_thread}/comments/{existing_comment}{ver}"
+            try:
+                _http("PATCH", url, {"content": body}, self._headers())
+                log.info("Updated ADO comment on thread %d, PR #%s", existing_thread, pr)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 403:
+                    # Comment authored by a different identity (e.g. a prior manual
+                    # run, or a Build Service identity change) — only the original
+                    # author or a project admin can PATCH it. Don't fail the whole
+                    # scan over an ownership conflict; start a fresh thread instead.
+                    log.warning(
+                        "Cannot update existing ADO comment on thread %d (403 — "
+                        "owned by a different identity); posting a new thread instead",
+                        existing_thread,
+                    )
+                    _post_new_thread()
+                else:
+                    raise
+        else:
+            _post_new_thread()
 
 
 _PLATFORMS: list[Platform] = [GitHub(), GitLab(), Bitbucket(), AzureDevOps()]
