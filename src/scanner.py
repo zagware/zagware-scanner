@@ -635,27 +635,23 @@ def run_scan(path: str, output_json: str) -> dict:
         cmd += ["--exclude-severities", ",".join(below)]
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=path, timeout=600)
-    if result.returncode not in (0, 50):
-        log.warning("Scanner returned code %d", result.returncode)
+
+    # KICS exit codes: 0=no findings, 30=LOW/INFO, 40=MEDIUM, 50=HIGH/CRITICAL.
+    # All of these are valid — the output file is the source of truth, not the
+    # exit code. Only fail if we can't read valid JSON output.
+    if result.returncode not in (0, 30, 40, 50):
+        log.warning("Unexpected KICS exit code %d", result.returncode)
         if result.stderr:
             log.debug("stderr: %s", result.stderr[:800])
-
-    # KICS exit 50 = findings found (expected). Exit 0 = no findings.
-    # Any other non-zero exit is a real error — fail loudly rather than
-    # silently returning empty results (false negative).
-    if result.returncode not in (0, 50):
-        raise RuntimeError(
-            f"KICS exited with code {result.returncode} — scan failed. "
-            f"stderr: {(result.stderr or '')[:400]}"
-        )
 
     try:
         with open(output_json) as fh:
             return json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError) as exc:
+        # Output missing = KICS crashed before writing. This is NOT 'no findings'.
         raise RuntimeError(
-            f"KICS output not readable ({exc}) — scan may have crashed before writing results. "
-            f"This is NOT 'no findings'; it is a scanner failure."
+            f"KICS output not readable ({exc}) — scanner may have crashed. "
+            f"Exit code: {result.returncode}. This is NOT 'no findings'; it is a scanner failure."
         ) from exc
 
 
