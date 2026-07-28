@@ -20,6 +20,7 @@ Optional (all platforms):
 from __future__ import annotations
 
 import base64
+import re as _re
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
 import hashlib
+
 
 # ── Internal constants ─────────────────────────────────────────────────────────
 
@@ -951,7 +953,6 @@ def _cell(text: str, limit: int = 80) -> str:
     text = text.replace("|", "\\|").replace("\n", " ").strip()
     return text[:limit] + "…" if len(text) > limit else text
 
-import re as _re
 
 _SECRET_PATTERNS = [
     _re.compile(r'(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)\s*[:=]\s*\S+', _re.IGNORECASE),
