@@ -1204,6 +1204,7 @@ def render_sca_section(
             findings = by_sev.get(sev, [])
             if not findings:
                 continue
+            emoji = _SCA_SEVERITY_EMOJI.get(sev, "❓")
             if collapsible:
                 L += [
                     "<details>",
