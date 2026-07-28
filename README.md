@@ -288,6 +288,8 @@ SCA scanning is enabled by default when manifest files are detected. Set `ZAGWAR
 | `ZAGWARE_FAIL_ON_NEW` | `false` | Exit 1 when new findings are found at or above `ZAGWARE_MIN_SEVERITY`. Blocks the merge when set to `true`. |
 | `ZAGWARE_EXCLUDE_PATHS` | `.git` | Comma-separated paths or globs to exclude from IaC scanning. |
 | `ZAGWARE_SCA_ENABLED` | `true` | Set `false` to skip Grype dependency scanning entirely. |
+| `ZAGWARE_TELEMETRY` | _(on)_ | Set `off` to disable anonymous usage telemetry. See [Telemetry](#telemetry). |
+| `ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME` | `false` | Set `true` to send your org/repo name in clear instead of a one-way hash. |
 
 ---
 
@@ -401,7 +403,10 @@ If you need that guarantee, run the `cosign verify-blob` steps from
 
 **Does the scanner send my code anywhere?**
 No. It runs entirely within your CI environment. It clones your repo with your CI token, scans
-locally, and posts results via your CI platform's API. No code leaves your infrastructure.
+locally, and posts results via your CI platform's API. No code, file contents, or file paths
+ever leave your infrastructure. The scanner does send anonymous usage telemetry (which CI
+platform, scan durations, bucketed finding counts) — see [Telemetry](#telemetry) for the exact
+field list and how to disable it.
 
 **What if I already have thousands of existing findings?**
 That's exactly the scenario this tool is built for. Existing findings are ignored. You only see
@@ -522,6 +527,56 @@ experimentation and getting the newest scanner features.
 3. If no HIGH/CRITICAL CVEs are found → `:stable` and `:secure` are re-tagged to the same digest
 4. If CVEs are found → promotion is blocked, a GitHub issue is opened, `:latest` stays
 5. A weekly audit workflow re-scans `:stable` for post-promotion CVE disclosures
+
+---
+
+## Telemetry
+
+The scanner sends anonymous usage telemetry to Zagware (via PostHog) so we can see which CI
+platforms are actually used, how IaC vs SCA scanning are exercised, and general usage volume.
+**No code, file paths, finding descriptions, CVE/package details, branch names, commit SHAs, or
+credentials are ever sent.** Full transparency below — this is exactly what leaves your CI runner.
+
+### What is sent
+
+| Field | Example | Notes |
+|---|---|---|
+| `platform` | `"github"` | Which CI provider (github / gitlab / bitbucket / azure_devops) |
+| `repo_id`, `org_id` | `"cea56b328a1226dd"` | SHA-256 hash (16 chars) of your repo/org — **not** the plaintext name (see opt-in below) |
+| `is_pr` | `true` | Whether this run scanned a PR/MR |
+| `sca_enabled`, `iac_scanned`, `sca_scanned` | `true` | Which scan types ran |
+| `has_platform_integration` | `false` | Whether `ZAGWARE_PLATFORM_URL`/`TOKEN` are configured (not their values) |
+| `min_severity_filter`, `fail_on_new` | `"HIGH"`, `false` | Your configured thresholds |
+| `duration_seconds` | `93.9` | Total scan time |
+| `iac_new_findings_bucket`, `sca_new_findings_bucket` | `"1-5"` | **Bucketed**, not exact — `0`, `1-5`, `6-20`, `21+`. We deliberately never transmit a precise vulnerability count tied to your org, only a coarse usage signal |
+| `suppressions_used` | `true` | Whether `.zagware/suppressions.yaml` had any entries |
+| `exit_code` | `0` | 0 or 1 |
+| `scanner_version` | `"2.6.0"` | For understanding rollout/adoption of new releases |
+
+### What is never sent
+
+File contents · file paths · finding descriptions · CVE IDs · package names/versions ·
+branch names · commit SHAs · CI tokens/secrets · IP-based geolocation (`$ip: 0` is set explicitly
+to disable PostHog's IP capture).
+
+### Identity: hashed by default
+
+`repo_id`/`org_id` are a one-way SHA-256 hash of your platform + repo/org name — stable across
+runs (so PostHog can group "same repo scanned N times") but **not reversible** to your actual
+repo/org name by Zagware or anyone with PostHog access. If you're comfortable with Zagware seeing
+the plaintext name (e.g. for support purposes, or if you already share it via the platform
+integration), set `ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME=true`.
+
+### Disabling
+
+```yaml
+env:
+  ZAGWARE_TELEMETRY: "off"
+```
+
+Telemetry is best-effort and fail-silent: it runs on a background thread with a 3-second network
+timeout, never raises, never retries, and never blocks or slows down your pipeline — even if the
+PostHog endpoint is completely unreachable, the scan result and exit code are unaffected.
 
 ---
 

@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -37,6 +38,8 @@ import hashlib
 
 
 # ── Internal constants ─────────────────────────────────────────────────────────
+
+__version__ = "2.6.0"
 
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
@@ -91,6 +94,170 @@ logging.basicConfig(
     level=logging.DEBUG if os.environ.get("ZAGWARE_DEBUG") else logging.INFO,
 )
 log = logging.getLogger("zagware")
+
+# ── Telemetry (opt-out, non-blocking, fail-silent) ─────────────────────────────
+#
+# What is sent: CI platform name, scanner version, whether the run is a PR scan,
+# whether IaC/SCA scanning ran, scan duration, a bucketed (not exact) new-finding
+# count per scan type, whether suppressions were used, and a SHA-256 hash of the
+# org/repo identity (not the plaintext name, unless explicitly opted in — see
+# ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME below).
+#
+# What is NEVER sent: file contents, file paths, finding descriptions, CVE IDs,
+# package names, branch names, commit SHAs, tokens/secrets, or any CI/platform
+# credential. PostHog's IP-based geolocation is explicitly disabled ($ip: 0).
+#
+# Disable entirely:            ZAGWARE_TELEMETRY=off (or false/0/no/disabled)
+# Send org/repo name in clear: ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME=true
+#
+# The PostHog project API key below is a public, write-only project token —
+# safe to embed (see PostHog docs: project API keys are not secret credentials).
+
+_POSTHOG_API_KEY        = "phc_12P9WCCmeTB6969NvX6qt2nKZirAegKPtfozTzxH1yG"
+_POSTHOG_CAPTURE_URL    = "https://eu.i.posthog.com/capture/"
+_TELEMETRY_HTTP_TIMEOUT = 3  # seconds
+_TELEMETRY_DISABLED     = os.environ.get("ZAGWARE_TELEMETRY", "").strip().lower() in (
+    "off", "false", "0", "no", "disabled",
+)
+_TELEMETRY_INCLUDE_REPO_NAME = os.environ.get(
+    "ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME", "").strip().lower() in ("true", "1", "yes")
+
+_telemetry_threads: list[threading.Thread] = []
+
+
+def _telemetry_hash(s: str) -> str:
+    """Short (16-char) SHA-256 prefix — enough entropy to avoid collisions across
+    the scanner's realistic install base, without embedding a full 64-char hash."""
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+
+def _bucket_count(n: int) -> str:
+    """Coarse-bucket a finding count so exact vulnerability inventories are never
+    transmitted — only rough usage/engagement signal."""
+    if n <= 0:
+        return "0"
+    if n <= 5:
+        return "1-5"
+    if n <= 20:
+        return "6-20"
+    return "21+"
+
+
+def _telemetry_identity(platform_name: str, repo_full_name: str) -> tuple[str, dict]:
+    """Return (distinct_id, base_properties) identifying the CI platform + repo.
+
+    By default org/repo identity is hashed (pseudonymous, stable across runs so
+    the same repo groups consistently in PostHog without exposing its name to a
+    third-party analytics processor). Set ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME=true
+    to send the plaintext org/repo name instead.
+    """
+    repo_full_name = repo_full_name or ""
+    org = repo_full_name.split("/", 1)[0] if "/" in repo_full_name else ""
+    repo_hash = _telemetry_hash(f"{platform_name}:{repo_full_name}") if repo_full_name else "unknown"
+    org_hash  = _telemetry_hash(org) if org else "unknown"
+    props: dict = {
+        "platform": platform_name,
+        "repo_id":  repo_hash,
+        "org_id":   org_hash,
+    }
+    if _TELEMETRY_INCLUDE_REPO_NAME and repo_full_name:
+        props["repo_name"] = repo_full_name
+        props["org_name"]  = org
+    return repo_hash, props
+
+
+def _send_telemetry_event(name: str, props: dict) -> None:
+    if _TELEMETRY_DISABLED:
+        return
+    try:
+        props = dict(props)
+        distinct_id = props.pop("_distinct_id", "anonymous")
+        props["tool"]            = "zagware-scanner"
+        props["scanner_version"] = __version__
+        props["$ip"] = 0  # disable PostHog IP-based geolocation
+        payload = {
+            "api_key":     _POSTHOG_API_KEY,
+            "event":       name,
+            "distinct_id": distinct_id,
+            "properties":  props,
+        }
+        body = json.dumps(payload).encode("utf-8")
+    except Exception:
+        return  # telemetry construction must never break the scan
+
+    def _post() -> None:
+        try:
+            req = urllib.request.Request(
+                _POSTHOG_CAPTURE_URL, data=body,
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            urllib.request.urlopen(req, timeout=_TELEMETRY_HTTP_TIMEOUT).close()
+        except Exception:
+            pass  # network/DNS/timeout — never surfaced, never retried
+
+    t = threading.Thread(target=_post, daemon=True)
+    t.start()
+    _telemetry_threads.append(t)
+
+
+def telemetry_flush(timeout: float = 2.0) -> None:
+    """Wait briefly for in-flight telemetry to send before process exit.
+    Bounded — never blocks the pipeline waiting on a slow/unreachable endpoint."""
+    deadline = time.monotonic() + timeout
+    for t in _telemetry_threads:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        t.join(timeout=remaining)
+
+
+def track_scan_started(
+    platform_name: str, repo: str, is_pr: bool, sca_enabled: bool,
+    has_platform_integration: bool, min_severity: str, fail_on_new: bool,
+) -> None:
+    distinct_id, props = _telemetry_identity(platform_name, repo)
+    props.update({
+        "is_pr":                    is_pr,
+        "sca_enabled":               sca_enabled,
+        "has_platform_integration":  has_platform_integration,
+        "min_severity_filter":       min_severity or "none",
+        "fail_on_new":               fail_on_new,
+        "_distinct_id":              distinct_id,
+    })
+    _send_telemetry_event("scan_started", props)
+
+
+def track_scan_completed(
+    platform_name: str, repo: str, duration_seconds: float,
+    iac_new: int, sca_new: int | None, iac_scanned: bool, sca_scanned: bool,
+    suppressions_used: bool, exit_code: int,
+) -> None:
+    distinct_id, props = _telemetry_identity(platform_name, repo)
+    props.update({
+        "duration_seconds":       round(duration_seconds, 1),
+        "iac_new_findings_bucket": _bucket_count(iac_new),
+        "sca_new_findings_bucket": _bucket_count(sca_new) if sca_scanned and sca_new is not None else "not_scanned",
+        "iac_scanned":            iac_scanned,
+        "sca_scanned":            sca_scanned,
+        "suppressions_used":      suppressions_used,
+        "exit_code":              exit_code,
+        "_distinct_id":           distinct_id,
+    })
+    _send_telemetry_event("scan_completed", props)
+
+
+def track_scan_failed(platform_name: str, repo: str, stage: str) -> None:
+    """stage: coarse failure location only (e.g. 'clone', 'iac_scan') — never the
+    raw exception message, which could contain file paths or credential fragments."""
+    distinct_id, props = _telemetry_identity(platform_name, repo)
+    props.update({"failure_stage": stage, "_distinct_id": distinct_id})
+    _send_telemetry_event("scan_failed", props)
+
+
+def track_suppression_applied(platform_name: str, repo: str, count: int) -> None:
+    distinct_id, props = _telemetry_identity(platform_name, repo)
+    props.update({"count": count, "_distinct_id": distinct_id})
+    _send_telemetry_event("suppression_applied", props)
 
 
 # ── HTTP helper (stdlib only, no pip deps) ─────────────────────────────────────
@@ -1354,7 +1521,7 @@ def upload_to_platform(
             'scan_type': 'pr_base' if pr_number else 'branch',
             'pr_number': pr_number,
             'pr_comparison_id': None,
-            'scanner_version': 'unknown',
+            'scanner_version': __version__,
             'results': base_results,
             'repo_base_url': _repo_base_url() or None,
         }
@@ -1370,7 +1537,7 @@ def upload_to_platform(
                 'scan_type': 'pr_head',
                 'pr_number': pr_number,
                 'pr_comparison_id': base_scan_id,
-                'scanner_version': 'unknown',
+                'scanner_version': __version__,
                 'results': head_results,
                 'repo_base_url': _repo_base_url() or None,
             }
@@ -1481,6 +1648,7 @@ def main() -> int:
             "Expected one of: GITHUB_ACTIONS=true, GITLAB_CI=true, "
             "BITBUCKET_BUILD_NUMBER, or TF_BUILD=True"
         )
+        track_scan_failed("unknown", "", "no_platform_detected")
         return 1
     log.info("Platform: %s", platform.name())
     if _MIN_SEVERITY:
@@ -1488,6 +1656,7 @@ def main() -> int:
         if not below and _MIN_SEVERITY not in _SEVERITY_ORDER:
             log.error("Invalid ZAGWARE_MIN_SEVERITY='%s' — must be one of: %s",
                       _MIN_SEVERITY, ", ".join(_SEVERITY_ORDER))
+            track_scan_failed(platform.name(), platform.repo(), "invalid_config")
             return 1
         log.info("Severity filter: %s and above (excluding %s)",
                  _MIN_SEVERITY, ", ".join(below) if below else "nothing")
@@ -1499,6 +1668,12 @@ def main() -> int:
     head_branch = platform.head_branch()
     log.info("Repository: %s", clone_url.split("@", 1)[-1])  # redact credentials
     log.info("Base → %s  |  Head → %s", base_branch, head_branch)
+
+    _has_platform = bool(os.environ.get('ZAGWARE_PLATFORM_URL')) and bool(os.environ.get('ZAGWARE_PLATFORM_TOKEN'))
+    track_scan_started(
+        platform.name(), platform.repo(), platform.pr_number() is not None,
+        _SCA_ENABLED, _has_platform, _MIN_SEVERITY, _FAIL_ON_NEW,
+    )
 
     timings: dict[str, float] = {}
 
@@ -1515,6 +1690,7 @@ def main() -> int:
             clone_branch(clone_url, base_branch, base_dir)
         except subprocess.CalledProcessError as exc:
             log.error("Clone failed for base branch: %s", exc.stderr)
+            track_scan_failed(platform.name(), platform.repo(), "clone")
             return 1
 
         log.info("Cloning PR branch '%s'…", head_branch)
@@ -1526,6 +1702,7 @@ def main() -> int:
                 clone_and_checkout_sha(clone_url, base_branch, head_branch, pr_dir)
             except subprocess.CalledProcessError as exc:
                 log.error("Clone failed for PR branch/SHA: %s", exc.stderr)
+                track_scan_failed(platform.name(), platform.repo(), "clone")
                 return 1
         timings["clone"] = time.perf_counter() - t0
 
@@ -1539,6 +1716,7 @@ def main() -> int:
             base_results = run_scan(base_dir, base_json)
         except RuntimeError as exc:
             log.error("IaC scan failed for base branch: %s", exc)
+            track_scan_failed(platform.name(), platform.repo(), "iac_scan")
             return 1
         base_count   = count_findings(base_results.get("queries", []))
         log.info("Base: %d finding(s)", base_count)
@@ -1550,6 +1728,7 @@ def main() -> int:
             pr_results = run_scan(pr_dir, pr_json)
         except RuntimeError as exc:
             log.error("IaC scan failed for PR branch: %s", exc)
+            track_scan_failed(platform.name(), platform.repo(), "iac_scan")
             return 1
         pr_count   = count_findings(pr_results.get("queries", []))
         log.info("PR:   %d finding(s)", pr_count)
@@ -1621,6 +1800,7 @@ def main() -> int:
                     if pushed:
                         suppressed_ids |= {sid for sid, _ in resolved}
                         just_suppressed = resolved
+                        track_suppression_applied(platform.name(), platform.repo(), len(resolved))
                         # Recompute with the updated suppression set
                         novel     = new_findings(base_results, pr_results, suppressed_ids)
                         novel_sca = new_sca_findings(base_sca, head_sca, suppressed_ids)
@@ -1703,19 +1883,28 @@ def main() -> int:
                 platform.post_or_update_comment(comment)
             except Exception as exc:
                 log.error("Failed to post comment: %s", exc)
+                track_scan_failed(platform.name(), platform.repo(), "comment_post")
                 return 1
         else:
             log.info("No PR detected — skipping comment post")
 
     # ── Fail-on-new gate (IaC + SCA combined) ─────────────────────────────────
-    new_total = new_count + len(novel_sca)
-    if _FAIL_ON_NEW and new_total > 0:
+    new_total  = new_count + len(novel_sca)
+    exit_code  = 1 if (_FAIL_ON_NEW and new_total > 0) else 0
+    if exit_code:
         log.warning("Exiting 1 — %d new finding(s) (ZAGWARE_FAIL_ON_NEW=true)", new_total)
-        return 1
+
+    track_scan_completed(
+        platform.name(), platform.repo(), timings.get("total", 0.0),
+        new_count, len(novel_sca), True, (base_sca is not None or head_sca is not None),
+        bool(suppressed_ids), exit_code,
+    )
 
     log.info("Done.")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _exit_code = main()
+    telemetry_flush()  # bounded wait for in-flight telemetry — never blocks indefinitely
+    sys.exit(_exit_code)
