@@ -177,11 +177,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Generate auto changelog, then append supply chain verification
           gh release create "${{ github.ref_name }}" \
             --repo zagware/zagware-scanner \
             --title "Zagware Scanner ${{ steps.tag.outputs.value }}" \
             --generate-notes \
-            --notes-end-of-body "
+            --notes ""
+
+          # Append supply chain verification to the generated notes
+          gh release edit "${{ github.ref_name }}" \
+            --repo zagware/zagware-scanner \
+            --notes "$(gh release view '${{ github.ref_name }}' --repo zagware/zagware-scanner --json body --jq '.body')
+
           ---
           ## Supply chain verification
 
@@ -192,8 +199,7 @@ jobs:
 
           gh attestation verify oci://ghcr.io/zagware/zagware-scanner:${{ steps.tag.outputs.value }} \\
             --repo zagware/zagware-scanner
-          \`\`\`
-          "
+          \`\`\`"
 
       - name: Build summary
         run: |
