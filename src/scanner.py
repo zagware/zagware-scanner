@@ -39,7 +39,7 @@ import hashlib
 
 # ── Internal constants ─────────────────────────────────────────────────────────
 
-__version__ = "2.6.0"
+__version__ = "2.6.1"
 
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
@@ -319,6 +319,15 @@ class Platform(ABC):
         GitHub and GitLab support HTML details; Bitbucket does not."""
         return True
 
+    def supports_interactive_suppression(self) -> bool:
+        """Return True if the scanner can read back PR comments on this platform,
+        making the `/zagware suppress <id> <reason>` comment command usable.
+        Only GitHub implements read_pr_comments() today — GitLab, Bitbucket, and
+        Azure DevOps fall back to the default (empty) read_pr_comments() below, so
+        showing the interactive suppress hint there would be misleading (the
+        command would silently do nothing)."""
+        return False
+
     def repo(self) -> str:
         """Full repository name (owner/repo or similar). Empty string if unavailable."""
         return ''
@@ -437,6 +446,9 @@ class GitHub(Platform):
                 break
             page += 1
         return bodies
+
+    def supports_interactive_suppression(self) -> bool:
+        return True  # GitHub is the only platform with read_pr_comments() implemented
 
 
 class GitLab(Platform):
@@ -1830,10 +1842,11 @@ def main() -> int:
             base_sca, head_sca, novel_sca,
             collapsible=platform.supports_html_details(),
         )
-        comment += render_suppression_hints(
-            novel, novel_sca,
-            collapsible=platform.supports_html_details(),
-        )
+        if platform.supports_interactive_suppression():
+            comment += render_suppression_hints(
+                novel, novel_sca,
+                collapsible=platform.supports_html_details(),
+            )
 
         # Truncate the combined comment (IaC + SCA) to platform limit
         if len(comment) > _MAX_COMMENT:
