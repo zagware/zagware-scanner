@@ -480,8 +480,32 @@ For SCA findings, the `similarity_id` is `sha256(cve_id:package_name:package_ver
 
 - The scanner reads `.zagware/suppressions.yaml` from the **PR branch** (not main)
 - Suppressed findings are excluded from the "new findings" diff — they won't appear in the PR comment
-- Suppressed findings are still uploaded to the platform (for audit trail) but marked as suppressed
+- Suppressed IaC/SCA findings are still uploaded to the platform's scan history (for audit trail) but marked as suppressed
 - The suppression count is logged in the scan output
+
+### Suppression audit trail
+
+When `ZAGWARE_PLATFORM_URL`/`ZAGWARE_PLATFORM_TOKEN` are configured, every scan uploads the
+**full current set of active suppressions** for the repo to the platform — a durable, queryable
+record of who suppressed what, when, and why, independent of the git history in
+`.zagware/suppressions.yaml`. This is for compliance auditing and to spot which IaC/SCA rules get
+suppressed so often across repos that the underlying policy may need tightening.
+
+Each record captures: repo, PR number, category (`iac`/`sca`), the finding (name + file), the
+reason, and **who added it**:
+
+- Suppressed via a `/zagware suppress` PR comment → exact attribution: the commenter's git
+  platform username and the comment timestamp.
+- Suppressed by hand-editing `.zagware/suppressions.yaml` directly (no PR comment) → best-effort
+  attribution via `git blame` on the file. Less precise (the scanner clones shallow, so blame is
+  bounded to the checked-out commit), and marked as such (`added_via: file` vs `pr_comment`) so
+  the lower confidence is visible.
+
+Removing an entry from `.zagware/suppressions.yaml` is picked up on the next scan — the platform
+marks that record as no longer active rather than deleting its history.
+
+Like scan result uploads, this is non-fatal and best-effort: a failed upload never affects the PR
+comment, the exit code, or the scan result.
 
 ---
 
@@ -551,7 +575,7 @@ credentials are ever sent.** Full transparency below — this is exactly what le
 | `iac_new_findings_bucket`, `sca_new_findings_bucket` | `"1-5"` | **Bucketed**, not exact — `0`, `1-5`, `6-20`, `21+`. We deliberately never transmit a precise vulnerability count tied to your org, only a coarse usage signal |
 | `suppressions_used` | `true` | Whether `.zagware/suppressions.yaml` had any entries |
 | `exit_code` | `0` | 0 or 1 |
-| `scanner_version` | `"2.6.0"` | For understanding rollout/adoption of new releases |
+| `scanner_version` | `"2.7.0"` | For understanding rollout/adoption of new releases |
 
 ### What is never sent
 

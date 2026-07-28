@@ -33,13 +33,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
 
 
 # ── Internal constants ─────────────────────────────────────────────────────────
-
-__version__ = "2.6.1"
+__version__ = "2.7.0"
 
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
@@ -336,8 +336,9 @@ class Platform(ABC):
         """PR/MR number as an integer, or None if not a PR pipeline."""
         return None
 
-    def read_pr_comments(self) -> list[str]:
-        """Return all PR/MR comment bodies. Default: empty (platform-specific override needed)."""
+    def read_pr_comments(self) -> list[dict]:
+        """Return all PR/MR comments as {body, author, created_at} dicts.
+        Default: empty (platform-specific override needed)."""
         return []
 
 
@@ -428,24 +429,31 @@ class GitHub(Platform):
                   {"body": body}, self._headers())
             log.info("Posted GitHub comment on PR #%s", pr)
 
-    def read_pr_comments(self) -> list[str]:
+    def read_pr_comments(self) -> list[dict]:
+        """Return PR comments as {body, author, created_at} dicts — author/created_at
+        are used to attribute /zagware suppress commands for the suppression audit
+        trail (see collect_suppression_records())."""
         owner, repo = self._repo.split("/", 1)
         pr  = os.environ.get("PR_NUMBER", "").strip()
         if not pr:
             return []
         api = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr}/comments"
-        bodies: list[str] = []
+        result: list[dict] = []
         page = 1
         while True:
             comments = _http("GET", f"{api}?per_page=100&page={page}", headers=self._headers())
             if not isinstance(comments, list) or not comments:
                 break
             for c in comments:
-                bodies.append(c.get("body", ""))
+                result.append({
+                    "body":       c.get("body", ""),
+                    "author":     (c.get("user") or {}).get("login") or "unknown",
+                    "created_at": c.get("created_at", ""),
+                })
             if len(comments) < 100:
                 break
             page += 1
-        return bodies
+        return result
 
     def supports_interactive_suppression(self) -> bool:
         return True  # GitHub is the only platform with read_pr_comments() implemented
@@ -1082,13 +1090,18 @@ _SUPPRESS_CMD_RE = _re.compile(
 )
 
 
-def parse_suppression_commands(comments: list[str]) -> list[tuple[str, str]]:
+def parse_suppression_commands(comments: list[dict]) -> list[tuple[str, str, str, str]]:
     """Parse /zagware suppress <id> <reason> commands from PR comments.
 
-    Returns list of (similarity_id, reason) tuples.
+    Returns list of (similarity_id, reason, author, created_at) tuples. author/created_at
+    identify who posted the command and when — used to attribute the suppression audit
+    trail (see collect_suppression_records()) without depending on git blame.
     """
-    commands: list[tuple[str, str]] = []
-    for body in comments:
+    commands: list[tuple[str, str, str, str]] = []
+    for c in comments:
+        body   = c.get("body", "")
+        author = c.get("author") or "unknown"
+        created_at = c.get("created_at", "")
         for line in body.splitlines():
             m = _SUPPRESS_CMD_RE.search(line.strip())
             if m:
@@ -1101,7 +1114,7 @@ def parse_suppression_commands(comments: list[str]) -> list[tuple[str, str]]:
                 # Strip "reason:" prefix if present
                 if reason.lower().startswith("reason:"):
                     reason = reason[7:].strip()
-                commands.append((sim_id, reason))
+                commands.append((sim_id, reason, author, created_at))
     return commands
 
 
@@ -1132,9 +1145,14 @@ def resolve_suppression_id(
 
 def apply_suppression_commands(
     pr_dir: str, clone_url: str, head_branch: str,
-    commands: list[tuple[str, str]],
+    commands: list[tuple[str, str, str, str]],
 ) -> bool:
     """Write new suppressions to .zagware/suppressions.yaml and push to PR branch.
+
+    Each entry records suppressed_by/suppressed_at (the PR commenter and comment
+    timestamp) alongside id/reason, so the platform-side suppression audit trail
+    (see collect_suppression_records()) can attribute it exactly without falling
+    back to git blame.
 
     Returns True if a commit was made, False if no new suppressions to add.
     """
@@ -1146,7 +1164,8 @@ def apply_suppression_commands(
 
     # Read existing suppressions to avoid duplicates
     existing = load_suppressions(pr_dir)
-    new_entries = [(sid, reason) for sid, reason in commands if sid not in existing]
+    new_entries = [(sid, reason, author, created_at)
+                   for sid, reason, author, created_at in commands if sid not in existing]
     if not new_entries:
         log.info("All suppression commands already in file — nothing to add")
         return False
@@ -1158,9 +1177,13 @@ def apply_suppression_commands(
     else:
         current_text = "# Zagware Scanner — Suppressions\n# Auto-managed by /zagware suppress commands\n\n"
 
-    for sid, reason in new_entries:
+    for sid, reason, author, created_at in new_entries:
+        safe_reason = reason.replace('"', '\\"')
         yaml_lines.append(f"- id: {sid}")
-        yaml_lines.append(f'  reason: "{reason}"')
+        yaml_lines.append(f'  reason: "{safe_reason}"')
+        yaml_lines.append(f'  suppressed_by: "{author}"')
+        if created_at:
+            yaml_lines.append(f'  suppressed_at: "{created_at}"')
         yaml_lines.append("")
 
     supp_path.write_text(current_text.rstrip() + "\n\n" + "\n".join(yaml_lines), encoding="utf-8")
@@ -1226,40 +1249,114 @@ def _redact_kics_results(results: dict) -> dict:
 _SUPPRESSIONS_PATH = os.environ.get("ZAGWARE_SUPPRESSIONS_FILE", ".zagware/suppressions.yaml")
 
 
-def load_suppressions(scan_dir: str) -> set[str]:
-    """Load suppression similarity IDs from .zagware/suppressions.yaml in the scanned repo.
+def _parse_suppressions_file(scan_dir: str) -> dict[str, dict]:
+    """Parse .zagware/suppressions.yaml into {similarity_id: {reason, added_by, added_at}}.
 
-    Returns a set of similarity_id strings to exclude from new-findings diff.
+    added_by/added_at come from the suppressed_by/suppressed_at fields written by
+    apply_suppression_commands() for entries added via /zagware suppress PR comments.
+    Entries written by hand (or predating this field) have added_by=added_at=None —
+    callers needing attribution for those fall back to _blame_suppressions_file().
     """
     supp_file = Path(scan_dir) / _SUPPRESSIONS_PATH
     if not supp_file.exists():
-        return set()
+        return {}
     try:
         text = supp_file.read_text(encoding="utf-8")
     except Exception as e:
         log.warning("Could not read suppressions file %s: %s", supp_file, e)
-        return set()
-    ids: set[str] = set()
-    current_entry: dict = {}
+        return {}
+
+    records: dict[str, dict] = {}
+    current: dict = {}
+
+    def _flush() -> None:
+        sid = current.get("id")
+        if sid:
+            records[sid] = {
+                "reason":   current.get("reason", ""),
+                "added_by": current.get("suppressed_by"),
+                "added_at": current.get("suppressed_at"),
+            }
+
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         if stripped.startswith("- "):
-            if current_entry.get("id"):
-                ids.add(current_entry["id"])
-            current_entry = {}
+            _flush()
+            current = {}
             stripped = stripped[2:]
         if ":" in stripped:
             key, _, val = stripped.partition(":")
             key = key.strip()
             val = val.strip().strip('"').strip("'")
-            if key in ("id", "similarity_id"):
-                current_entry["id"] = val
-    if current_entry.get("id"):
-        ids.add(current_entry["id"])
-    if ids:
-        log.info("Loaded %d suppression(s) from %s", len(ids), _SUPPRESSIONS_PATH)
+            if key == "similarity_id":
+                key = "id"
+            current[key] = val
+    _flush()
+    return records
+
+
+def load_suppressions(scan_dir: str) -> set[str]:
+    """Load suppression similarity IDs from .zagware/suppressions.yaml in the scanned repo.
+
+    Returns a set of similarity_id strings to exclude from new-findings diff.
+    """
+    records = _parse_suppressions_file(scan_dir)
+    if records:
+        log.info("Loaded %d suppression(s) from %s", len(records), _SUPPRESSIONS_PATH)
+    return set(records.keys())
+
+
+def _blame_suppressions_file(pr_dir: str) -> dict[str, tuple[str, str]]:
+    """Best-effort fallback: git blame .zagware/suppressions.yaml to attribute entries
+    that predate the suppressed_by/suppressed_at YAML fields (e.g. hand-committed files,
+    or suppressions.yaml files written before this feature existed).
+
+    Returns {similarity_id: (author_name, author_date_iso)}.
+
+    Caveat: the scanner shallow-clones with --depth=1, so blame can only see the single
+    checked-out commit — for lines untouched by that commit, git still attributes them to
+    it (there's no earlier history to walk back through), which is less precise than a
+    full clone. This is acceptable as a last-resort fallback only: the primary, accurate
+    attribution path is the suppressed_by/suppressed_at fields recorded directly in the
+    YAML by apply_suppression_commands() at the moment a /zagware suppress command lands.
+    """
+    supp_path = Path(pr_dir) / _SUPPRESSIONS_PATH
+    if not supp_path.exists():
+        return {}
+    try:
+        result = subprocess.run(
+            ["git", "blame", "--line-porcelain", "--", _SUPPRESSIONS_PATH],
+            cwd=pr_dir, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return {}
+    except Exception:
+        return {}
+
+    ids: dict[str, tuple[str, str]] = {}
+    author = ""
+    author_time_iso = ""
+    for line in result.stdout.splitlines():
+        if line.startswith("author "):
+            author = line[len("author "):]
+        elif line.startswith("author-time "):
+            try:
+                ts = int(line.split(" ", 1)[1])
+                author_time_iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (ValueError, IndexError):
+                author_time_iso = ""
+        elif line.startswith("\t"):
+            content = line[1:].strip()
+            if content.startswith("- id:"):
+                sid = content[5:].strip().strip('"').strip("'")
+            elif content.startswith("id:"):
+                sid = content[3:].strip().strip('"').strip("'")
+            else:
+                continue
+            if sid:
+                ids[sid] = (author or "unknown", author_time_iso)
     return ids
 
 
@@ -1491,6 +1588,112 @@ def render_suppression_hints(
     if collapsible:
         L += ["</details>", ""]
     return "\n".join(L)
+
+
+# ── Suppression audit trail (platform upload) ───────────────────────────────────
+
+def collect_suppression_records(
+    pr_dir: str,
+    pr_results: dict,
+    head_sca: list[dict] | None,
+    suppressed_ids: set[str],
+    just_suppressed: list[tuple[str, str, str, str]],
+) -> list[dict]:
+    """Build one audit record per currently-active suppression: who added it, when,
+    why, and which finding it covers. Attribution comes from three sources, tried
+    in priority order (most to least reliable):
+
+      1. just_suppressed — /zagware suppress commands resolved and pushed in THIS
+         run: exact (the PR comment author + comment timestamp).
+      2. suppressed_by/suppressed_at fields already in suppressions.yaml: exact
+         (recorded by a *previous* run's step 1, when that entry was new).
+      3. git blame on suppressions.yaml: best-effort fallback for entries that
+         predate this feature or were committed by hand rather than via the
+         /zagware suppress comment flow.
+
+    Uploaded to the platform (see upload_suppressions_to_platform) so suppressions
+    are auditable by repo/PR/user, and so widely-suppressed findings across many
+    repos surface as candidates for tightening the underlying IaC/SCA policy.
+    """
+    finding_info: dict[str, tuple[str, str, str]] = {}
+    for q in pr_results.get("queries", []):
+        for f in q.get("files", []):
+            sid = f.get("similarity_id", "")
+            if sid:
+                finding_info[sid] = (q.get("query_name", ""), f.get("file_name", ""), "iac")
+    for f in (head_sca or []):
+        sid = f.get("similarity_id", "")
+        if sid:
+            finding_info[sid] = (
+                f"{f.get('vulnerability_id', '')} in {f.get('package_name', '')}",
+                f.get("file_path", "") or f.get("package_name", ""),
+                "sca",
+            )
+
+    file_records = _parse_suppressions_file(pr_dir)
+    just_by_id = {sid: (reason, author, created_at)
+                  for sid, reason, author, created_at in just_suppressed}
+
+    blame: dict[str, tuple[str, str]] | None = None  # lazy — only git-blame if actually needed
+
+    records: list[dict] = []
+    for sid in suppressed_ids:
+        finding_name, file_path, category = finding_info.get(sid, (None, None, None))
+        if sid in just_by_id:
+            reason, added_by, added_at = just_by_id[sid]
+            added_via = "pr_comment"
+        else:
+            rec = file_records.get(sid, {})
+            reason = rec.get("reason") or ""
+            added_by = rec.get("added_by")
+            added_at = rec.get("added_at")
+            if added_by:
+                added_via = "pr_comment"
+            else:
+                added_via = "file"
+                if blame is None:
+                    blame = _blame_suppressions_file(pr_dir)
+                added_by, added_at = blame.get(sid, ("unknown", ""))
+        records.append({
+            "category":      category or "unknown",
+            "similarity_id": sid,
+            "finding_name":  finding_name,
+            "file_path":     file_path,
+            "reason":        reason,
+            "added_by":      added_by or "unknown",
+            "added_via":     added_via,
+            "added_at":      added_at or None,
+        })
+    return records
+
+
+def upload_suppressions_to_platform(
+    platform_url: str, platform_token: str,
+    repo: str, pr_number: int | None,
+    records: list[dict],
+) -> None:
+    """Upload the current suppression audit trail to the GTP platform. Non-fatal if
+    this fails — the PR comment and exit code never depend on it."""
+    if not records:
+        return
+    try:
+        headers = {'Authorization': f'Bearer {platform_token}', 'Content-Type': 'application/json'}
+        payload = {
+            'repo': repo,
+            'pr_number': pr_number,
+            'scanner_version': __version__,
+            'suppressions': records,
+        }
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            f'{platform_url}/api/v1/suppressions/upload',
+            data=data, headers=headers, method='POST',
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+        log.info('Suppression audit uploaded to platform (%d record(s))', len(records))
+    except Exception as e:
+        log.warning('Failed to upload suppression audit to platform: %s', e)
 
 
 # ── Platform upload ────────────────────────────────────────────────────────────
@@ -1791,16 +1994,16 @@ def main() -> int:
         # then recompute novel/novel_sca so the same run reflects the result —
         # relying on the push to auto-retrigger doesn't work (GITHUB_TOKEN pushes
         # don't fire new workflow runs on GitHub).
-        just_suppressed: list[tuple[str, str]] = []  # (id, reason)
+        just_suppressed: list[tuple[str, str, str, str]] = []  # (id, reason, author, created_at)
         if platform.pr_number() is not None:
             try:
                 comments = platform.read_pr_comments()
                 commands = parse_suppression_commands(comments)
-                resolved: list[tuple[str, str]] = []
-                for raw_id, reason in commands:
+                resolved: list[tuple[str, str, str, str]] = []
+                for raw_id, reason, author, created_at in commands:
                     full_id = resolve_suppression_id(raw_id, novel, novel_sca)
                     if full_id:
-                        resolved.append((full_id, reason))
+                        resolved.append((full_id, reason, author, created_at))
                     elif raw_id not in suppressed_ids:
                         log.warning(
                             "Suppress command '%s' doesn't match any current finding "
@@ -1810,7 +2013,7 @@ def main() -> int:
                     log.info("Resolved %d suppression command(s)", len(resolved))
                     pushed = apply_suppression_commands(pr_dir, clone_url, head_branch, resolved)
                     if pushed:
-                        suppressed_ids |= {sid for sid, _ in resolved}
+                        suppressed_ids |= {sid for sid, _, _, _ in resolved}
                         just_suppressed = resolved
                         track_suppression_applied(platform.name(), platform.repo(), len(resolved))
                         # Recompute with the updated suppression set
@@ -1825,10 +2028,21 @@ def main() -> int:
         log.info("New:  %d finding(s)", new_count)
         if suppressed_ids:
             log.info("Suppressed: %d finding(s) (see .zagware/suppressions.yaml)", len(suppressed_ids))
+            if _platform_url and _platform_token:
+                t0 = time.perf_counter()
+                suppression_records = collect_suppression_records(
+                    pr_dir, pr_results, head_sca, suppressed_ids, just_suppressed,
+                )
+                upload_suppressions_to_platform(
+                    _platform_url, _platform_token,
+                    platform.repo(), platform.pr_number(),
+                    suppression_records,
+                )
+                timings["platform_upload_suppressions"] = time.perf_counter() - t0
 
         comment = ""
         if just_suppressed:
-            ids_str = ", ".join(f"`{sid[:16]}`" for sid, _ in just_suppressed[:5])
+            ids_str = ", ".join(f"`{sid[:16]}`" for sid, _, _, _ in just_suppressed[:5])
             comment += (
                 f"> ✅ **{len(just_suppressed)} finding(s) suppressed** via `/zagware suppress` "
                 f"— {ids_str} — committed to `.zagware/suppressions.yaml`\n\n"
@@ -1882,8 +2096,9 @@ def main() -> int:
             "iac_head":             "  IaC head",
             "sca_base":             "  SCA base (Syft+Grype)",
             "sca_head":             "  SCA head (Syft+Grype)",
-            "platform_upload_iac":  "  Platform upload (IaC)",
-            "platform_upload_sca":  "  Platform upload (SCA)",
+            "platform_upload_iac":          "  Platform upload (IaC)",
+            "platform_upload_sca":          "  Platform upload (SCA)",
+            "platform_upload_suppressions": "  Platform upload (Suppressions)",
             "total":                "  Total",
         }
         for key, label in labels.items():
