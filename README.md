@@ -81,8 +81,8 @@ jobs:
         env:
           GITHUB_TOKEN:           ${{ github.token }}
           PR_NUMBER:              ${{ github.event.pull_request.number || github.event.issue.number }}
-          GITHUB_BASE_REF:        ${{ github.base_ref || steps.pr.outputs.base_ref }}
-          GITHUB_HEAD_REF:        ${{ github.head_ref || steps.pr.outputs.head_ref }}
+          ZAGWARE_BASE_REF:       ${{ steps.pr.outputs.base_ref }}
+          ZAGWARE_HEAD_REF:       ${{ steps.pr.outputs.head_ref }}
           ZAGWARE_PLATFORM_URL:   ${{ secrets.ZAGWARE_PLATFORM_URL }}
           ZAGWARE_PLATFORM_TOKEN: ${{ secrets.ZAGWARE_PLATFORM_TOKEN }}
 ```

@@ -65,6 +65,10 @@ jobs:
     steps:
       # issue_comment events don't carry PR base/head refs the way pull_request
       # events do (GITHUB_BASE_REF/GITHUB_HEAD_REF are unset) — look them up.
+      # NOTE: GitHub Actions reserves the GITHUB_* env var namespace — a step's
+      # env: block cannot override GITHUB_BASE_REF/GITHUB_HEAD_REF for docker://
+      # actions (the runner's actual value is always passed through instead).
+      # ZAGWARE_BASE_REF/ZAGWARE_HEAD_REF are read by the scanner as an override.
       - name: Resolve PR refs (comment-triggered runs only)
         if: github.event_name == 'issue_comment'
         id: pr
@@ -80,8 +84,8 @@ jobs:
         env:
           GITHUB_TOKEN:           ${{ github.token }}
           PR_NUMBER:              ${{ github.event.pull_request.number || github.event.issue.number }}
-          GITHUB_BASE_REF:        ${{ github.base_ref || steps.pr.outputs.base_ref }}
-          GITHUB_HEAD_REF:        ${{ github.head_ref || steps.pr.outputs.head_ref }}
+          ZAGWARE_BASE_REF:       ${{ steps.pr.outputs.base_ref }}
+          ZAGWARE_HEAD_REF:       ${{ steps.pr.outputs.head_ref }}
           ZAGWARE_PLATFORM_URL:   ${{ secrets.ZAGWARE_PLATFORM_URL }}
           ZAGWARE_PLATFORM_TOKEN: ${{ secrets.ZAGWARE_PLATFORM_TOKEN }}
 

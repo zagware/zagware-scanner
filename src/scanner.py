@@ -193,16 +193,21 @@ class GitHub(Platform):
         return f"https://x-access-token:{self._token}@github.com/{self._repo}.git"
 
     def base_branch(self) -> str:
-        return os.environ["GITHUB_BASE_REF"]
+        # ZAGWARE_BASE_REF overrides for issue_comment-triggered runs: GitHub Actions
+        # reserves GITHUB_* names and silently ignores any workflow-declared env:
+        # override for them on docker:// actions, so a distinct name is required.
+        return os.environ.get("ZAGWARE_BASE_REF") or os.environ["GITHUB_BASE_REF"]
 
     def head_branch(self) -> str:
-        return os.environ.get("GITHUB_HEAD_REF") or os.environ["GITHUB_SHA"]
+        return (os.environ.get("ZAGWARE_HEAD_REF")
+                or os.environ.get("GITHUB_HEAD_REF")
+                or os.environ["GITHUB_SHA"])
 
     def base_label(self) -> str:
-        return os.environ.get("GITHUB_BASE_REF", "base")
+        return os.environ.get("ZAGWARE_BASE_REF") or os.environ.get("GITHUB_BASE_REF", "base")
 
     def head_label(self) -> str:
-        return os.environ.get("GITHUB_HEAD_REF", "PR branch")
+        return os.environ.get("ZAGWARE_HEAD_REF") or os.environ.get("GITHUB_HEAD_REF", "PR branch")
 
     def repo(self) -> str:
         return os.environ.get("GITHUB_REPOSITORY", "")
