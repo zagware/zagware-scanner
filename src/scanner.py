@@ -28,6 +28,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -37,8 +38,8 @@ import hashlib
 
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
-_COMMENT_MARKER    = "<!-- zagware-iac-scanner -->"          # GitHub / GitLab (hidden HTML comment)
-_BB_COMMENT_MARKER = "[zagware-iac-scanner]: https://github.com/zagware/iac-scanner"  # Bitbucket (invisible link ref)
+_COMMENT_MARKER    = "<!-- zagware-scanner -->"              # GitHub / Gitlab (hidden HTML comment)
+_BB_COMMENT_MARKER = "[zagware-scanner]: https://github.com/zagware/zagware-scanner"  # Bitbucket (invisible link ref)
 _MAX_COMMENT   = 60_000
 _FAIL_ON_NEW   = os.environ.get("ZAGWARE_FAIL_ON_NEW", "false").lower() == "true"
 _EXCLUDE_PATHS = os.environ.get("ZAGWARE_EXCLUDE_PATHS", ".git")
@@ -157,6 +158,10 @@ class Platform(ABC):
         """PR/MR number as an integer, or None if not a PR pipeline."""
         return None
 
+    def read_pr_comments(self) -> list[str]:
+        """Return all PR/MR comment bodies. Default: empty (platform-specific override needed)."""
+        return []
+
 
 class GitHub(Platform):
     """
@@ -239,6 +244,25 @@ class GitHub(Platform):
             _http("POST", f"{api}/issues/{pr}/comments",
                   {"body": body}, self._headers())
             log.info("Posted GitHub comment on PR #%s", pr)
+
+    def read_pr_comments(self) -> list[str]:
+        owner, repo = self._repo.split("/", 1)
+        pr  = os.environ.get("PR_NUMBER", "").strip()
+        if not pr:
+            return []
+        api = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr}/comments"
+        bodies: list[str] = []
+        page = 1
+        while True:
+            comments = _http("GET", f"{api}?per_page=100&page={page}", headers=self._headers())
+            if not isinstance(comments, list) or not comments:
+                break
+            for c in comments:
+                bodies.append(c.get("body", ""))
+            if len(comments) < 100:
+                break
+            page += 1
+        return bodies
 
 
 class GitLab(Platform):
@@ -516,7 +540,7 @@ class AzureDevOps(Platform):
 
     def post_or_update_comment(self, body: str) -> None:
         pr  = os.environ["SYSTEM_PULLREQUEST_PULLREQUESTID"]
-        api = (f"{self._org_url}/{self._project}/_apis/git"
+        api = (f"{self._org_url}/{urllib.parse.quote(self._project, safe='')}/_apis/git"
                f"/repositories/{self._repo_id}/pullRequests/{pr}")
         ver = "?api-version=7.1"
 
@@ -572,7 +596,8 @@ def _repo_base_url() -> str:
         collection = os.environ.get('SYSTEM_TEAMFOUNDATIONCOLLECTIONURI', '').rstrip('/')
         project    = os.environ.get('SYSTEM_TEAMPROJECT', '')
         repo_name  = os.environ.get('BUILD_REPOSITORY_NAME', '')
-        return f'{collection}/{project}/_git/{repo_name}' if all([collection, project, repo_name]) else ''
+        return (f"{collection}/{urllib.parse.quote(project, safe='')}/_git/"
+                f"{urllib.parse.quote(repo_name, safe='')}") if all([collection, project, repo_name]) else ''
     return ''
 
 
@@ -846,6 +871,80 @@ def new_sca_findings(
             if f["similarity_id"] not in base_sims
             and f["similarity_id"] not in supp]
 
+# ── Interactive suppression from PR comments ──────────────────────────────────
+
+_SUPPRESS_CMD_RE = _re.compile(
+    r'/zagware\s+suppress\s+(\S+)\s+(.*)', _re.IGNORECASE,
+)
+
+
+def parse_suppression_commands(comments: list[str]) -> list[tuple[str, str]]:
+    """Parse /zagware suppress <id> <reason> commands from PR comments.
+
+    Returns list of (similarity_id, reason) tuples.
+    """
+    commands: list[tuple[str, str]] = []
+    for body in comments:
+        for line in body.splitlines():
+            m = _SUPPRESS_CMD_RE.search(line.strip())
+            if m:
+                sim_id = m.group(1).strip()
+                reason = m.group(2).strip() or "Suppressed via PR comment"
+                # Strip "reason:" prefix if present
+                if reason.lower().startswith("reason:"):
+                    reason = reason[7:].strip()
+                commands.append((sim_id, reason))
+    return commands
+
+
+def apply_suppression_commands(
+    pr_dir: str, clone_url: str, head_branch: str,
+    commands: list[tuple[str, str]],
+) -> bool:
+    """Write new suppressions to .zagware/suppressions.yaml and push to PR branch.
+
+    Returns True if a commit was made, False if no new suppressions to add.
+    """
+    if not commands:
+        return False
+
+    supp_path = Path(pr_dir) / _SUPPRESSIONS_PATH
+    supp_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Read existing suppressions to avoid duplicates
+    existing = load_suppressions(pr_dir)
+    new_entries = [(sid, reason) for sid, reason in commands if sid not in existing]
+    if not new_entries:
+        log.info("All suppression commands already in file — nothing to add")
+        return False
+
+    # Build YAML entries
+    yaml_lines: list[str] = []
+    if supp_path.exists():
+        current_text = supp_path.read_text(encoding="utf-8")
+    else:
+        current_text = "# Zagware Scanner — Suppressions\n# Auto-managed by /zagware suppress commands\n\n"
+
+    for sid, reason in new_entries:
+        yaml_lines.append(f"- id: {sid}")
+        yaml_lines.append(f'  reason: "{reason}"')
+        yaml_lines.append("")
+
+    supp_path.write_text(current_text.rstrip() + "\n\n" + "\n".join(yaml_lines), encoding="utf-8")
+
+    # Git commit and push
+    try:
+        _git(["config", "user.email", "zagware-scanner@users.noreply.github.com"], cwd=pr_dir)
+        _git(["config", "user.name", "Zagware Scanner"], cwd=pr_dir)
+        _git(["add", _SUPPRESSIONS_PATH], cwd=pr_dir)
+        _git(["commit", "-m", f"suppress: {len(new_entries)} finding(s) via PR comment"], cwd=pr_dir)
+        _git(["push", "origin", head_branch], cwd=pr_dir)
+        log.info("Pushed %d suppression(s) to %s — pipeline will re-run", len(new_entries), head_branch)
+        return True
+    except subprocess.CalledProcessError as exc:
+        log.error("Failed to push suppressions: %s", exc.stderr or str(exc))
+        return False
+
 # ── Comment rendering ──────────────────────────────────────────────────────────
 
 def _cell(text: str, limit: int = 80) -> str:
@@ -1028,26 +1127,51 @@ def render_comment(
             if collapsible:
                 L += ["</details>", ""]
 
+    # ── Suppression hints: list similarity IDs for interactive suppression ──────
+    if novel:
+        if collapsible:
+            L += ["<details>", "<summary>📋 Suppress findings</summary>", ""]
+        else:
+            L += ["---", "### 📋 Suppress findings", ""]
+        L += [
+            "To suppress a finding, comment on this PR:",
+            "",
+            "```",
+            "/zagware suppress <similarity_id> <reason>",
+            "```",
+            "",
+            "**Available IDs from this scan:**",
+            "",
+        ]
+        for q in novel[:20]:  # cap at 20 to avoid huge comment
+            for f in q.get("files", [])[:5]:
+                sim = f.get("similarity_id", "")[:16] + "…"
+                desc = q.get("query_name", "")[:60]
+                loc  = f.get("file_name", "")
+                L.append(f"- `{sim}` — {desc} (`{loc}`)")
+        if total_new > 100:
+            L.append(f"\n_… and {total_new - 100} more (see scan artifacts for full list)_")
+        L.append("")
+        if collapsible:
+            L += ["</details>", ""]
+
     footer = [
         "---",
         "<sub>Zagware IaC Scanner &nbsp;·&nbsp; "
-        "[zagware/iac-scanner](https://github.com/zagware/iac-scanner)</sub>",
+        "[zagware/zagware-scanner](https://github.com/zagware/zagware-scanner)</sub>",
     ]
     # Bitbucket: append invisible CommonMark link-reference definition as the comment marker
     if not collapsible:
         footer.append(_BB_COMMENT_MARKER)
     L += footer
 
-    body = "\n".join(L)
-    if len(body) > _MAX_COMMENT:
-        note = "\n\n> ⚠️ _Comment truncated — run locally for full output._"
-        body = body[: _MAX_COMMENT - len(note)] + note
-    return body
+    return "\n".join(L)
 
 
 
 def render_sca_section(
     base_sca: list[dict] | None, head_sca: list[dict] | None, novel_sca: list[dict],
+    collapsible: bool = True,
 ) -> str:
     """Return the SCA block to append to the PR comment. Empty string if no SCA data."""
     base_list = base_sca or []
@@ -1079,11 +1203,15 @@ def render_sca_section(
             findings = by_sev.get(sev, [])
             if not findings:
                 continue
-            emoji = _SCA_SEVERITY_EMOJI.get(sev, "❓")
+            if collapsible:
+                L += [
+                    "<details>",
+                    f"<summary>{emoji} <strong>{sev}</strong> — {len(findings)} finding(s)</summary>",
+                    "",
+                ]
+            else:
+                L += ["---", f"### {emoji} {sev} — {len(findings)} finding(s)", ""]
             L += [
-                "<details>",
-                f"<summary>{emoji} <strong>{sev}</strong> — {len(findings)} finding(s)</summary>",
-                "",
                 "| CVE / Advisory | Package | Installed | Fix | CVSS | KEV |",
                 "|---|---|:---:|:---:|:---:|:---:|",
             ]
@@ -1099,7 +1227,10 @@ def render_sca_section(
                     f"| {cve_cell} | `{pkg}` | `{f['package_version']}` "
                     f"| `{fix}` | {cvss} | {kev} |"
                 )
-            L += ["", "</details>", ""]
+            if collapsible:
+                L += ["", "</details>", ""]
+            else:
+                L.append("")
     return "\n".join(L)
 
 
@@ -1318,6 +1449,22 @@ def main() -> int:
                 return 1
         timings["clone"] = time.perf_counter() - t0
 
+        # ── Check for interactive suppression commands in PR comments ────────
+        if platform.pr_number() is not None:
+            try:
+                comments = platform.read_pr_comments()
+                commands = parse_suppression_commands(comments)
+                if commands:
+                    log.info("Found %d suppression command(s) in PR comments", len(commands))
+                    pushed = apply_suppression_commands(
+                        pr_dir, clone_url, head_branch, commands,
+                    )
+                    if pushed:
+                        log.info("Suppression file pushed — pipeline will re-run with suppressions applied")
+                        return 0  # Exit; the push triggers a new pipeline run
+            except Exception as exc:
+                log.warning("Failed to process suppression commands: %s", exc)
+
         # ── Load suppressions from PR branch ─────────────────────────────────
         suppressed_ids = load_suppressions(pr_dir)
 
@@ -1393,7 +1540,15 @@ def main() -> int:
             platform.base_label(), platform.head_label(),
             collapsible=platform.supports_html_details(),
         )
-        comment += render_sca_section(base_sca, head_sca, novel_sca)
+        comment += render_sca_section(
+            base_sca, head_sca, novel_sca,
+            collapsible=platform.supports_html_details(),
+        )
+
+        # Truncate the combined comment (IaC + SCA) to platform limit
+        if len(comment) > _MAX_COMMENT:
+            note = "\n\n> ⚠️ _Comment truncated — run locally for full output._"
+            comment = comment[: _MAX_COMMENT - len(note)] + note
 
         # ── Save artifacts ────────────────────────────────────────────────────
         timings["total"] = time.perf_counter() - t_start

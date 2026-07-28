@@ -398,7 +398,7 @@ Create a `.zagware/suppressions.yaml` file in your repository:
   reason: "Accepted risk — mitigated by network policy"
 ```
 
-### How to find the `similarity_id`
+Copyright 2026 Zagware Ltd.
 
 The `similarity_id` is a SHA256 fingerprint that uniquely identifies a finding. Find it in:
 

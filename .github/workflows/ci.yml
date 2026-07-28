@@ -1,0 +1,60 @@
+# PR CI — lint + Docker build (no push) on every pull request to main.
+# Provides status checks for branch protection.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-build:
+    name: Lint + Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Python syntax check
+        run: python3 -m py_compile src/scanner.py
+
+      - name: Check for common issues
+        run: |
+          # Ensure no shell=True in subprocess calls
+          if grep -n "shell=True" src/scanner.py; then
+            echo "ERROR: shell=True found in scanner.py — use list args for subprocess"
+            exit 1
+          fi
+          # Ensure no mutable tag refs in publish.yml
+          if grep -E 'uses: .*@v[0-9]' .github/workflows/publish.yml; then
+            echo "ERROR: publish.yml uses mutable tag refs — pin to commit SHAs"
+            exit 1
+          fi
+          echo "✓ Lint checks passed"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: false
+          tags: zagware-scanner:ci-test
+          load: true
+
+      - name: Verify scanner entrypoint
+        run: |
+          docker run --rm --entrypoint python3 zagware-scanner:ci-test -c "import py_compile; py_compile.compile('/usr/local/bin/zagware-scan', doraise=True); print('✓ scanner.py compiles in container')"
+
+      - name: Verify binaries exist
+        run: |
+          docker run --rm --entrypoint sh zagware-scanner:ci-test -c '
+            for bin in /usr/local/bin/kics /usr/bin/syft /usr/bin/grype; do
+              if [ ! -x "$bin" ]; then echo "ERROR: $bin not found"; exit 1; fi
+              echo "✓ $bin"
+            done
+            echo "✓ KICS queries: $(ls /opt/iac-rules/assets/queries | wc -l) platforms"
+          '

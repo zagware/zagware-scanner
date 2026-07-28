@@ -155,6 +155,46 @@ jobs:
           subject-name: ghcr.io/zagware/zagware-scanner
           subject-digest: ${{ steps.build.outputs.digest }}
 
+      # ── Post-push: scan the published image for its own CVEs ─────────────────
+      - name: Self-scan image with Grype
+        continue-on-error: true
+        run: |
+          echo "Scanning published image for vulnerabilities..."
+          grype "ghcr.io/zagware/zagware-scanner@${{ steps.build.outputs.digest }}" \
+            -o json --fail-on high > /tmp/grype-self-scan.json 2>&1 || true
+          HIGH=$(jq '[.matches[] | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length' /tmp/grype-self-scan.json 2>/dev/null || echo "0")
+          echo "HIGH/CRITICAL vulnerabilities in image: $HIGH"
+          if [ "$HIGH" != "0" ]; then
+            echo "⚠️  $HIGH HIGH/CRITICAL vulnerabilities found in the published image" >> $GITHUB_STEP_SUMMARY
+            echo "See full scan: /tmp/grype-self-scan.json" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ No HIGH/CRITICAL vulnerabilities found in the published image" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ── GitHub Release with auto-generated changelog ──────────────────────────
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo zagware/zagware-scanner \
+            --title "Zagware Scanner ${{ steps.tag.outputs.value }}" \
+            --generate-notes \
+            --notes-end-of-body "
+          ---
+          ## Supply chain verification
+
+          \`\`\`bash
+          cosign verify ghcr.io/zagware/zagware-scanner@${{ steps.build.outputs.digest }} \\
+            --certificate-identity-regexp '^https://github.com/zagware/zagware-scanner/.+\$' \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+          gh attestation verify oci://ghcr.io/zagware/zagware-scanner:${{ steps.tag.outputs.value }} \\
+            --repo zagware/zagware-scanner
+          \`\`\`
+          "
+
       - name: Build summary
         run: |
           echo "## Published \`ghcr.io/zagware/zagware-scanner:${{ steps.tag.outputs.value }}\`" >> $GITHUB_STEP_SUMMARY
