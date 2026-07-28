@@ -36,7 +36,7 @@ jobs:
     name: Build · Sign · Push
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write       # create GitHub Releases on tag push
       packages: write        # push to GHCR
       id-token: write        # cosign keyless signing via GitHub OIDC
       attestations: write    # SLSA provenance attestation
