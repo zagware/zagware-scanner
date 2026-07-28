@@ -1,0 +1,22 @@
+# Zagware Scanner — Suppressions File
+# ─────────────────────────────────────
+# Place this file at .zagware/suppressions.yaml in your repository to suppress
+# false positives or accepted-risk findings from the scanner's PR diff.
+#
+# Each entry suppresses a finding by its similarity_id (a SHA256 fingerprint
+# of the finding's unique identity). Find the similarity_id in the scan
+# artifacts (zagware-scan-results/summary.json or the PR comment's raw JSON).
+#
+# Format:
+#   - id: <similarity_id>        # required — the fingerprint to suppress
+#     reason: "Why this is suppressed"  # recommended — for audit trail
+#     expires: "2026-12-31"      # optional — ISO date, suppression auto-expires
+#
+# Example:
+#   - id: abc123def456...
+#     reason: "False positive — test resource, not production"
+#     expires: "2026-12-31"
+#   - id: def789abc012...
+#     reason: "Accepted risk — mitigated by network policy"
+
+# (empty by default — add your suppressions below)

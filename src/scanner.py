@@ -634,18 +634,29 @@ def run_scan(path: str, output_json: str) -> dict:
     if below:
         cmd += ["--exclude-severities", ",".join(below)]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=path)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=path, timeout=600)
     if result.returncode not in (0, 50):
         log.warning("Scanner returned code %d", result.returncode)
         if result.stderr:
             log.debug("stderr: %s", result.stderr[:800])
 
+    # KICS exit 50 = findings found (expected). Exit 0 = no findings.
+    # Any other non-zero exit is a real error — fail loudly rather than
+    # silently returning empty results (false negative).
+    if result.returncode not in (0, 50):
+        raise RuntimeError(
+            f"KICS exited with code {result.returncode} — scan failed. "
+            f"stderr: {(result.stderr or '')[:400]}"
+        )
+
     try:
         with open(output_json) as fh:
             return json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError) as exc:
-        log.warning("Could not read scan output (%s) — returning empty results", exc)
-        return {"queries": []}
+        raise RuntimeError(
+            f"KICS output not readable ({exc}) — scan may have crashed before writing results. "
+            f"This is NOT 'no findings'; it is a scanner failure."
+        ) from exc
 
 
 # ── Diff ───────────────────────────────────────────────────────────────────────
@@ -658,13 +669,20 @@ def _base_sim_ids(results: dict) -> set[str]:
     }
 
 
-def new_findings(base: dict, pr: dict) -> list[dict]:
-    """Return queries from *pr* containing only findings absent from *base*."""
+def new_findings(base: dict, pr: dict, suppressed: set[str] | None = None) -> list[dict]:
+    """Return queries from *pr* containing only findings absent from *base*.
+
+    If *suppressed* is provided, findings whose similarity_id is in the set
+    are excluded from the novel list.
+    """
     base_sims = _base_sim_ids(base)
+    supp = suppressed or set()
     sev_rank  = {s: i for i, s in enumerate(_SEVERITY_ORDER)}
     out: list[dict] = []
     for q in pr.get("queries", []):
-        novel = [f for f in q.get("files", []) if f["similarity_id"] not in base_sims]
+        novel = [f for f in q.get("files", [])
+                 if f["similarity_id"] not in base_sims
+                 and f["similarity_id"] not in supp]
         if novel:
             out.append({**q, "files": novel})
     out.sort(key=lambda q: sev_rank.get(q.get("severity", ""), 99))
@@ -710,7 +728,11 @@ def _run_grype(sbom_path: str, grype_out: str) -> bool:
             [_GRYPE_BIN, f"sbom:{sbom_path}", "-o", "json", "--quiet"],
             capture_output=True, text=True, timeout=180,
         )
-        if r.returncode == 0 and r.stdout:
+        if r.returncode != 0:
+            log.warning("Grype exited %d: %s", r.returncode, (r.stderr or r.stdout or "").strip()[:400])
+        # Accept stdout output even on non-zero exit — Grype may emit warnings
+        # as errors but still produce valid JSON with vulnerability matches.
+        if r.stdout:
             Path(grype_out).write_text(r.stdout)
             return True
         return False
@@ -749,63 +771,169 @@ def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
         return []
     findings: list[dict] = []
     for match in data.get("matches", []):
-        vuln     = match.get("vulnerability", {})
-        artifact = match.get("artifact", {})
-        vuln_id  = vuln.get("id", "")
-        pkg_name = artifact.get("name", "")
-        pkg_ver  = artifact.get("version", "")
-        if not vuln_id or not pkg_name:
+        try:
+            vuln     = match.get("vulnerability", {})
+            artifact = match.get("artifact", {})
+            vuln_id  = vuln.get("id", "")
+            pkg_name = artifact.get("name", "")
+            pkg_ver  = artifact.get("version", "")
+            if not vuln_id or not pkg_name:
+                continue
+            cvss = None
+            for c in vuln.get("cvss", []):
+                b = c.get("metrics", {}).get("baseScore") or c.get("metrics", {}).get("base_score")
+                if b is not None:
+                    try:
+                        cvss = float(b)
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            epss_list = vuln.get("epss", [])
+            epss = None
+            if epss_list:
+                try:
+                    epss = float(epss_list[0].get("epss"))
+                except (TypeError, ValueError, IndexError, KeyError):
+                    pass
+            fix  = vuln.get("fix", {})
+            locs = artifact.get("locations", [])
+            mdet = match.get("matchDetails", [])
+            urls = list(vuln.get("urls") or [])
+            for adv in vuln.get("advisories") or []:
+                u = adv.get("url") or adv.get("link") or ""
+                if u and u not in urls:
+                    urls.append(u)
+            severity = (vuln.get("severity") or "UNKNOWN").upper()
+            # Apply ZAGWARE_MIN_SEVERITY to SCA findings (map NEGLIGIBLE→LOW for comparison)
+            if _MIN_SEVERITY:
+                sca_sev = "LOW" if severity == "NEGLIGIBLE" else severity
+                sca_rank = {s: i for i, s in enumerate(_SCA_SEVERITY_ORDER)}
+                min_rank = sca_rank.get(_MIN_SEVERITY, 0)
+                if sca_rank.get(sca_sev, 99) > min_rank:
+                    continue  # below threshold — skip
+            findings.append({
+                "vulnerability_id": vuln_id,
+                "data_source":      vuln.get("dataSource") or "",
+                "namespace":        vuln.get("namespace")  or "",
+                "severity":         severity,
+                "cvss_score":       cvss,
+                "epss_score":       epss,
+                "kev_listed":       vuln.get("kev") is not None,
+                "risk_score":       vuln.get("riskScore"),
+                "description":      vuln.get("description") or "",
+                "vuln_urls":        urls,
+                "fix_versions":     fix.get("versions") or [],
+                "fix_state":        fix.get("state") or "unknown",
+                "package_name":     pkg_name,
+                "package_version":  pkg_ver,
+                "package_type":     artifact.get("type")     or "",
+                "package_language": artifact.get("language") or "",
+                "package_purl":     artifact.get("purl")     or "",
+                "file_path":        locs[0].get("path", "") if locs else "",
+                "match_type":       mdet[0].get("type", "")  if mdet else "",
+                "similarity_id":    _sca_sim_id(vuln_id, pkg_name, pkg_ver),
+            })
+        except Exception as e:
+            log.warning("SCA: skipping malformed match: %s", e)
             continue
-        cvss = None
-        for c in vuln.get("cvss", []):
-            b = c.get("metrics", {}).get("baseScore") or c.get("metrics", {}).get("base_score")
-            if b is not None:
-                cvss = float(b); break
-        epss_list = vuln.get("epss", [])
-        epss = float(epss_list[0]["epss"]) if epss_list else None
-        fix  = vuln.get("fix", {})
-        locs = artifact.get("locations", [])
-        mdet = match.get("matchDetails", [])
-        urls = list(vuln.get("urls") or [])
-        for adv in vuln.get("advisories") or []:
-            u = adv.get("url") or adv.get("link") or ""
-            if u and u not in urls:
-                urls.append(u)
-        findings.append({
-            "vulnerability_id": vuln_id,
-            "data_source":      vuln.get("dataSource") or "",
-            "namespace":        vuln.get("namespace")  or "",
-            "severity":         (vuln.get("severity") or "UNKNOWN").upper(),
-            "cvss_score":       cvss,
-            "epss_score":       epss,
-            "kev_listed":       vuln.get("kev") is not None,
-            "risk_score":       vuln.get("riskScore"),
-            "description":      vuln.get("description") or "",
-            "vuln_urls":        urls,
-            "fix_versions":     fix.get("versions") or [],
-            "fix_state":        fix.get("state") or "unknown",
-            "package_name":     pkg_name,
-            "package_version":  pkg_ver,
-            "package_type":     artifact.get("type")     or "",
-            "package_language": artifact.get("language") or "",
-            "package_purl":     artifact.get("purl")     or "",
-            "file_path":        locs[0].get("path", "") if locs else "",
-            "match_type":       mdet[0].get("type", "")  if mdet else "",
-            "similarity_id":    _sca_sim_id(vuln_id, pkg_name, pkg_ver),
-        })
     log.info("SCA %s: %d finding(s)", label, len(findings))
     return findings
 
 
-def new_sca_findings(base: list[dict] | None, head: list[dict] | None) -> list[dict]:
+def new_sca_findings(
+    base: list[dict] | None, head: list[dict] | None,
+    suppressed: set[str] | None = None,
+) -> list[dict]:
     base_sims = {f["similarity_id"] for f in (base or [])}
-    return [f for f in (head or []) if f["similarity_id"] not in base_sims]
+    supp = suppressed or set()
+    return [f for f in (head or [])
+            if f["similarity_id"] not in base_sims
+            and f["similarity_id"] not in supp]
 
 # ── Comment rendering ──────────────────────────────────────────────────────────
 
 def _cell(text: str, limit: int = 80) -> str:
     text = text.replace("|", "\\|").replace("\n", " ").strip()
     return text[:limit] + "…" if len(text) > limit else text
+
+import re as _re
+
+_SECRET_PATTERNS = [
+    _re.compile(r'(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)\s*[:=]\s*\S+', _re.IGNORECASE),
+    _re.compile(r'AKIA[0-9A-Z]{16}'),
+    _re.compile(r'gh[pousr]_[A-Za-z0-9]{36}'),
+    _re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
+    _re.compile(r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'),
+]
+
+_SECRET_CATEGORIES = {"secrets", "password", "credential", "key", "token", "authentication"}
+
+
+def _redact_value(val, category: str = "") -> str:
+    """Mask secret-like values before rendering in comments or writing to artifacts."""
+    if not val or not isinstance(val, str):
+        return val if val else ""
+    cat_lower = (category or "").lower()
+    if any(k in cat_lower for k in _SECRET_CATEGORIES):
+        return "***REDACTED***"
+    result = val
+    for pat in _SECRET_PATTERNS:
+        result = pat.sub("***REDACTED***", result)
+    return result
+
+
+def _redact_kics_results(results: dict) -> dict:
+    """Deep-copy KICS results with actual_value redacted to prevent secret leakage."""
+    import copy
+    redacted = copy.deepcopy(results)
+    for q in redacted.get("queries", []):
+        cat = q.get("category", "")
+        for f in q.get("files", []):
+            if "actual_value" in f:
+                f["actual_value"] = _redact_value(f.get("actual_value", ""), cat)
+    return redacted
+
+
+# ── Suppressions ──────────────────────────────────────────────────────────────
+
+_SUPPRESSIONS_PATH = os.environ.get("ZAGWARE_SUPPRESSIONS_FILE", ".zagware/suppressions.yaml")
+
+
+def load_suppressions(scan_dir: str) -> set[str]:
+    """Load suppression similarity IDs from .zagware/suppressions.yaml in the scanned repo.
+
+    Returns a set of similarity_id strings to exclude from new-findings diff.
+    """
+    supp_file = Path(scan_dir) / _SUPPRESSIONS_PATH
+    if not supp_file.exists():
+        return set()
+    try:
+        text = supp_file.read_text(encoding="utf-8")
+    except Exception as e:
+        log.warning("Could not read suppressions file %s: %s", supp_file, e)
+        return set()
+    ids: set[str] = set()
+    current_entry: dict = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            if current_entry.get("id"):
+                ids.add(current_entry["id"])
+            current_entry = {}
+            stripped = stripped[2:]
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key in ("id", "similarity_id"):
+                current_entry["id"] = val
+    if current_entry.get("id"):
+        ids.add(current_entry["id"])
+    if ids:
+        log.info("Loaded %d suppression(s) from %s", len(ids), _SUPPRESSIONS_PATH)
+    return ids
 
 
 def render_comment(
@@ -897,7 +1025,7 @@ def render_comment(
                         f"| `{fname}` | {f['line']} | `{resource}`"
                         f" | {f.get('issue_type', '')}"
                         f" | {_cell(f.get('expected_value', ''))}"
-                        f" | {_cell(f.get('actual_value', ''))} |"
+                        f" | {_cell(_redact_value(f.get('actual_value', ''), q.get('category', '')))} |"
                     )
                 L.append("")
 
@@ -1104,11 +1232,11 @@ def _write_artifacts(
         d = Path(out_dir)
         d.mkdir(parents=True, exist_ok=True)
 
-        # IaC findings (raw KICS JSON for base and PR branch)
+        # IaC findings (redacted KICS JSON — actual_value masked to prevent secret leakage)
         (d / "iac-base.json").write_text(
-            json.dumps(base_results, indent=2, ensure_ascii=False), encoding="utf-8")
+            json.dumps(_redact_kics_results(base_results), indent=2, ensure_ascii=False), encoding="utf-8")
         (d / "iac-head.json").write_text(
-            json.dumps(pr_results,  indent=2, ensure_ascii=False), encoding="utf-8")
+            json.dumps(_redact_kics_results(pr_results),  indent=2, ensure_ascii=False), encoding="utf-8")
 
         # SCA findings (normalized Grype output)
         (d / "sca-base.json").write_text(
@@ -1150,6 +1278,10 @@ def main() -> int:
     log.info("Platform: %s", platform.name())
     if _MIN_SEVERITY:
         below = _severities_below()
+        if not below and _MIN_SEVERITY not in _SEVERITY_ORDER:
+            log.error("Invalid ZAGWARE_MIN_SEVERITY='%s' — must be one of: %s",
+                      _MIN_SEVERITY, ", ".join(_SEVERITY_ORDER))
+            return 1
         log.info("Severity filter: %s and above (excluding %s)",
                  _MIN_SEVERITY, ", ".join(below) if below else "nothing")
     if _FAIL_ON_NEW:
@@ -1190,17 +1322,28 @@ def main() -> int:
                 return 1
         timings["clone"] = time.perf_counter() - t0
 
+        # ── Load suppressions from PR branch ─────────────────────────────────
+        suppressed_ids = load_suppressions(pr_dir)
+
         # ── IaC scan ─────────────────────────────────────────────────────────
         t0 = time.perf_counter()
         log.info("Scanning base branch…")
-        base_results = run_scan(base_dir, base_json)
+        try:
+            base_results = run_scan(base_dir, base_json)
+        except RuntimeError as exc:
+            log.error("IaC scan failed for base branch: %s", exc)
+            return 1
         base_count   = count_findings(base_results.get("queries", []))
         log.info("Base: %d finding(s)", base_count)
         timings["iac_base"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         log.info("Scanning PR branch…")
-        pr_results = run_scan(pr_dir, pr_json)
+        try:
+            pr_results = run_scan(pr_dir, pr_json)
+        except RuntimeError as exc:
+            log.error("IaC scan failed for PR branch: %s", exc)
+            return 1
         pr_count   = count_findings(pr_results.get("queries", []))
         log.info("PR:   %d finding(s)", pr_count)
         timings["iac_head"] = time.perf_counter() - t0
@@ -1228,7 +1371,7 @@ def main() -> int:
         head_sca = run_sca_scan(pr_dir, tmp, "pr")
         timings["sca_head"] = time.perf_counter() - t0
 
-        novel_sca = new_sca_findings(base_sca, head_sca)
+        novel_sca = new_sca_findings(base_sca, head_sca, suppressed_ids)
         log.info("SCA new: %d finding(s)", len(novel_sca))
 
         if _platform_url and _platform_token and (base_sca is not None or head_sca is not None):
@@ -1243,9 +1386,11 @@ def main() -> int:
             timings["platform_upload_sca"] = time.perf_counter() - t0
 
         # ── Diff + render ─────────────────────────────────────────────────────
-        novel     = new_findings(base_results, pr_results)
+        novel     = new_findings(base_results, pr_results, suppressed_ids)
         new_count = count_findings(novel)
         log.info("New:  %d finding(s)", new_count)
+        if suppressed_ids:
+            log.info("Suppressed: %d finding(s) (see .zagware/suppressions.yaml)", len(suppressed_ids))
 
         comment = render_comment(
             base_results, pr_results, novel,
@@ -1292,14 +1437,19 @@ def main() -> int:
                 log.info("%s: %.1fs", label, timings[key])
 
         # ── Post comment ──────────────────────────────────────────────────────
-        try:
-            platform.post_or_update_comment(comment)
-        except Exception as exc:
-            log.error("Failed to post comment: %s", exc)
-            return 1
+        if platform.pr_number() is not None:
+            try:
+                platform.post_or_update_comment(comment)
+            except Exception as exc:
+                log.error("Failed to post comment: %s", exc)
+                return 1
+        else:
+            log.info("No PR detected — skipping comment post")
 
-    if _FAIL_ON_NEW and new_count > 0:
-        log.warning("Exiting 1 — %d new finding(s) (ZAGWARE_FAIL_ON_NEW=true)", new_count)
+    # ── Fail-on-new gate (IaC + SCA combined) ─────────────────────────────────
+    new_total = new_count + len(novel_sca)
+    if _FAIL_ON_NEW and new_total > 0:
+        log.warning("Exiting 1 — %d new finding(s) (ZAGWARE_FAIL_ON_NEW=true)", new_total)
         return 1
 
     log.info("Done.")

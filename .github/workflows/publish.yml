@@ -1,17 +1,20 @@
 # Builds, signs, and pushes ghcr.io/zagware/zagware-scanner on every version tag.
-# Uses GITHUB_TOKEN throughout — no external secrets required.
+# Uses GITHUB_TOKEN for GHCR — no external secrets required.
 #
 # Supply chain guarantees:
 #   1. Syft and Grype cosign signatures verified BEFORE the Docker build
 #   2. KICS/Syft/Grype pinned by hardcoded SHA256 in Dockerfile
 #   3. Image signed with cosign (keyless, GitHub OIDC → sigstore Rekor log)
-#   4. CycloneDX SBOM attached as OCI attestation
+#   4. SPDX SBOM attached as OCI attestation
 #   5. SLSA provenance attached as OCI attestation
 #   6. GitHub-native provenance (gh attestation verify)
 #
+# All GitHub Actions are pinned to immutable commit SHAs (not mutable tags)
+# to prevent tag-rewrite supply-chain attacks.
+#
 # Verify the image:
 #   cosign verify ghcr.io/zagware/zagware-scanner:latest \
-#     --certificate-identity-regexp "https://github.com/zagware/zagware-scanner" \
+#     --certificate-identity-regexp "^https://github.com/zagware/zagware-scanner/.+$" \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 name: Publish zagware-scanner
@@ -23,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag (e.g. latest or 2.0.5)'
+        description: 'Image tag (e.g. latest or 2.1.0)'
         required: true
         default: 'latest'
 
@@ -38,10 +41,10 @@ jobs:
       attestations: write    # SLSA provenance attestation
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       # ── Pre-build: verify Syft + Grype release signatures ────────────────────
       # Anchore signs checksums.txt via cosign/sigstore. This verifies the file
@@ -58,7 +61,7 @@ jobs:
           cosign verify-blob \
             --certificate syft_checksums.txt.pem \
             --signature syft_checksums.txt.sig \
-            --certificate-identity-regexp "https://github.com/anchore/syft" \
+            --certificate-identity-regexp "^https://github.com/anchore/syft/.+$" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             syft_checksums.txt
           echo "✓ Syft ${SYFT_VERSION} release signature verified"
@@ -75,7 +78,7 @@ jobs:
           cosign verify-blob \
             --certificate grype_checksums.txt.pem \
             --signature grype_checksums.txt.sig \
-            --certificate-identity-regexp "https://github.com/anchore/grype" \
+            --certificate-identity-regexp "^https://github.com/anchore/grype/.+$" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             grype_checksums.txt
           echo "✓ Grype ${GRYPE_VERSION} release signature verified"
@@ -85,27 +88,29 @@ jobs:
 
       # sbom: true and provenance: true require the docker-container buildx driver
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GH_PAT_PACKAGES }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set image tag
         id: tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "value=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
           else
             echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/zagware/zagware-scanner
           tags: |
@@ -120,7 +125,7 @@ jobs:
 
       - name: Build and push (SBOM + provenance attestations)
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true
@@ -144,7 +149,7 @@ jobs:
           echo "✓ Signed: ${{ steps.build.outputs.digest }}"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ghcr.io/zagware/zagware-scanner
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -156,6 +161,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
           echo "cosign verify ghcr.io/zagware/zagware-scanner@${{ steps.build.outputs.digest }} \\" >> $GITHUB_STEP_SUMMARY
-          echo "  --certificate-identity-regexp 'https://github.com/zagware/zagware-scanner' \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --certificate-identity-regexp '^https://github.com/zagware/zagware-scanner/.+\$' \\" >> $GITHUB_STEP_SUMMARY
           echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY

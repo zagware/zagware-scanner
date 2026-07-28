@@ -1,0 +1,13 @@
+.git
+.gitignore
+.github
+.env
+.env.*
+__pycache__
+*.pyc
+examples
+README.md
+LICENSE
+Dockerfile
+.dockerignore
+zagware-scan-results
