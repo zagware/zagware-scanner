@@ -151,9 +151,14 @@ pipelines:
 
 ### Azure DevOps
 
-**One-time setup:**
-1. Enable **Allow scripts to access the OAuth token** (Pipeline → Edit → Triggers → YAML → Additional options).
-2. Grant the Build Service identity **Contribute to pull requests** on the repository.
+**Setup:** usually none beyond the YAML below. `$(System.AccessToken)` is available to any step that
+explicitly maps it via `env:` (as shown), and on most organizations the default **Project Collection
+Build Service** identity can already read and post pull request comments — no manual permission grant
+needed. If the scan step fails posting the comment (`401`/`403` in the log), grant the Build Service
+identity **Contribute to pull requests** on the repository (Project settings → Repositories → your repo
+→ Security). If `$(System.AccessToken)` itself comes through empty, enable **Allow scripts to access the
+OAuth token** (Pipeline → Edit → Triggers → YAML → Additional options) — only seen on pipelines migrated
+from the classic editor.
 
 ```yaml
 trigger: none
@@ -172,6 +177,7 @@ steps:
         -e SYSTEM_TEAMPROJECT \
         -e BUILD_REPOSITORY_ID \
         -e BUILD_REPOSITORY_URI \
+        -e BUILD_REPOSITORY_NAME \
         -e BUILD_SOURCEVERSION \
         -e SYSTEM_PULLREQUEST_TARGETBRANCH \
         -e SYSTEM_PULLREQUEST_SOURCEBRANCH \
@@ -185,6 +191,15 @@ steps:
       SYSTEM_ACCESSTOKEN: $(System.AccessToken)
     continueOnError: true
 ```
+
+`BUILD_REPOSITORY_NAME` is required for the `repo_base_url` link in platform uploads — without it the
+scanner still works, but that link is omitted. `SYSTEM_TEAMPROJECT` and repository names containing
+spaces (the Azure DevOps default) are handled automatically; no extra encoding needed.
+
+If the scanner's existing PR comment was authored by a different identity than the current run (e.g. a
+manual test, or the pipeline's Build Service account changed), Azure DevOps blocks editing it — only the
+original author or a project admin may update a comment. The scanner detects this (`403` on update) and
+starts a fresh comment thread instead of failing the build.
 
 ---
 

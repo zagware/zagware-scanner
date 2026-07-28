@@ -2,11 +2,15 @@
 # ──────────────────────────────────────────
 # Add to your azure-pipelines.yml.
 #
-# One-time setup:
-# 1. Enable "Allow scripts to access the OAuth token":
-#    Pipeline → Edit → Triggers → YAML → Additional options
-# 2. Grant the Build Service account "Contribute to pull requests" on the repository:
-#    Project settings → Repositories → Security → Build Service
+# Setup: usually none beyond this file. $(System.AccessToken) is exposed to the script step
+# via the explicit `env:` mapping below, and the default Project Collection Build Service
+# identity can already read/post PR comments on most organizations.
+#   - If the scan step fails posting the comment (401/403 in the log), grant the Build
+#     Service identity "Contribute to pull requests" on the repository:
+#     Project settings → Repositories → Security → Build Service
+#   - If $(System.AccessToken) itself comes through empty (rare — seen on pipelines
+#     migrated from the classic editor), enable "Allow scripts to access the OAuth token":
+#     Pipeline → Edit → Triggers → YAML → Additional options
 #
 # Pipeline variables (Pipelines → Library or inline):
 #   ZAGWARE_PLATFORM_URL    https://app.zagware.io    (optional — omit for standalone)
@@ -43,6 +47,7 @@ steps:
         -e SYSTEM_TEAMPROJECT \
         -e BUILD_REPOSITORY_ID \
         -e BUILD_REPOSITORY_URI \
+        -e BUILD_REPOSITORY_NAME \
         -e BUILD_SOURCEVERSION \
         -e SYSTEM_PULLREQUEST_TARGETBRANCH \
         -e SYSTEM_PULLREQUEST_SOURCEBRANCH \
