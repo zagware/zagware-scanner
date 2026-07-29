@@ -97,6 +97,63 @@ The `issue_comment` trigger and `contents: write` permission are required for th
 If you don't need that, you can omit them and keep just the `pull_request` trigger with
 `permissions: pull-requests: write`.
 
+#### Organization-wide enforcement via GitHub rulesets (GitHub Team+)
+
+GitHub's closest equivalent to GitLab's Pipeline Execution Policy is an **organization ruleset with
+a `workflows` rule** ("require workflows to pass before merging"). A single ruleset in one source
+repo requires a workflow file to run and pass against every targeted repo's pull requests — targeted
+repos carry **no `.github/workflows/*.yml` of their own** for this to work, so enforcement can't be
+silently defeated by deleting or renaming a caller file the way branch-protection-plus-reusable-workflow
+setups can.
+
+**vs. GitLab Pipeline Execution Policy** (see the [GitLab CI](#gitlab-ci) section below) — same
+shape, different edges:
+
+| | GitHub org ruleset (`workflows` rule) | GitLab Pipeline Execution Policy |
+|---|---|---|
+| Minimum plan | Team | Ultimate |
+| Caller file in target repo | None | None |
+| Trigger events supported | `pull_request`, `pull_request_target`, `merge_group` only | Any pipeline trigger the policy's CI file declares |
+| Targeting | Repo name/pattern or custom properties, org- or enterprise-scoped | Project/group selectors, group-scoped |
+| Evaluate-before-enforce mode | Yes (`enforcement: "evaluate"`) | Yes (shadow mode) |
+| Bypass list | Yes, per-actor/role | Yes |
+| Cross-org / cross-group source | No — source workflow must be in the same org | No — policy CI file must be in the same group hierarchy |
+
+```bash
+# One-time: define a custom property and create the org-level ruleset
+curl -fsSL https://raw.githubusercontent.com/zagware/security-workflows/main/rulesets/setup-org-level.sh | bash -s <your-org>
+
+# Opt a repo in (or out) without touching the ruleset itself
+gh api orgs/<org>/properties/values -X PATCH \
+  -f 'repository_names[]=<repo>' \
+  -f 'properties[][property_name]=zagware-scan-scope' \
+  -f 'properties[][value]=enabled'
+```
+
+See [`zagware/security-workflows`](https://github.com/zagware/security-workflows) for the reference
+source workflow, ready-to-fire ruleset JSON, and setup script — verified live end-to-end against a
+repo with zero workflow files of its own (the required check appeared, ran, and passed; confirmed as
+an active organization-ruleset-sourced rule via `GET /repos/{owner}/{repo}/rules/branches/{branch}`).
+
+**Constraints, confirmed by testing rather than assumed:**
+
+| | |
+|---|---|
+| **Plan** | Organization rulesets need **GitHub Team or higher** — a Free/Pro org gets `403 Upgrade to GitHub Team` on `POST /orgs/{org}/rulesets`, full stop. There's no repository-level substitute for the `workflows` rule specifically: `repos/{owner}/{repo}/rulesets` structurally rejects that rule type on **any** plan (GitHub's own docs confirm it's org/enterprise-only), so this isn't a matter of upgrading a single repo. |
+| **Trigger events** | Only `pull_request`, `pull_request_target`, and `merge_group` are recognized as required-check-producing events for a ruleset workflow — no `push`, no `schedule`. Merge-gating works; periodic/default-branch drift scans need a separate mechanism (e.g. a `schedule`-triggered workflow committed directly in each repo, or the App-based out-of-band scanning described below). |
+| **Source repo scope** | The ruleset's referenced workflow must live in a repo in the **same organization** — an org can't point at a workflow in a different org. Multi-org customers need one source repo + one ruleset per org. |
+| **Fails closed on disabled Actions** | If GitHub Actions is disabled on a targeted repo, the required check never produces a result and the PR is **permanently unmergeable** until Actions is re-enabled or the repo is dropped from the ruleset's scope. Expect this to surface as a support ticket the first time it happens. |
+| **Forks** | A forked repo does not inherit the parent's ruleset. Only relevant if a customer runs an internal-fork contribution model. |
+| **Allowed-actions policy** | Orgs running "allow select actions only" need `zagware/*` explicitly allowlisted, since the workflow resolves `uses: docker://ghcr.io/zagware/zagware-scanner:latest` as an action reference. If that's not viable, self-host the equivalent step as a pinned, checksum-verified binary download instead of a Marketplace/registry action reference. |
+| **`/zagware suppress` + required workflows** | The suppress flow pushes a commit back to the PR branch using `GITHUB_TOKEN`. GitHub's anti-recursion protection means a `GITHUB_TOKEN`-authored push never re-triggers `pull_request: synchronize`, so under this enforcement path the new commit's required check never gets created and the PR stays blocked. Fixable with a non-`GITHUB_TOKEN` push identity (e.g. a GitHub App installation token) — a platform-side automation concern, not something this standalone scanner solves on its own. |
+
+No org-level ruleset access, or don't want the plan requirement? A `workflow_call` reusable workflow
+plus a thin per-repo caller file gets you centralized scan *logic* (bump the image tag or an env var
+once, every caller picks it up) on any plan — see `zagware/security-workflows`'s README for the exact
+caller snippet. The tradeoff versus the ruleset route: every target repo needs that caller file, and
+enforcement silently stops if it's deleted, renamed, or its job name drifts from what's marked
+"required" in branch protection.
+
 ---
 
 ### GitLab CI
