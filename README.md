@@ -342,8 +342,9 @@ the rule, the resource path, and the file content at the flagged location.
 
 Each SCA finding is fingerprinted as `sha256(cve_id:package_name:package_version)`.
 
-Each Secrets finding is fingerprinted by betterleaks itself (`file_path:rule_id:line`), read from
-the report's `Fingerprint` field — never derived from the secret value.
+Each Secrets finding is fingerprinted as `sha256(betterleaks_fingerprint)`, where the input is
+betterleaks' own `Fingerprint` field (`file_path:rule_id:line`) — hashed rather than shown raw so
+the suppress-command id doesn't expose the file path directly, consistent with IaC/SCA.
 
 Both approaches mean:
 - Code reformatting or line shifts do not create spurious new findings.
@@ -524,7 +525,8 @@ Find the full `similarity_id` in:
 3. **Raw KICS JSON** — `zagware-scan-results/iac-head.json` → `queries[].files[].similarity_id`
 
 For SCA findings, the `similarity_id` is `sha256(cve_id:package_name:package_version)`. For Secrets
-findings, the `similarity_id` is betterleaks' own `Fingerprint` (`file_path:rule_id:line`).
+findings, the `similarity_id` is `sha256(betterleaks_fingerprint)`, where the fingerprint itself is
+betterleaks' `file_path:rule_id:line`.
 
 ### How suppressions work
 
@@ -628,7 +630,7 @@ credentials are ever sent.** Full transparency below — this is exactly what le
 | `iac_new_findings_bucket`, `sca_new_findings_bucket`, `secrets_new_findings_bucket` | `"1-5"` | **Bucketed**, not exact — `0`, `1-5`, `6-20`, `21+`. We deliberately never transmit a precise vulnerability count tied to your org, only a coarse usage signal |
 | `suppressions_used` | `true` | Whether `.zagware/suppressions.yaml` had any entries |
 | `exit_code` | `0` | 0 or 1 |
-| `scanner_version` | `"2.8.0"` | For understanding rollout/adoption of new releases |
+| `scanner_version` | `"2.8.2"` | For understanding rollout/adoption of new releases |
 
 ### What is never sent
 

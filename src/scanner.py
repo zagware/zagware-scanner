@@ -39,7 +39,7 @@ import hashlib
 
 
 # ── Internal constants ─────────────────────────────────────────────────────────
-__version__ = "2.8.1"
+__version__ = "2.8.2"
 
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
@@ -1213,7 +1213,13 @@ def run_secrets_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
                 "line":              f.get("StartLine"),
                 "tags":              list(f.get("Tags") or []),
                 "validation_status": (f.get("ValidationStatus") or "unknown").lower(),
-                "similarity_id":     fingerprint,
+                # betterleaks' own Fingerprint is a *readable* "file_path:rule_id:line"
+                # string, not a hash — using it verbatim would show raw file paths as
+                # the suppress-command id (confusing, and inconsistent with IaC's KICS
+                # hash and SCA's sha256(cve:pkg:version)). Hash it for a uniform,
+                # opaque id; stability across scans is unaffected since sha256 is
+                # deterministic on the same fingerprint input.
+                "similarity_id":     hashlib.sha256(fingerprint.encode()).hexdigest(),
             })
             # NEVER read f["Secret"], f["Match"], f["MatchContext"], f["CaptureGroups"], f["Line"] here.
         except Exception as e:
