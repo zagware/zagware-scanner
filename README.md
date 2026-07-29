@@ -209,7 +209,7 @@ starts a fresh comment thread instead of failing the build.
 The scanner posts a single in-place comment per PR. On push, the comment is updated — never duplicated.
 
 ```
-## Zagware IaC Scanner
+## 🏗️ Zagware IaC — Infrastructure Misconfigurations
 
 Comparing `main` → `feat/add-storage`
 
@@ -250,6 +250,9 @@ Comparing `main` → `feat/add-storage`
 | Rule | File | Line | Validation |
 |---|---|:---:|:---:|
 |`stripe-access-token`|`config/payments.rb`|5|🔴 Valid|
+
+---
+<sub>Zagware Scanner &nbsp;·&nbsp; [zagware/zagware-scanner](https://github.com/zagware/zagware-scanner)</sub>
 ```
 
 If the PR is clean: **✅ No new security findings introduced by this PR.**

@@ -39,7 +39,7 @@ import hashlib
 
 
 # ── Internal constants ─────────────────────────────────────────────────────────
-__version__ = "2.8.0"
+__version__ = "2.8.1"
 
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
@@ -1540,7 +1540,7 @@ def render_comment(
 
     L: list[str] = (
         ([marker_line, ""] if marker_line else []) + [
-            "## Zagware IaC Scanner",
+            "## 🏗️ Zagware IaC — Infrastructure Misconfigurations",
             "",
             f"Comparing **`{base_label}`** → **`{head_label}`**",
             "",
@@ -1559,6 +1559,7 @@ def render_comment(
 
     if not novel:
         L.append("✅ **No new security findings introduced by this PR.**")
+        L.append("")
     else:
         summary = " &nbsp;·&nbsp; ".join(
             f"{_SEVERITY_EMOJI[s]} **{sev_counts[s]}** {s}"
@@ -1611,16 +1612,6 @@ def render_comment(
             if collapsible:
                 L += ["</details>", ""]
 
-    footer = [
-        "---",
-        "<sub>Zagware IaC Scanner &nbsp;·&nbsp; "
-        "[zagware/zagware-scanner](https://github.com/zagware/zagware-scanner)</sub>",
-    ]
-    # Bitbucket: append invisible CommonMark link-reference definition as the comment marker
-    if not collapsible:
-        footer.append(_BB_COMMENT_MARKER)
-    L += footer
-
     return "\n".join(L)
 
 
@@ -1646,6 +1637,7 @@ def render_sca_section(
     ]
     if not novel_sca:
         L.append("✅ **No new dependency vulnerabilities introduced by this PR.**")
+        L.append("")
     else:
         summary = " &nbsp;·&nbsp; ".join(
             f"{_SCA_SEVERITY_EMOJI.get(s, '❓')} **{len(by_sev[s])}** {s}"
@@ -1720,6 +1712,7 @@ def render_secrets_section(
     ]
     if not novel_secrets:
         L.append("✅ **No new secrets introduced by this PR.**")
+        L.append("")
         return "\n".join(L)
 
     if is_public:
@@ -2389,7 +2382,18 @@ def main() -> int:
                 collapsible=platform.supports_html_details(),
             )
 
-        # Truncate the combined comment (IaC + SCA) to platform limit
+        # Single attribution footer for the whole comment (not per-section) — a
+        # blank line always precedes "---" here so it can never be misread as a
+        # CommonMark Setext heading underline for the preceding line's text.
+        comment += (
+            "\n\n---\n<sub>Zagware Scanner &nbsp;·&nbsp; "
+            "[zagware/zagware-scanner](https://github.com/zagware/zagware-scanner)</sub>"
+        )
+        if not platform.supports_html_details():
+            # Bitbucket: append invisible CommonMark link-reference definition as the comment marker
+            comment += "\n" + _BB_COMMENT_MARKER
+
+        # Truncate the combined comment (IaC + SCA + Secrets) to platform limit
         if len(comment) > _MAX_COMMENT:
             note = "\n\n> ⚠️ _Comment truncated — run locally for full output._"
             comment = comment[: _MAX_COMMENT - len(note)] + note
