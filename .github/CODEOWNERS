@@ -1,4 +1,5 @@
 # Zagware scanner — code owners
-# All changes require review from at least one owner
-
-* @davymcaleer99
+# All changes require review from at least one owner. A team, not an
+# individual account, so ownership survives any single person leaving and
+# review coverage isn't a single point of failure. See SUP-09.
+* @zagware/maintainers

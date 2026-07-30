@@ -24,13 +24,6 @@ jobs:
       - name: Install Grype
         uses: ./.github/actions/install-grype
 
-      - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GH_PAT_PACKAGES }}
-
       - name: Resolve :stable digest
         id: stable
         run: |
@@ -72,7 +65,7 @@ jobs:
 
       - name: Open issue for new CVEs
         if: steps.stable.outputs.skip != 'true' && steps.scan.outputs.high_count != '0'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const count = '${{ steps.scan.outputs.high_count }}';

@@ -27,9 +27,15 @@ jobs:
             echo "ERROR: shell=True found in scanner.py — use list args for subprocess"
             exit 1
           fi
-          # Ensure no mutable tag refs in publish.yml
-          if grep -E 'uses: .*@v[0-9]' .github/workflows/publish.yml; then
-            echo "ERROR: publish.yml uses mutable tag refs — pin to commit SHAs"
+          # Ensure no mutable tag refs anywhere in this repo's workflows or
+          # composite actions -- narrowly checking only publish.yml (the
+          # original guard) let actions/github-script@v7 ship unpinned in
+          # promote.yml and audit.yml, the two workflows that mutate
+          # :stable/:secure and hold packages/contents/issues/id-token write
+          # permissions plus, in promote.yml, GH_PAT_PACKAGES in the same job
+          # environment. See SUP-13.
+          if grep -rE 'uses: .*@v[0-9]' .github/workflows/ .github/actions/; then
+            echo "ERROR: a workflow or composite action uses a mutable tag ref — pin to a commit SHA"
             exit 1
           fi
           echo "✓ Lint checks passed"

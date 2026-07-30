@@ -1,6 +1,7 @@
 # Builds, signs, and pushes ghcr.io/zagware/zagware-scanner on every version tag.
-# Uses GH_PAT_PACKAGES (scoped classic PAT with write:packages) for GHCR —
-# GITHUB_TOKEN cannot push to the org namespace on first creation.
+# Uses GITHUB_TOKEN (packages: write) for GHCR -- GH_PAT_PACKAGES was only
+# ever needed to create the package under the org namespace the first time;
+# the package exists now, so the built-in token suffices. See SUP-11.
 #
 # Supply chain guarantees:
 #   1. Syft, Grype, and Betterleaks cosign signatures verified BEFORE the Docker build
@@ -41,21 +42,41 @@ jobs:
       id-token: write        # cosign keyless signing via GitHub OIDC
       attestations: write    # SLSA provenance attestation
 
+    # Gates every publish behind a required reviewer -- tag creation alone is
+    # not covered by branch protection, so without this a single compromised
+    # account pushing a tag was enough to obtain a cosign-signed, SLSA-
+    # attested, :latest-tagged image with no second-party check. The
+    # "release" environment is configured in repo Settings with a required
+    # reviewer (see .github/CODEOWNERS' @zagware/maintainers team) and,
+    # incidentally, also environment-scopes GITHUB_TOKEN. See SUP-09.
+    environment: release
+
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Single source of truth for every pinned version/checksum -- the
+      # Dockerfile's own ARG defaults. Everything below reads from these
+      # instead of duplicating the literals, so there is exactly one place
+      # left to update on a version bump and no way for the two files to
+      # silently disagree. See SUP-08.
+      - name: Read pinned versions from Dockerfile
+        run: sed -n 's/^ARG //p' Dockerfile >> "$GITHUB_ENV"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      # ── Pre-build: verify Syft + Grype release signatures ────────────────────
-      # Anchore signs checksums.txt via cosign/sigstore. This verifies the file
-      # was produced by a GitHub Actions run in the anchore org — not by an
-      # attacker who swapped release artifacts post-TeamPCP style.
+      # ── Pre-build: verify Syft + Grype + Betterleaks release signatures ──────
+      # Anchore/betterleaks sign checksums.txt via cosign/sigstore. verify-blob
+      # proves the FILE is authentic (produced by their real CI) -- it says
+      # nothing about whether the checksum hand-copied into the Dockerfile
+      # actually matches an entry in it. A transcription error, or a value
+      # copied from the wrong release, would still print "✓ verified" with no
+      # other signal. Each step below extracts the asset's own line from the
+      # now-authenticated file and fails closed on any mismatch against the
+      # Dockerfile's pinned value. See SUP-07.
       - name: Verify Syft release signature
-        env:
-          SYFT_VERSION: v1.19.0
-          SYFT_VER: 1.19.0
         run: |
+          SYFT_VER="${SYFT_VERSION#v}"
           curl -sL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_checksums.txt" -o syft_checksums.txt
           curl -sL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_checksums.txt.pem" -o syft_checksums.txt.pem
           curl -sL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_checksums.txt.sig" -o syft_checksums.txt.sig
@@ -66,13 +87,22 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             syft_checksums.txt
           echo "✓ Syft ${SYFT_VERSION} release signature verified"
+
+          EXPECTED=$(grep " syft_${SYFT_VER}_linux_amd64.deb\$" syft_checksums.txt | cut -d' ' -f1)
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::syft_${SYFT_VER}_linux_amd64.deb not found in the verified Syft checksums.txt"
+            exit 1
+          fi
+          if [ "$EXPECTED" != "$SYFT_CHECKSUM" ]; then
+            echo "::error::Dockerfile SYFT_CHECKSUM ($SYFT_CHECKSUM) does not match the signed manifest ($EXPECTED)"
+            exit 1
+          fi
+          echo "✓ Dockerfile's pinned SYFT_CHECKSUM matches the signed manifest"
           rm syft_checksums.txt syft_checksums.txt.pem syft_checksums.txt.sig
 
       - name: Verify Grype release signature
-        env:
-          GRYPE_VERSION: v0.112.0
-          GRYPE_VER: 0.112.0
         run: |
+          GRYPE_VER="${GRYPE_VERSION#v}"
           curl -sL "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_checksums.txt" -o grype_checksums.txt
           curl -sL "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_checksums.txt.pem" -o grype_checksums.txt.pem
           curl -sL "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_checksums.txt.sig" -o grype_checksums.txt.sig
@@ -83,20 +113,40 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             grype_checksums.txt
           echo "✓ Grype ${GRYPE_VERSION} release signature verified"
+
+          EXPECTED=$(grep " grype_${GRYPE_VER}_linux_amd64.deb\$" grype_checksums.txt | cut -d' ' -f1)
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::grype_${GRYPE_VER}_linux_amd64.deb not found in the verified Grype checksums.txt"
+            exit 1
+          fi
+          if [ "$EXPECTED" != "$GRYPE_CHECKSUM" ]; then
+            echo "::error::Dockerfile GRYPE_CHECKSUM ($GRYPE_CHECKSUM) does not match the signed manifest ($EXPECTED)"
+            exit 1
+          fi
+          echo "✓ Dockerfile's pinned GRYPE_CHECKSUM matches the signed manifest"
           rm grype_checksums.txt grype_checksums.txt.pem grype_checksums.txt.sig
 
       - name: Verify Betterleaks release signature
-        env:
-          BETTERLEAKS_VERSION: v1.7.2
         run: |
-          curl -sL "https://github.com/betterleaks/betterleaks/releases/download/${BETTERLEAKS_VERSION}/checksums.txt" -o betterleaks_checksums.txt
-          curl -sL "https://github.com/betterleaks/betterleaks/releases/download/${BETTERLEAKS_VERSION}/checksums.txt.sigstore.json" -o betterleaks_checksums.txt.sigstore.json
+          curl -sL "https://github.com/betterleaks/betterleaks/releases/download/v${BETTERLEAKS_VERSION}/checksums.txt" -o betterleaks_checksums.txt
+          curl -sL "https://github.com/betterleaks/betterleaks/releases/download/v${BETTERLEAKS_VERSION}/checksums.txt.sigstore.json" -o betterleaks_checksums.txt.sigstore.json
           cosign verify-blob \
             --bundle betterleaks_checksums.txt.sigstore.json \
             --certificate-identity-regexp "^https://github.com/betterleaks/betterleaks/.+$" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             betterleaks_checksums.txt
-          echo "✓ Betterleaks ${BETTERLEAKS_VERSION} release signature verified"
+          echo "✓ Betterleaks v${BETTERLEAKS_VERSION} release signature verified"
+
+          EXPECTED=$(grep " betterleaks_${BETTERLEAKS_VERSION}_linux_x64.tar.gz\$" betterleaks_checksums.txt | cut -d' ' -f1)
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::betterleaks_${BETTERLEAKS_VERSION}_linux_x64.tar.gz not found in the verified Betterleaks checksums.txt"
+            exit 1
+          fi
+          if [ "$EXPECTED" != "$BETTERLEAKS_CHECKSUM" ]; then
+            echo "::error::Dockerfile BETTERLEAKS_CHECKSUM ($BETTERLEAKS_CHECKSUM) does not match the signed manifest ($EXPECTED)"
+            exit 1
+          fi
+          echo "✓ Dockerfile's pinned BETTERLEAKS_CHECKSUM matches the signed manifest"
           rm betterleaks_checksums.txt betterleaks_checksums.txt.sigstore.json
 
       # ── Build ─────────────────────────────────────────────────────────────────
@@ -110,7 +160,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GH_PAT_PACKAGES }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set image tag
         id: tag
@@ -118,6 +168,20 @@ jobs:
           INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            case "$INPUT_TAG" in
+              stable|secure)
+                echo "::error::Refusing to dispatch directly onto ':$INPUT_TAG' -- that tag is only ever moved by promote.yml after its 14-day cooling period and CVE gate. Publish a version tag instead and let promotion advance :$INPUT_TAG the normal way. See SUP-02."
+                exit 1
+                ;;
+            esac
+            # Allowlist, not a blocklist: also closes SUP-19 (a newline in
+            # INPUT_TAG would otherwise inject arbitrary extra GITHUB_OUTPUT
+            # lines) and rejects any other malformed input, not just the two
+            # reserved names checked above.
+            if ! [[ "$INPUT_TAG" =~ ^([0-9]+\.[0-9]+\.[0-9]+|latest)$ ]]; then
+              echo "::error::Invalid tag '$INPUT_TAG' -- must be 'latest' or a plain X.Y.Z version. See SUP-19."
+              exit 1
+            fi
             echo "value=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
           else
             echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
@@ -130,7 +194,7 @@ jobs:
           images: ghcr.io/zagware/zagware-scanner
           tags: |
             type=raw,value=${{ steps.tag.outputs.value }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
           labels: |
             org.opencontainers.image.title=Zagware Security Scanner
             org.opencontainers.image.description=IaC (KICS) + SCA (Grype) + Secrets (Betterleaks) security scanner for CI pipelines
@@ -146,15 +210,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            KICS_VERSION=2.1.20
-            KICS_CHECKSUM=8a5aa375ccfdc0ddd1114eddf1f9638ad7f6122e98d12a592207509dbe6d81f8
-            SYFT_VERSION=v1.19.0
-            SYFT_CHECKSUM=f3667d6abfa97a1e5614882f81e0a0b090f0047e0df7025b568fa87b6d95ac58
-            GRYPE_VERSION=v0.112.0
-            GRYPE_CHECKSUM=434bae8af635b6308d7a33ea842c6216dc382d4ec49fe3873f927b7805cc69e2
-            BETTERLEAKS_VERSION=1.7.2
-            BETTERLEAKS_CHECKSUM=ea9ed6a4aa2845ac2e00c0eafbc841057631321d53c061d5a435cf33e6e9ddaf
+          # No build-args here -- the Dockerfile's own ARG defaults are the
+          # single source of truth (just verified against the signed
+          # upstream manifests above), so nothing here can drift from what
+          # the "Verify *" steps checked. See SUP-08.
           sbom: true
           provenance: true
 
