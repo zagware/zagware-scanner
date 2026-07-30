@@ -76,6 +76,26 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Parse an integer-shaped env var, same fail-safe contract as _env_bool:
+    unset/empty -> *default*; anything unparseable or below *minimum* is
+    logged and *default* is used rather than silently coerced. Never raises --
+    a typo in a timeout must not crash the scan before it starts."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        val = int(raw.strip())
+    except ValueError:
+        logging.warning("%s=%r is not an integer -- using default %d", name, raw, default)
+        return default
+    if val < minimum:
+        logging.warning("%s=%d is below the minimum of %d -- using default %d",
+                        name, val, minimum, default)
+        return default
+    return val
+
+
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
 _COMMENT_MARKER    = "<!-- zagware-scanner -->"              # GitHub / Gitlab (hidden HTML comment)
@@ -85,6 +105,12 @@ _FAIL_ON_NEW   = _env_bool("ZAGWARE_FAIL_ON_NEW", False)
 _EXCLUDE_PATHS = os.environ.get("ZAGWARE_EXCLUDE_PATHS", ".git")
 _MIN_SEVERITY  = os.environ.get("ZAGWARE_MIN_SEVERITY", "").upper().strip()
 _OUTPUT_DIR    = os.environ.get("ZAGWARE_OUTPUT_DIR", "zagware-scan-results")
+# Wall-clock budget for a single KICS invocation (per branch, so a full run
+# allows up to 2x this). Configurable because the failure it guards is
+# size-driven: a large monorepo can legitimately exceed the default, and
+# before QUAL-04 the only symptom was an unhandled TimeoutExpired traceback
+# with no hint that a longer budget was the fix.
+_SCAN_TIMEOUT  = _env_int("ZAGWARE_SCAN_TIMEOUT", 600)
 
 _SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "TRACE"]
 _SEVERITY_EMOJI = {
@@ -1018,7 +1044,26 @@ def run_scan(path: str, output_json: str) -> dict:
     if below:
         cmd += ["--exclude-severities", ",".join(below)]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=path, timeout=600)
+    # TimeoutExpired and FileNotFoundError must surface as ScanFailure, not as
+    # an unhandled traceback: main() catches RuntimeError (ScanFailure's base)
+    # and records telemetry, whereas a bare traceback kills the process before
+    # telemetry_flush() and makes a 10-minute monorepo scan indistinguishable
+    # from ZAGWARE_FAIL_ON_NEW legitimately blocking the merge. The SCA and
+    # Secrets paths already do this; IaC was the outlier. See QUAL-04.
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=path,
+                                timeout=_SCAN_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        raise ScanFailure(
+            f"KICS exceeded its {_SCAN_TIMEOUT}s budget scanning {path} — this is NOT "
+            f"'no findings'; it is a scanner failure. Raise ZAGWARE_SCAN_TIMEOUT if this "
+            f"repository legitimately needs longer."
+        ) from exc
+    except FileNotFoundError as exc:
+        raise ScanFailure(
+            f"KICS binary not found at {_SCANNER_BIN} ({exc}) — this is NOT 'no findings'; "
+            f"it is a scanner failure. Check the image, or _ZAGWARE_SCANNER_BIN if overridden."
+        ) from exc
 
     # KICS exit codes: 0=no findings, 30=LOW/INFO, 40=MEDIUM, 50=HIGH/CRITICAL.
     # All of these are valid — the output file is the source of truth, not the
@@ -2869,7 +2914,36 @@ def main() -> int:
     return exit_code
 
 
-if __name__ == "__main__":
-    _exit_code = main()
+# Exit codes:
+#   0 — scan completed, nothing gated the merge
+#   1 — scan completed and a policy gate fired (ZAGWARE_FAIL_ON_NEW, public-repo
+#       secrets), or a handled scanner failure occurred
+#   2 — the scanner itself crashed unexpectedly. Kept distinct from 1 so an
+#       operator can tell "your PR has findings" from "the tool broke"; before
+#       QUAL-04 an unhandled exception exited 1 via the traceback path with no
+#       telemetry and no way to distinguish the two.
+_EXIT_CRASH = 2
+
+def _run_cli() -> int:
+    """Process entrypoint wrapper. Converts an unhandled exception into
+    _EXIT_CRASH *and* still flushes telemetry, instead of dying on the
+    traceback before telemetry_flush() ever runs. Kept as a named function
+    rather than inline under `if __name__ == "__main__"` so the backstop
+    itself is directly testable. See QUAL-04."""
+    try:
+        exit_code = main()
+    except Exception as exc:  # noqa: BLE001 -- deliberate top-level backstop
+        # log.exception keeps the traceback available for debugging; the
+        # difference is that the process now exits through the flush below.
+        log.exception("Scanner crashed unexpectedly: %s: %s", type(exc).__name__, exc)
+        try:
+            track_scan_failed("unknown", "", "unhandled")
+        except Exception:
+            pass  # a broken telemetry path must not mask the original crash
+        exit_code = _EXIT_CRASH
     telemetry_flush()  # bounded wait for in-flight telemetry — never blocks indefinitely
-    sys.exit(_exit_code)
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(_run_cli())

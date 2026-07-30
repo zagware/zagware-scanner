@@ -503,6 +503,11 @@ three resolve base/head refs and the PR number from their own native CI variable
 | Variable | Default | Description |
 |---|---|---|
 | `ZAGWARE_DEBUG` | `false` | Set `true` for debug-level log output — the most useful first step when a scan behaves unexpectedly. |
+| `ZAGWARE_SCAN_TIMEOUT` | `600` | Seconds allowed for a single KICS invocation, per branch (so a full run allows up to 2×). Raise it for large monorepos — exceeding it is reported as an explicit scanner failure, not as "no findings". |
+
+**Exit codes:** `0` = clean, `1` = a policy gate fired (`ZAGWARE_FAIL_ON_NEW`, public-repo
+secrets) or a scan failed, `2` = the scanner itself crashed. `2` is deliberately distinct so a
+broken tool is never mistaken for a PR that legitimately has findings.
 
 ---
 ## Scan artifacts
