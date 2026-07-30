@@ -464,6 +464,13 @@ the credential is live). Set `ZAGWARE_SECRETS_ENABLED=false` to disable it.
 
 ## Configuration
 
+### Scan behaviour
+
+Boolean-shaped variables below share one vocabulary: `true`/`1`/`yes`/`on` for on,
+`false`/`0`/`no`/`off`/`disabled` for off (case-insensitive, whitespace-trimmed).
+Any other value is rejected with a warning in the scan log and the default is used —
+it is never silently misread as the opposite of what you intended.
+
 | Variable | Default | Description |
 |---|---|---|
 | `ZAGWARE_PLATFORM_URL` | — | Base URL of the Zagware platform, e.g. `https://app.zagware.io`. No trailing slash. Required for dashboard upload. |
@@ -474,8 +481,28 @@ the credential is live). Set `ZAGWARE_SECRETS_ENABLED=false` to disable it.
 | `ZAGWARE_SCA_ENABLED` | `true` | Set `false` to skip Grype dependency scanning entirely. |
 | `ZAGWARE_SECRETS_ENABLED` | `true` | Set `false` to skip betterleaks secrets scanning entirely. |
 | `ZAGWARE_SECRETS_FAIL_ON_PUBLIC` | `true` | Exit 1 when a new secret is found in a **public** repository, regardless of `ZAGWARE_FAIL_ON_NEW`. Betterleaks has no severity to gate on, so repo visibility is the priority signal instead. |
+| `ZAGWARE_OUTPUT_DIR` | `zagware-scan-results` | Directory scan artifacts are written to — see [Scan artifacts](#scan-artifacts). |
+| `ZAGWARE_SUPPRESSIONS_FILE` | `.zagware/suppressions.yaml` | Path (relative to the repo root) to the suppressions file. Change this for monorepos that can't use the default location. |
+| `ZAGWARE_QUERIES_PATH` | `/opt/iac-rules/assets/queries` | Path to the KICS query rules tree inside the image. Only relevant for [self-hosted](#self-hosting) builds shipping a custom or additional rules bundle. |
 | `ZAGWARE_TELEMETRY` | _(on)_ | Set `off` to disable anonymous usage telemetry. See [Telemetry](#telemetry). |
 | `ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME` | `false` | Set `true` to send your org/repo name in clear instead of a one-way hash. |
+
+### Platform inputs (GitHub Actions only)
+
+Ignored, and unnecessary to set, on GitLab CI, Bitbucket Pipelines, and Azure DevOps — those
+three resolve base/head refs and the PR number from their own native CI variables instead.
+
+| Variable | Required? | Description |
+|---|---|---|
+| `PR_NUMBER` | **Required** | The pull request number, e.g. `${{ github.event.pull_request.number \|\| github.event.issue.number }}`. Missing this raises an uncaught error before the scan can post a comment. |
+| `ZAGWARE_BASE_REF` | Only for `issue_comment`-triggered runs | Overrides `GITHUB_BASE_REF`. GitHub Actions reserves `GITHUB_*` names and silently ignores a workflow-declared override for them on `docker://` actions, so a `/zagware suppress` re-run (which is `issue_comment`-triggered, not `pull_request`-triggered) needs this to resolve the base branch. See [`examples/github-actions.yml`](examples/github-actions.yml) for how to compute it via the GitHub API. |
+| `ZAGWARE_HEAD_REF` | Only for `issue_comment`-triggered runs | Same reasoning as `ZAGWARE_BASE_REF`, overriding `GITHUB_HEAD_REF` (falls back to `GITHUB_SHA` otherwise). |
+
+### Debugging & advanced
+
+| Variable | Default | Description |
+|---|---|---|
+| `ZAGWARE_DEBUG` | `false` | Set `true` for debug-level log output — the most useful first step when a scan behaves unexpectedly. |
 
 ---
 ## Scan artifacts

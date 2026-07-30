@@ -41,12 +41,47 @@ import hashlib
 # ── Internal constants ─────────────────────────────────────────────────────────
 __version__ = "2.10.0"
 
+# Boolean-shaped env vars previously used five different, mutually incompatible
+# parsing conventions (.lower()=="true", .lower()!="false", bare truthiness, and
+# two different "off" vocabularies): ZAGWARE_FAIL_ON_NEW=1 silently left the
+# merge gate off, ZAGWARE_SECRETS_FAIL_ON_PUBLIC=0 could not turn that gate off
+# at all, and ZAGWARE_DEBUG=false enabled debug logging. One helper, one
+# documented vocabulary, used for every boolean-shaped ZAGWARE_* var. The false
+# side matches ZAGWARE_TELEMETRY's existing (and now-canonical) vocabulary
+# rather than narrowing it, so ZAGWARE_TELEMETRY=disabled keeps working. See
+# QUAL-19/DOC-25.
+_ENV_BOOL_TRUE  = {"1", "true", "yes", "on"}
+_ENV_BOOL_FALSE = {"0", "false", "no", "off", "disabled"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean-shaped env var against the shared vocabulary above.
+    Unset or empty -> *default*. Any other non-empty value is not silently
+    guessed at: it is logged (via the module-level `logging.warning`, since
+    this runs for some vars before `log` is configured below) and *default*
+    is used rather than misinterpreted."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    val = raw.strip().lower()
+    if val in _ENV_BOOL_TRUE:
+        return True
+    if val in _ENV_BOOL_FALSE:
+        return False
+    logging.warning(
+        "%s=%r is not a recognised boolean value (true: %s / false: %s) "
+        "-- using default %s",
+        name, raw, sorted(_ENV_BOOL_TRUE), sorted(_ENV_BOOL_FALSE), default,
+    )
+    return default
+
+
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
 _COMMENT_MARKER    = "<!-- zagware-scanner -->"              # GitHub / Gitlab (hidden HTML comment)
 _BB_COMMENT_MARKER = "[zagware-scanner]: https://github.com/zagware/zagware-scanner"  # Bitbucket (invisible link ref)
 _MAX_COMMENT   = 60_000
-_FAIL_ON_NEW   = os.environ.get("ZAGWARE_FAIL_ON_NEW", "false").lower() == "true"
+_FAIL_ON_NEW   = _env_bool("ZAGWARE_FAIL_ON_NEW", False)
 _EXCLUDE_PATHS = os.environ.get("ZAGWARE_EXCLUDE_PATHS", ".git")
 _MIN_SEVERITY  = os.environ.get("ZAGWARE_MIN_SEVERITY", "").upper().strip()
 _OUTPUT_DIR    = os.environ.get("ZAGWARE_OUTPUT_DIR", "zagware-scan-results")
@@ -58,7 +93,7 @@ _SEVERITY_EMOJI = {
 }
 
 # ── SCA (Grype) constants ──────────────────────────────────────────────────────
-_SCA_ENABLED      = os.environ.get("ZAGWARE_SCA_ENABLED", "true").lower() != "false"
+_SCA_ENABLED      = _env_bool("ZAGWARE_SCA_ENABLED", True)
 _GRYPE_BIN        = os.environ.get("_ZAGWARE_GRYPE_BIN",  "/usr/bin/grype")
 _SYFT_BIN         = os.environ.get("_ZAGWARE_SYFT_BIN",   "/usr/bin/syft")
 _SCA_SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NEGLIGIBLE", "UNKNOWN"]
@@ -88,19 +123,19 @@ _SCA_MANIFESTS = [
 ]
 
 # ── Secrets (betterleaks) constants ────────────────────────────────────────────
-_SECRETS_ENABLED = os.environ.get("ZAGWARE_SECRETS_ENABLED", "true").lower() != "false"
+_SECRETS_ENABLED = _env_bool("ZAGWARE_SECRETS_ENABLED", True)
 _SECRETS_BIN     = os.environ.get("_ZAGWARE_SECRETS_BIN", "/usr/local/bin/betterleaks")
 # Fail the build if a NEW secret lands in a PUBLIC repo, regardless of ZAGWARE_FAIL_ON_NEW.
 # Betterleaks has no severity taxonomy, so repo visibility is the priority signal instead —
 # a leaked credential in a public repo is immediately exposed to the world.
-_SECRETS_FAIL_ON_PUBLIC = os.environ.get("ZAGWARE_SECRETS_FAIL_ON_PUBLIC", "true").lower() != "false"
+_SECRETS_FAIL_ON_PUBLIC = _env_bool("ZAGWARE_SECRETS_FAIL_ON_PUBLIC", True)
 # When repo_visibility() cannot be determined (transient API error, missing
 # permission, GitHub Enterprise quirk), ZAGWARE_SECRETS_FAIL_ON_PUBLIC treats
 # "unknown" the same as "public" (fail closed) by default — see QUAL-02. Set
 # this to explicitly opt out, e.g. for an air-gapped install where visibility
 # can never be resolved and the operator has independently confirmed the repo
 # is private.
-_ASSUME_PRIVATE = os.environ.get("ZAGWARE_ASSUME_PRIVATE", "false").lower() == "true"
+_ASSUME_PRIVATE = _env_bool("ZAGWARE_ASSUME_PRIVATE", False)
 
 def _severities_below() -> list[str]:
     """Return severities to pass to --exclude-severities based on ZAGWARE_MIN_SEVERITY.
@@ -119,10 +154,12 @@ def _severities_below() -> list[str]:
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
+_DEBUG = _env_bool("ZAGWARE_DEBUG", False)
+
 logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%H:%M:%S",
-    level=logging.DEBUG if os.environ.get("ZAGWARE_DEBUG") else logging.INFO,
+    level=logging.DEBUG if _DEBUG else logging.INFO,
 )
 log = logging.getLogger("zagware")
 
@@ -147,11 +184,8 @@ log = logging.getLogger("zagware")
 _POSTHOG_API_KEY        = "phc_12P9WCCmeTB6969NvX6qt2nKZirAegKPtfozTzxH1yG"
 _POSTHOG_CAPTURE_URL    = "https://eu.i.posthog.com/capture/"
 _TELEMETRY_HTTP_TIMEOUT = 3  # seconds
-_TELEMETRY_DISABLED     = os.environ.get("ZAGWARE_TELEMETRY", "").strip().lower() in (
-    "off", "false", "0", "no", "disabled",
-)
-_TELEMETRY_INCLUDE_REPO_NAME = os.environ.get(
-    "ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME", "").strip().lower() in ("true", "1", "yes")
+_TELEMETRY_ENABLED = _env_bool("ZAGWARE_TELEMETRY", True)
+_TELEMETRY_INCLUDE_REPO_NAME = _env_bool("ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME", False)
 
 _telemetry_threads: list[threading.Thread] = []
 
@@ -198,7 +232,7 @@ def _telemetry_identity(platform_name: str, repo_full_name: str) -> tuple[str, d
 
 
 def _send_telemetry_event(name: str, props: dict) -> None:
-    if _TELEMETRY_DISABLED:
+    if not _TELEMETRY_ENABLED:
         return
     try:
         props = dict(props)
