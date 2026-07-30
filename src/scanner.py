@@ -199,7 +199,9 @@ log = logging.getLogger("zagware")
 #
 # What is NEVER sent: file contents, file paths, finding descriptions, CVE IDs,
 # package names, branch names, commit SHAs, tokens/secrets, or any CI/platform
-# credential. PostHog's IP-based geolocation is explicitly disabled ($ip: 0).
+# credential. PostHog's IP-based geolocation is disabled via $geoip_disable
+# (see _send_telemetry_event for why $ip: 0 alone did NOT work). Note that
+# repo_id/org_id are pseudonymous, not irreversible -- see _telemetry_identity.
 #
 # Disable entirely:            ZAGWARE_TELEMETRY=off (or false/0/no/disabled)
 # Send org/repo name in clear: ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME=true
@@ -218,7 +220,17 @@ _telemetry_threads: list[threading.Thread] = []
 
 def _telemetry_hash(s: str) -> str:
     """Short (16-char) SHA-256 prefix — enough entropy to avoid collisions across
-    the scanner's realistic install base, without embedding a full 64-char hash."""
+    the scanner's realistic install base, without embedding a full 64-char hash.
+
+    NOT irreversible. This is an unsalted digest over a small, public, fully
+    enumerable namespace (platform + `owner/repo` strings), so anyone holding
+    the values can recover the original name for a public repo with a
+    precomputed table. It is a *pseudonym* — stable and linkable, not
+    anonymous. Salting per-install would defeat the cross-run grouping this
+    exists for, and a CI container has nowhere durable to persist a salt, so
+    the honest fix is to describe it accurately rather than overclaim. See
+    SEC-09.
+    """
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
@@ -237,10 +249,12 @@ def _bucket_count(n: int) -> str:
 def _telemetry_identity(platform_name: str, repo_full_name: str) -> tuple[str, dict]:
     """Return (distinct_id, base_properties) identifying the CI platform + repo.
 
-    By default org/repo identity is hashed (pseudonymous, stable across runs so
-    the same repo groups consistently in PostHog without exposing its name to a
-    third-party analytics processor). Set ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME=true
-    to send the plaintext org/repo name instead.
+    By default org/repo identity is sent as a stable pseudonymous hash rather
+    than plaintext, so the same repo groups consistently in PostHog. For a
+    public repo that hash is reversible by anyone who has it (see
+    _telemetry_hash) — it reduces casual exposure, it is not anonymity. Set
+    ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME=true to send the plaintext name
+    instead, or ZAGWARE_TELEMETRY=off to send nothing at all.
     """
     repo_full_name = repo_full_name or ""
     org = repo_full_name.split("/", 1)[0] if "/" in repo_full_name else ""
@@ -265,7 +279,15 @@ def _send_telemetry_event(name: str, props: dict) -> None:
         distinct_id = props.pop("_distinct_id", "anonymous")
         props["tool"]            = "zagware-scanner"
         props["scanner_version"] = __version__
-        props["$ip"] = 0  # disable PostHog IP-based geolocation
+        # PostHog's GeoIP plugin reads `event.properties?.$ip || event.ip` and
+        # only skips when `event.properties?.$geoip_disable` is truthy. The
+        # previous `$ip = 0` is FALSY in JS, so it was discarded and the plugin
+        # fell back to event.ip -- the runner's public IP -- and geolocated
+        # normally, despite the docs claiming otherwise. $geoip_disable is the
+        # documented switch; $ip is set to None so no address is sent at all.
+        # See SEC-09.
+        props["$geoip_disable"] = True
+        props["$ip"] = None
         payload = {
             "api_key":     _POSTHOG_API_KEY,
             "event":       name,
@@ -282,6 +304,11 @@ def _send_telemetry_event(name: str, props: dict) -> None:
                 _POSTHOG_CAPTURE_URL, data=body,
                 headers={"Content-Type": "application/json"}, method="POST",
             )
+            # Plain urlopen, deliberately: this request carries no Authorization
+            # header (the PostHog project key is a public write-only token), so
+            # the cross-host-redirect concern in SEC-05 does not apply, and it
+            # already has its own tighter timeout. Keeping it off the shared
+            # opener also keeps this daemon thread independent of it.
             urllib.request.urlopen(req, timeout=_TELEMETRY_HTTP_TIMEOUT).close()
         except Exception:
             pass  # network/DNS/timeout — never surfaced, never retried
@@ -358,6 +385,72 @@ def track_suppression_applied(platform_name: str, repo: str, count: int) -> None
 
 # ── HTTP helper (stdlib only, no pip deps) ─────────────────────────────────────
 
+_HTTP_TIMEOUT = 30  # seconds — every authenticated request below is bounded
+
+
+class _NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse any 30x that changes host.
+
+    urllib follows redirects by default, and CPython's
+    HTTPRedirectHandler.redirect_request strips only *content* headers —
+    Authorization survives. A POST to https://a.example carrying
+    `Authorization: Bearer <token>` redirected to https://evil.example arrives
+    there with the token intact. That reaches every path here: the platform
+    uploads (bearer `gtp_…`), and every _http() call, where CI_SERVER_URL and
+    SYSTEM_TEAMFOUNDATIONCOLLECTIONURI are already operator-supplied hosts
+    carrying GITHUB_TOKEN / GITLAB_TOKEN / SYSTEM_ACCESSTOKEN.
+
+    Returning None makes urllib surface the 30x as an HTTPError instead of
+    following it — fail closed, and loudly. See SEC-05.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old_host = urllib.parse.urlsplit(req.full_url).netloc
+        new_host = urllib.parse.urlsplit(newurl).netloc
+        if old_host != new_host:
+            log.error(
+                "Refusing cross-host redirect %s → %s (HTTP %s): credentials would "
+                "follow to the new host", old_host, new_host, code,
+            )
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_NoCrossHostRedirect())
+
+
+def _urlopen(req, timeout: int = _HTTP_TIMEOUT):
+    """Single chokepoint for every credential-bearing request: cross-host
+    redirects blocked, and always bounded by a timeout. See SEC-05."""
+    return _opener.open(req, timeout=timeout)
+
+
+def _validate_platform_url(url: str) -> str:
+    """Return *url* if a bearer token may safely be sent to it, else "".
+
+    ZAGWARE_PLATFORM_URL was previously consumed with no scheme check at all,
+    so `http://…` was accepted and the `gtp_…` token plus full scan results
+    went out in cleartext. https is required; plain http is tolerated only for
+    loopback, where there is no network to intercept. See SEC-05.
+    """
+    if not url:
+        return ""
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if parts.scheme == "https":
+        return url
+    if parts.scheme == "http" and host in ("localhost", "127.0.0.1", "::1"):
+        log.warning("ZAGWARE_PLATFORM_URL uses http:// on a loopback host — "
+                    "acceptable for local development only")
+        return url
+    log.error(
+        "Refusing ZAGWARE_PLATFORM_URL=%r — platform uploads carry a bearer token and "
+        "require https:// (http:// is allowed only for localhost). Platform upload is "
+        "disabled for this run; the scan and PR comment are unaffected.", url,
+    )
+    return ""
+
+
 def _http(method: str, url: str, data: dict | None = None, headers: dict | None = None) -> dict | list:
     body = json.dumps(data).encode() if data is not None else None
     req  = urllib.request.Request(url, data=body, method=method)
@@ -365,7 +458,11 @@ def _http(method: str, url: str, data: dict | None = None, headers: dict | None 
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req) as resp:
+        # _urlopen, not urllib.request.urlopen: this call carries the CI
+        # platform token and previously had NO timeout at all, so one stalled
+        # socket inside the comment-pagination loop hung the job until the CI
+        # platform's global timeout. See SEC-05.
+        with _urlopen(req) as resp:
             raw = resp.read()
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
@@ -978,12 +1075,68 @@ def _repo_base_url() -> str:
 
 # ── Git helpers ────────────────────────────────────────────────────────────────
 
-def _git(args: list[str], cwd: str | None = None) -> None:
+def _scan_exclude_paths() -> str:
+    """ZAGWARE_EXCLUDE_PATHS with `.git` always appended.
+
+    `.git` used to be merely the *default* value, so the moment an operator set
+    ZAGWARE_EXCLUDE_PATHS to anything else -- e.g. "vendor" -- the clone's
+    .git directory silently became in-scope for scanning. It holds the packed
+    object store and, historically, the credential-bearing remote URL, so it is
+    appended unconditionally rather than left to a default that any config
+    change removes. See SEC-07.
+    """
+    parts = [p.strip() for p in _EXCLUDE_PATHS.split(",") if p.strip()]
+    if ".git" not in parts:
+        parts.append(".git")
+    return ",".join(parts)
+
+
+def _split_credential(url: str) -> tuple[str, dict[str, str]]:
+    """Split `https://user:pass@host/path` into a credential-free URL plus an
+    env dict that supplies the same credential via `http.extraHeader`.
+
+    Every platform adapter builds its clone URL with the credential inline, and
+    passing that as a positional argv to git has two consequences: the token is
+    visible in /proc/<pid>/cmdline for the life of the clone, and git persists
+    it as remote.origin.url in the clone's .git/config -- a plaintext
+    long-lived credential (GITLAB_TOKEN with api scope, BITBUCKET_API_TOKEN
+    with repo+PR write, SYSTEM_ACCESSTOKEN) sitting on disk inside the very
+    directory the scanner then hands to other tools.
+
+    GIT_CONFIG_COUNT/KEY/VALUE apply the header for one invocation only and are
+    never written to .git/config, so the clone ends up with a clean origin URL.
+
+    Measured, not assumed: betterleaks in `dir` mode does NOT walk .git/ (a
+    seeded token in .git/config produced 0 findings and an ~11-byte scan
+    against the real bundled binary), so the "fed straight to a credential
+    scanner" half of SEC-07 does not materialise. The on-disk and argv exposure
+    are real regardless, which is what this fixes. See SEC-07.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if not parts.username and not parts.password:
+        return url, {}
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    clean = urllib.parse.urlunsplit(
+        (parts.scheme, host, parts.path, parts.query, parts.fragment))
+    user = urllib.parse.unquote(parts.username or "")
+    pw   = urllib.parse.unquote(parts.password or "")
+    basic = base64.b64encode(f"{user}:{pw}".encode()).decode()
+    return clean, {
+        "GIT_CONFIG_COUNT":   "1",
+        "GIT_CONFIG_KEY_0":   "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
+    }
+
+
+def _git(args: list[str], cwd: str | None = None, env: dict[str, str] | None = None) -> None:
     result = subprocess.run(
         ["git"] + args,
         cwd=cwd,
         capture_output=True,
         text=True,
+        env={**os.environ, **env} if env else None,
     )
     if result.returncode != 0:
         raise subprocess.CalledProcessError(
@@ -992,16 +1145,21 @@ def _git(args: list[str], cwd: str | None = None) -> None:
 
 
 def clone_branch(url: str, branch: str, dest: str) -> None:
-    """Shallow-clone a single branch."""
+    """Shallow-clone a single branch with a credential-free argv. See SEC-07."""
+    clean, auth_env = _split_credential(url)
     _git(["clone", "--depth=1", "--quiet", "--no-tags",
-          "--branch", branch, url, dest])
+          "--branch", branch, clean, dest], env=auth_env)
 
 
 def clone_and_checkout_sha(url: str, base_branch: str, sha: str, dest: str) -> None:
-    """Clone base branch then fetch and checkout a specific SHA."""
+    """Clone base branch then fetch and checkout a specific SHA.
+
+    The fetch needs the credential too, and origin is now clean, so the same
+    out-of-band env is reapplied rather than re-embedding it in the URL."""
+    clean, auth_env = _split_credential(url)
     _git(["clone", "--depth=1", "--quiet", "--no-tags",
-          "--branch", base_branch, url, dest])
-    _git(["fetch", "--depth=1", "origin", sha], cwd=dest)
+          "--branch", base_branch, clean, dest], env=auth_env)
+    _git(["fetch", "--depth=1", "origin", sha], cwd=dest, env=auth_env)
     _git(["checkout", sha], cwd=dest)
 
 
@@ -1033,7 +1191,7 @@ def run_scan(path: str, output_json: str) -> dict:
         "--report-formats", "json",
         "--output-path",  out_dir,      # absolute — unaffected by cwd
         "--output-name",  out_name,
-        "--exclude-paths", _EXCLUDE_PATHS,
+        "--exclude-paths", _scan_exclude_paths(),
         "--disable-full-descriptions",
         "--no-progress",
         "--ci",
@@ -1135,7 +1293,13 @@ def _has_sca_manifests(path: str) -> bool:
 def _run_syft(path: str, sbom_out: str) -> bool:
     try:
         r = subprocess.run(
-            [_SYFT_BIN, "scan", f"dir:{path}", "-o", f"syft-json={sbom_out}", "--quiet"],
+            [_SYFT_BIN, "scan", f"dir:{path}", "-o", f"syft-json={sbom_out}",
+             # Never catalogue the clone's own .git store. Measured: betterleaks
+             # already skips .git in dir mode, and Syft finds no manifests
+             # there in practice, but neither is a guarantee worth relying on
+             # for a directory that holds the packed object store. See SEC-07.
+             "--exclude", "./.git/**",
+             "--quiet"],
             capture_output=True, text=True, timeout=180,
         )
         if r.returncode != 0:
@@ -1326,6 +1490,12 @@ def run_secrets_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
         "--exit-code", "0",  # report file is the source of truth, not the exit code
         "--no-color",
         "--no-banner",
+        # --redact masks matched secret material in betterleaks' console output
+        # (it does NOT affect the report file -- see the SECURITY note above).
+        # Without it, the tool's stdout carries the leaked credential and its
+        # surrounding line, which the error path below used to copy verbatim
+        # into the CI job log. See SEC-08.
+        "--redact",
     ]
     log.info("Secrets: running betterleaks on %s...", label)
     try:
@@ -1338,8 +1508,13 @@ def run_secrets_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
             f"Secrets: betterleaks unavailable for {label}: {e} — this is NOT 'no findings'; it is a scanner failure."
         ) from e
     if result.returncode != 0:
-        log.warning("Secrets: betterleaks exited %d for %s: %s", result.returncode, label,
-                    (result.stderr or result.stdout or "").strip()[:400])
+        # Deliberately does NOT interpolate stdout/stderr: for a secrets
+        # scanner that output is the leaked credential. The report file is the
+        # source of truth (see --exit-code 0 above), so the return code alone
+        # is all the diagnostic this path needs. See SEC-08.
+        log.warning("Secrets: betterleaks exited %d for %s — see the report file for findings; "
+                    "console output withheld because it can contain raw secret material",
+                    result.returncode, label)
 
     try:
         raw = json.loads(Path(out_json).read_text())
@@ -1573,13 +1748,17 @@ def apply_suppression_commands(
         log.error("Refusing to write %s: %s", _SUPPRESSIONS_PATH, exc)
         return False
 
-    # Git commit and push
+    # Git commit and push. origin is now a credential-free URL (see SEC-07), so
+    # the push needs the credential supplied out-of-band the same way the clone
+    # did. This is also what clone_url is finally *for*: it was previously an
+    # unused positional parameter, a trap in a 4-argument call (QUAL-22).
+    _, auth_env = _split_credential(clone_url)
     try:
         _git(["config", "user.email", "zagware-scanner@users.noreply.github.com"], cwd=pr_dir)
         _git(["config", "user.name", "Zagware Scanner"], cwd=pr_dir)
         _git(["add", _SUPPRESSIONS_PATH], cwd=pr_dir)
         _git(["commit", "-m", f"suppress: {len(new_entries)} finding(s) via PR comment"], cwd=pr_dir)
-        _git(["push", "origin", head_branch], cwd=pr_dir)
+        _git(["push", "origin", head_branch], cwd=pr_dir, env=auth_env)
         log.info("Pushed %d suppression(s) to %s — pipeline will re-run", len(new_entries), head_branch)
         return True
     except subprocess.CalledProcessError as exc:
@@ -1588,8 +1767,37 @@ def apply_suppression_commands(
 
 # ── Comment rendering ──────────────────────────────────────────────────────────
 
-def _cell(text: str, limit: int = 80) -> str:
-    text = text.replace("|", "\\|").replace("\n", " ").strip()
+def _cell(text, limit: int = 80) -> str:
+    """Sanitise one value for interpolation into the PR comment.
+
+    Every value passed here can originate in the pull request under review --
+    file names, IaC resource names, lockfile package names, betterleaks rule
+    tags -- so the comment the scanner posts is attacker-influenced content
+    rendered under the bot's identity. Reviewers treat that comment as the
+    authoritative gate output, so forging it is a review-integrity bypass that
+    needs no privilege. Four escapes, each closing a specific break-out:
+
+      backtick -> "'"    a backtick escapes the surrounding `code span`; it
+                         cannot be escaped *inside* one without changing the
+                         fence length, so it is replaced rather than escaped
+      < >      -> &lt;   GitHub's comment sanitiser permits <img>, <a>, <b> and
+                 &gt;    <details>, so raw angle brackets allow a tracking
+                         beacon, or a </details> that escapes the collapsed
+                         section and lets forged text (e.g. a fake "No new
+                         security findings" line) render as the bot's own
+      |        -> \\|     breaks the markdown table structure for the row
+      CR / LF  -> space  injects entirely new table rows or markdown blocks
+
+    See SEC-06.
+    """
+    if text is None:
+        return ""
+    text = (str(text)
+            .replace("\r", " ").replace("\n", " ")
+            .replace("`", "'")
+            .replace("<", "&lt;").replace(">", "&gt;")
+            .replace("|", "\\|")
+            .strip())
     return text[:limit] + "…" if len(text) > limit else text
 
 
@@ -1725,8 +1933,10 @@ def _parse_suppressions_file(scan_dir: str) -> dict[str, dict]:
 
     added_by/added_at come from the suppressed_by/suppressed_at fields written by
     apply_suppression_commands() for entries added via /zagware suppress PR comments.
-    Entries written by hand (or predating this field) have added_by=added_at=None —
-    callers needing attribution for those fall back to _blame_suppressions_file().
+    Entries written by hand (or predating this field) have added_by=added_at=None.
+    NOTE for callers: these values are read straight out of a repo-controlled
+    file and are therefore UNVERIFIED claims, not evidence — see SEC-10 and
+    collect_suppression_records(), which surfaces them as `claimed_by`.
     """
     text = _safe_read_suppressions_file(scan_dir)
     if text is None:
@@ -1816,58 +2026,6 @@ def load_suppressions(scan_dir: str) -> set[str]:
     log.info("Loaded %d suppression(s) from %s (%d expired and dropped)",
              len(active), _SUPPRESSIONS_PATH, expired_count)
     return active
-
-
-def _blame_suppressions_file(pr_dir: str) -> dict[str, tuple[str, str]]:
-    """Best-effort fallback: git blame .zagware/suppressions.yaml to attribute entries
-    that predate the suppressed_by/suppressed_at YAML fields (e.g. hand-committed files,
-    or suppressions.yaml files written before this feature existed).
-
-    Returns {similarity_id: (author_name, author_date_iso)}.
-
-    Caveat: the scanner shallow-clones with --depth=1, so blame can only see the single
-    checked-out commit — for lines untouched by that commit, git still attributes them to
-    it (there's no earlier history to walk back through), which is less precise than a
-    full clone. This is acceptable as a last-resort fallback only: the primary, accurate
-    attribution path is the suppressed_by/suppressed_at fields recorded directly in the
-    YAML by apply_suppression_commands() at the moment a /zagware suppress command lands.
-    """
-    supp_path = Path(pr_dir) / _SUPPRESSIONS_PATH
-    if supp_path.is_symlink() or not supp_path.exists():
-        return {}
-    try:
-        result = subprocess.run(
-            ["git", "blame", "--line-porcelain", "--", _SUPPRESSIONS_PATH],
-            cwd=pr_dir, capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return {}
-    except Exception:
-        return {}
-
-    ids: dict[str, tuple[str, str]] = {}
-    author = ""
-    author_time_iso = ""
-    for line in result.stdout.splitlines():
-        if line.startswith("author "):
-            author = line[len("author "):]
-        elif line.startswith("author-time "):
-            try:
-                ts = int(line.split(" ", 1)[1])
-                author_time_iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            except (ValueError, IndexError):
-                author_time_iso = ""
-        elif line.startswith("\t"):
-            content = line[1:].strip()
-            if content.startswith("- id:"):
-                sid = content[5:].strip().strip('"').strip("'")
-            elif content.startswith("id:"):
-                sid = content[3:].strip().strip('"').strip("'")
-            else:
-                continue
-            if sid:
-                ids[sid] = (author or "unknown", author_time_iso)
-    return ids
 
 
 def render_comment(
@@ -1965,11 +2123,14 @@ def render_comment(
                     "|------|-----:|----------|-------|----------|--------|",
                 ]
                 for f in q["files"]:
-                    fname    = f["file_name"]
-                    resource = f.get("resource_name") or f.get("resource_type") or "—"
+                    # Every cell below is routed through _cell: file_name and
+                    # resource_name come straight from the PR's own tree, and
+                    # issue_type can embed resource-derived text. See SEC-06.
+                    fname    = _cell(f.get("file_name", "—"))
+                    resource = _cell(f.get("resource_name") or f.get("resource_type") or "—")
                     L.append(
-                        f"| `{fname}` | {f['line']} | `{resource}`"
-                        f" | {f.get('issue_type', '')}"
+                        f"| `{fname}` | {_cell(f.get('line', '—'), 12)} | `{resource}`"
+                        f" | {_cell(f.get('issue_type', ''))}"
                         f" | {_cell(_redact_value(f.get('expected_value', '')))}"
                         f" | {_cell(_redact_value(f.get('actual_value', ''), q.get('category', '')))} |"
                     )
@@ -2035,15 +2196,17 @@ def render_sca_section(
             ]
             for f in sorted(findings, key=lambda x: -(x.get("cvss_score") or 0)):
                 vuln_url = f["vuln_urls"][0] if f.get("vuln_urls") else ""
-                cve_cell = (f"[{f['vulnerability_id']}]({vuln_url})"
-                            if vuln_url else f["vulnerability_id"])
+                vuln_id  = _cell(f.get("vulnerability_id", ""), 60)
+                cve_cell = f"[{vuln_id}]({vuln_url})" if vuln_url else vuln_id
                 fix = ", ".join(f["fix_versions"]) or f["fix_state"]
                 cvss = f"{f['cvss_score']:.1f}" if f.get("cvss_score") else "—"
                 kev  = "🔴 Yes" if f.get("kev_listed") else "No"
-                pkg  = f"{f['package_name']} ({f['package_type']})"
+                # package_name/version/type all come from a lockfile the PR
+                # controls, so they are sanitised like any other PR input.
+                pkg  = _cell(f"{f.get('package_name', '')} ({f.get('package_type', '')})")
                 L.append(
-                    f"| {cve_cell} | `{pkg}` | `{f['package_version']}` "
-                    f"| `{fix}` | {cvss} | {kev} |"
+                    f"| {cve_cell} | `{pkg}` | `{_cell(f.get('package_version', ''), 40)}` "
+                    f"| `{_cell(fix, 40)}` | {cvss} | {kev} |"
                 )
             if collapsible:
                 L += ["", "</details>", ""]
@@ -2113,10 +2276,13 @@ def render_secrets_section(
     ]
     _VALIDATION_CELL = {"valid": "🔴 Valid", "invalid": "⚪ Invalid", "unknown": "❓ Unknown"}
     for f in novel_secrets:
+        # rule_id and tags come from betterleaks' config, file_path from the
+        # PR's own tree -- all sanitised. See SEC-06.
         tags = ", ".join(f.get("tags") or [])
-        rule_cell = f.get("rule_id", "") + (f" ({tags})" if tags else "")
+        rule_cell = _cell(f.get("rule_id", "") + (f" ({tags})" if tags else ""))
         vs_cell = _VALIDATION_CELL.get(f.get("validation_status", "unknown"), "❓ Unknown")
-        L.append(f"| `{rule_cell}` | `{f.get('file_path', '')}` | {f.get('line', '—')} | {vs_cell} |")
+        L.append(f"| `{rule_cell}` | `{_cell(f.get('file_path', ''))}` "
+                 f"| {_cell(f.get('line', '—'), 12)} | {vs_cell} |")
     if collapsible:
         L += ["", "</details>"]
     L += [
@@ -2178,8 +2344,11 @@ def render_suppression_hints(
         "",
     ]
     for sim, desc, loc in items[:100]:
-        short = sim[:16] if sim else "?"
-        L.append(f"- `{short}` — {desc} (`{loc}`)")
+        # desc/loc are finding- and path-derived, i.e. PR-controlled. `short`
+        # is a hex similarity_id but is sanitised too rather than trusted on
+        # the assumption that it always will be. See SEC-06.
+        short = _cell(sim[:16], 16) if sim else "?"
+        L.append(f"- `{short}` — {_cell(desc)} (`{_cell(loc)}`)")
     if len(items) > 100:
         L.append(f"\n_… and {len(items) - 100} more (see scan artifacts for full list)_")
     L.append("")
@@ -2199,16 +2368,29 @@ def collect_suppression_records(
     just_suppressed: list[tuple[str, str, str, str]],
 ) -> list[dict]:
     """Build one audit record per currently-active suppression: who added it, when,
-    why, and which finding it covers. Attribution comes from three sources, tried
-    in priority order (most to least reliable):
+    why, and which finding it covers.
 
-      1. just_suppressed — /zagware suppress commands resolved and pushed in THIS
-         run: exact (the PR comment author + comment timestamp).
-      2. suppressed_by/suppressed_at fields already in suppressions.yaml: exact
-         (recorded by a *previous* run's step 1, when that entry was new).
-      3. git blame on suppressions.yaml: best-effort fallback for entries that
-         predate this feature or were committed by hand rather than via the
-         /zagware suppress comment flow.
+    Attribution has exactly ONE verified tier, deliberately:
+
+      1. just_suppressed — a /zagware suppress command the scanner itself
+         resolved and pushed in THIS run. The author came from the platform's
+         own comment API and the authorization check in
+         parse_suppression_commands, so it is evidence.
+         -> added_via = "pr_comment", added_by = the verified author.
+
+      2. Everything else — an entry already present in suppressions.yaml. That
+         file arrives via a PR the author controls, so its suppressed_by field
+         is a self-declared *claim*, not evidence: a contributor can hand-write
+         `suppressed_by: "trusted-maintainer"` and previously received a record
+         indistinguishable from tier 1.
+         -> added_via = "file_unverified", added_by = "unknown",
+            claimed_by = the unverified self-declared value (or None).
+
+    The former third tier — `git blame` on suppressions.yaml — has been removed
+    rather than relabelled. The scanner clones with --depth=1, so blame
+    attributes EVERY line to the single checked-out commit; it credited
+    whoever pushed last for suppressions added long before, which is worse than
+    no attribution because it looks authoritative. See SEC-10.
 
     Uploaded to the platform (see upload_suppressions_to_platform) so suppressions
     are auditable by repo/PR/user, and so widely-suppressed findings across many
@@ -2237,26 +2419,23 @@ def collect_suppression_records(
     just_by_id = {sid: (reason, author, created_at)
                   for sid, reason, author, created_at in just_suppressed}
 
-    blame: dict[str, tuple[str, str]] | None = None  # lazy — only git-blame if actually needed
-
     records: list[dict] = []
     for sid in suppressed_ids:
         finding_name, file_path, category = finding_info.get(sid, (None, None, None))
+        claimed_by: str | None = None
         if sid in just_by_id:
             reason, added_by, added_at = just_by_id[sid]
             added_via = "pr_comment"
         else:
             rec = file_records.get(sid, {})
             reason = rec.get("reason") or ""
-            added_by = rec.get("added_by")
             added_at = rec.get("added_at")
-            if added_by:
-                added_via = "pr_comment"
-            else:
-                added_via = "file"
-                if blame is None:
-                    blame = _blame_suppressions_file(pr_dir)
-                added_by, added_at = blame.get(sid, ("unknown", ""))
+            # Repo-supplied and therefore unverified — surfaced separately so
+            # the platform can render it as a claim rather than a fact, and so
+            # an auditor can always tell the two tiers apart. See SEC-10.
+            claimed_by = rec.get("added_by")
+            added_by = None
+            added_via = "file_unverified"
         records.append({
             "category":      category or "unknown",
             "similarity_id": sid,
@@ -2264,6 +2443,7 @@ def collect_suppression_records(
             "file_path":     file_path,
             "reason":        reason,
             "added_by":      added_by or "unknown",
+            "claimed_by":    claimed_by,
             "added_via":     added_via,
             "added_at":      added_at or None,
         })
@@ -2292,7 +2472,7 @@ def upload_suppressions_to_platform(
             f'{platform_url}/api/v1/suppressions/upload',
             data=data, headers=headers, method='POST',
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _urlopen(req) as resp:
             resp.read()
         log.info('Suppression audit uploaded to platform (%d record(s))', len(records))
     except Exception as e:
@@ -2328,7 +2508,7 @@ def upload_to_platform(
                 headers=headers,
                 method='POST',
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with _urlopen(req) as resp:
                 return json.loads(resp.read().decode('utf-8'))
 
         # 1. Upload base scan
@@ -2387,7 +2567,7 @@ def upload_sca_to_platform(
                 f'{platform_url}/api/v1/sca/upload',
                 data=data, headers=headers, method='POST',
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with _urlopen(req) as resp:
                 return json.loads(resp.read().decode('utf-8'))
 
         base_resp    = _post({'repo': repo, 'branch': base_branch,
@@ -2425,7 +2605,7 @@ def upload_secrets_to_platform(
                 f'{platform_url}/api/v1/secrets/upload',
                 data=data, headers=headers, method='POST',
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with _urlopen(req) as resp:
                 return json.loads(resp.read().decode('utf-8'))
 
         base_resp = _post({
@@ -2633,7 +2813,12 @@ def main() -> int:
         timings["iac_head"] = time.perf_counter() - t0
 
         # ── Platform upload (IaC) ─────────────────────────────────────────────
-        _platform_url   = os.environ.get('ZAGWARE_PLATFORM_URL', '').rstrip('/')
+        # Validated, not just read: an http:// URL would put the bearer token
+        # on the wire in cleartext. A rejected URL returns "" so every
+        # `if _platform_url and _platform_token` guard below skips cleanly and
+        # the scan itself is unaffected. See SEC-05.
+        _platform_url   = _validate_platform_url(
+            os.environ.get('ZAGWARE_PLATFORM_URL', '').rstrip('/'))
         _platform_token = os.environ.get('ZAGWARE_PLATFORM_TOKEN', '')
         if _platform_url and _platform_token:
             t0 = time.perf_counter()

@@ -16,6 +16,11 @@
 #   ZAGWARE_FAIL_ON_NEW     "true" to fail the job when new findings exist
 #   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW | INFO | TRACE (default: all)
 #   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
+#   ZAGWARE_SECRETS_ENABLED "false" to disable betterleaks secrets scanning
+#   ZAGWARE_SECRETS_FAIL_ON_PUBLIC
+#                           DEFAULT "true" -- on a PUBLIC repository a new secret
+#                           exits 1 and blocks the merge even with
+#                           ZAGWARE_FAIL_ON_NEW unset. Set "false" to opt out.
 #
 # Artifacts: ten files saved to zagware-scan-results/ and kept for 30 days --
 # see README's "Scan artifacts" section for the full list (iac-*.json,

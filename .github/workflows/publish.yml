@@ -149,6 +149,61 @@ jobs:
           echo "✓ Dockerfile's pinned BETTERLEAKS_CHECKSUM matches the signed manifest"
           rm betterleaks_checksums.txt betterleaks_checksums.txt.sigstore.json
 
+      # KICS query rules are fetched by commit SHA in the Dockerfile. That is
+      # genuine content-addressing -- immune to tag rewrites and force pushes
+      # -- but it says nothing about *which* KICS release those Rego policies
+      # belong to, and the pin was only ever checked by hand, once. This
+      # re-establishes that link on every build: the pinned commit must still
+      # be the object refs/tags/v${KICS_VERSION} resolves to in Checkmarx/kics.
+      # Upstream release commits are bot-authored and unsigned, so this is a
+      # provenance check, not signature verification -- do not describe it as
+      # one. See SUP-15.
+      - name: Verify pinned KICS rules commit matches the KICS release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$KICS_RULES_COMMIT" ] || [ -z "$KICS_VERSION" ]; then
+            echo "::error::KICS_RULES_COMMIT / KICS_VERSION were not exported from the Dockerfile ARGs -- the rules pin cannot be verified. See SUP-15."
+            exit 1
+          fi
+
+          REF_JSON=$(curl -sS --fail \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/Checkmarx/kics/git/ref/tags/v${KICS_VERSION}") || REF_JSON=""
+
+          if [ -z "$REF_JSON" ]; then
+            echo "::error::Could not resolve refs/tags/v${KICS_VERSION} in Checkmarx/kics -- failing closed rather than building against an unverified rules pin. See SUP-15."
+            exit 1
+          fi
+
+          REF_TYPE=$(printf '%s' "$REF_JSON" | jq -r '.object.type // ""')
+          REF_SHA=$(printf '%s' "$REF_JSON" | jq -r '.object.sha // ""')
+
+          # An annotated tag points at a tag object, not the commit -- deref it.
+          if [ "$REF_TYPE" = "tag" ]; then
+            REF_SHA=$(curl -sS --fail \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/Checkmarx/kics/git/tags/${REF_SHA}" \
+              | jq -r '.object.sha // ""') || REF_SHA=""
+          fi
+
+          if [ -z "$REF_SHA" ]; then
+            echo "::error::Could not read the commit SHA behind Checkmarx/kics tag v${KICS_VERSION}. See SUP-15."
+            exit 1
+          fi
+
+          if [ "$REF_SHA" != "$KICS_RULES_COMMIT" ]; then
+            echo "::error::Dockerfile KICS_RULES_COMMIT ($KICS_RULES_COMMIT) is NOT the commit Checkmarx/kics v${KICS_VERSION} points to ($REF_SHA). Either the rules pin and the pinned KICS binary version disagree, or the upstream tag moved. See SUP-15."
+            exit 1
+          fi
+
+          echo "✓ KICS_RULES_COMMIT ${KICS_RULES_COMMIT} is the commit behind Checkmarx/kics v${KICS_VERSION}"
+          echo "  (commit pin + release-tag provenance only -- upstream release commits are unsigned, so this is not signature verification)"
+
       # ── Build ─────────────────────────────────────────────────────────────────
 
       # sbom: true and provenance: true require the docker-container buildx driver
@@ -182,9 +237,21 @@ jobs:
               echo "::error::Invalid tag '$INPUT_TAG' -- must be 'latest' or a plain X.Y.Z version. See SUP-19."
               exit 1
             fi
-            echo "value=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+            # Heredoc delimiter form, not `value=...`: even though the
+            # allowlist above already makes a newline impossible, the
+            # single-line form is what turned a bad input into injected
+            # step outputs in the first place. See SUP-19.
+            {
+              echo "value<<ZAGWARE_TAG_EOF"
+              echo "${INPUT_TAG}"
+              echo "ZAGWARE_TAG_EOF"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            {
+              echo "value<<ZAGWARE_TAG_EOF"
+              echo "${GITHUB_REF_NAME#v}"
+              echo "ZAGWARE_TAG_EOF"
+            } >> "$GITHUB_OUTPUT"
           fi
 
       - name: Docker metadata

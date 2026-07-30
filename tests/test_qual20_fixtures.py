@@ -174,7 +174,7 @@ class TestSuppressionReasonRoundTrip:
     def test_plain_reason_round_trips(self, tmp_path, monkeypatch):
         repo = tmp_path / "repo"
         repo.mkdir()
-        monkeypatch.setattr(scanner, "_git", lambda args, cwd=None: None)
+        monkeypatch.setattr(scanner, "_git", lambda args, cwd=None, env=None: None)
 
         scanner.apply_suppression_commands(
             str(repo), "https://example.invalid/repo.git", "feature",
@@ -190,7 +190,7 @@ class TestSuppressionReasonRoundTrip:
         mangled with a dangling backslash or a silently dropped character."""
         repo = tmp_path / "repo"
         repo.mkdir()
-        monkeypatch.setattr(scanner, "_git", lambda args, cwd=None: None)
+        monkeypatch.setattr(scanner, "_git", lambda args, cwd=None, env=None: None)
 
         reason = r'reviewer said "fine, ship it" — see C:\configs\policy.yaml'
         scanner.apply_suppression_commands(
@@ -203,7 +203,7 @@ class TestSuppressionReasonRoundTrip:
     def test_reason_that_is_only_backslashes_round_trips(self, tmp_path, monkeypatch):
         repo = tmp_path / "repo"
         repo.mkdir()
-        monkeypatch.setattr(scanner, "_git", lambda args, cwd=None: None)
+        monkeypatch.setattr(scanner, "_git", lambda args, cwd=None, env=None: None)
 
         reason = "\\\\server\\share\\path"
         scanner.apply_suppression_commands(
@@ -220,7 +220,7 @@ class TestSuppressionReasonRoundTrip:
 
         repo = tmp_path / "repo"
         repo.mkdir()
-        monkeypatch.setattr(scanner, "_git", lambda args, cwd=None: None)
+        monkeypatch.setattr(scanner, "_git", lambda args, cwd=None, env=None: None)
 
         reason = r'a "quoted" reason with a \backslash and \\double\\ backslashes'
         scanner.apply_suppression_commands(

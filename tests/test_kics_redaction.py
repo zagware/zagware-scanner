@@ -130,12 +130,13 @@ class TestRenderCommentRedactsBothColumns:
 
 class TestUploadToPlatformRedactsBeforeSending:
     """SEC-03 end-to-end: the exact payload sent to the platform must never
-    contain the raw actual_value KICS extracted. upload_to_platform() has its
-    own inline urllib.request.urlopen() call (it doesn't go through the
-    shared _http() helper — same as upload_sca_to_platform/
-    upload_secrets_to_platform, an existing pattern this test respects rather
-    than papers over), so it's patched directly here rather than via
-    fake_http (which only intercepts scanner._http)."""
+    contain the raw actual_value KICS extracted.
+
+    upload_to_platform() does not go through the shared _http() helper (same
+    as upload_sca_to_platform/upload_secrets_to_platform, an existing pattern
+    this test respects rather than papers over). Since SEC-05 it routes
+    through scanner._urlopen — the single chokepoint that blocks cross-host
+    redirects and enforces a timeout — so that is what is patched here."""
 
     def test_redacted_kics_results_reach_the_http_payload_untouched(self, monkeypatch):
         sent_bodies: list[bytes] = []
@@ -152,7 +153,7 @@ class TestUploadToPlatformRedactsBeforeSending:
             sent_bodies.append(req.data)
             return _FakeResponse()
 
-        monkeypatch.setattr(scanner.urllib.request, "urlopen", _fake_urlopen)
+        monkeypatch.setattr(scanner, "_urlopen", _fake_urlopen)
 
         raw = {
             "queries": [{
@@ -189,7 +190,7 @@ class TestUploadToPlatformRedactsBeforeSending:
             def read(self):
                 return b'{"scan_id": "test-scan-id"}'
 
-        monkeypatch.setattr(scanner.urllib.request, "urlopen",
+        monkeypatch.setattr(scanner, "_urlopen",
                              lambda req, timeout=30: (sent_bodies.append(req.data), _FakeResponse())[1])
 
         raw = {

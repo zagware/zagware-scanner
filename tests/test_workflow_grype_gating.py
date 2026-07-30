@@ -216,6 +216,7 @@ class TestPublishYmlSelfScanStep:
 
 PREDICATE_EXPR_MAP = {
     "steps.latest.outputs.digest": TEST_DIGEST,
+    "steps.latest.outputs.previous_stable_digest": "sha256:" + "cd" * 32,
     "steps.latest.outputs.age_days": "17",
     "steps.scan.outputs.high_count": "0",
     "github.server_url": "https://github.com",

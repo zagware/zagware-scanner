@@ -6,6 +6,10 @@
 #   BITBUCKET_API_TOKEN   Atlassian API token with Bitbucket repo + PR read/write scopes
 #                         Create at: https://id.atlassian.com/manage-profile/security/api-tokens
 #   ATLASSIAN_EMAIL       Your Atlassian account email
+#   BITBUCKET_GIT_USER    Optional -- git username paired with BITBUCKET_API_TOKEN
+#                         when cloning. Defaults to <workspace>-admin, a workspace
+#                         convention rather than a guarantee. Set it if the clone
+#                         fails with a git authentication error.
 #   ZAGWARE_PLATFORM_URL  https://app.zagware.io    (optional — omit for standalone)
 #   ZAGWARE_PLATFORM_TOKEN  API token (optional)
 #
@@ -14,6 +18,11 @@
 #   ZAGWARE_FAIL_ON_NEW     "true" to fail on any new finding
 #   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW | INFO | TRACE (default: all)
 #   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
+#   ZAGWARE_SECRETS_ENABLED "false" to disable betterleaks secrets scanning
+#   ZAGWARE_SECRETS_FAIL_ON_PUBLIC
+#                           DEFAULT "true" -- on a PUBLIC repository a new secret
+#                           exits 1 and blocks the merge even with
+#                           ZAGWARE_FAIL_ON_NEW unset. Set "false" to opt out.
 #
 # Artifacts: ten files saved to zagware-scan-results/ and kept for 30 days --
 # see README's "Scan artifacts" section for the full list (iac-*.json,

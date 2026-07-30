@@ -67,30 +67,60 @@ jobs:
 
           echo "digest=$LATEST_DIGEST" >> "$GITHUB_OUTPUT"
 
-          # Get the creation date of the :latest tag from GHCR via GitHub API
-          TAG_DATE=$(curl -s \
+          # Age must be measured against the digest we just resolved from the
+          # registry -- NOT against whichever version the API happens to report
+          # as tagged :latest. The 14-day cooling period is the load-bearing
+          # guarantee of the whole rollout design; measuring it against a
+          # different image silently voids it. See SUP-18.
+          VERSIONS_JSON=$(curl -sS --fail \
             -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/orgs/zagware/packages/container/zagware-scanner/versions?per_page=100" \
-            | jq -r --arg digest "${LATEST_DIGEST#sha256:}" \
-              '.[] | select(.metadata.container.tags | index("latest")) | .created_at')
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/orgs/zagware/packages/container/zagware-scanner/versions?per_page=100") || VERSIONS_JSON=""
 
-          if [ -z "$TAG_DATE" ]; then
-            echo "Could not determine :latest creation date — skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          if [ -z "$VERSIONS_JSON" ] || ! printf '%s' "$VERSIONS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            echo "::error::Could not list container versions from the GitHub API -- the 14-day cooling period for ${LATEST_DIGEST} cannot be verified, so promotion fails closed rather than guessing an age. See SUP-18."
+            exit 1
           fi
 
-          TAG_TS=$(date -d "$TAG_DATE" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%SZ" "$TAG_DATE" +%s)
-          NOW_TS=$(date +%s)
+          TAG_DATES=$(printf '%s' "$VERSIONS_JSON" \
+            | jq -r --arg digest "${LATEST_DIGEST#sha256:}" \
+              '.[] | select(.name == "sha256:" + $digest) | .created_at')
+          MATCH_COUNT=$(printf '%s\n' "$TAG_DATES" | grep -c '[^[:space:]]' || true)
+
+          if [ "$MATCH_COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly one GHCR version with digest ${LATEST_DIGEST}, found ${MATCH_COUNT}. Zero means the registry and the packages API disagree (or the version is beyond the first 100 results); more than one means the creation date is ambiguous. Either way the cooling period cannot be measured, so promotion fails closed. See SUP-18."
+            exit 1
+          fi
+
+          TAG_DATE="$TAG_DATES"
+
+          # GNU date only -- these workflows only ever run on ubuntu-latest, and
+          # the old BSD `date -jf` fallback could never have fired there.
+          TAG_TS=$(date -u -d "$TAG_DATE" +%s) || TAG_TS=""
+          if [ -z "$TAG_TS" ]; then
+            echo "::error::Could not parse the creation date '${TAG_DATE}' reported for ${LATEST_DIGEST} -- failing closed. See SUP-18."
+            exit 1
+          fi
+
+          NOW_TS=$(date -u +%s)
           AGE_DAYS=$(( (NOW_TS - TAG_TS) / 86400 ))
 
           echo "Latest digest: $LATEST_DIGEST"
           echo "Latest tag age: ${AGE_DAYS} days"
 
-          # Check if :stable already points to this digest
+          # Read the digest :stable currently points at. This is both the
+          # "already promoted?" check and the only record of the digest this
+          # run is about to overwrite -- without it a maintainer has to
+          # reconstruct the previous :stable from GHCR version history by hand
+          # under incident pressure. Recorded (not acted on) below: audit.yml
+          # alerts, rollback stays a deliberate manual decision. See SUP-17.
           STABLE_DIGEST=$(docker buildx imagetools inspect \
             ghcr.io/zagware/zagware-scanner:stable \
             --format '{{.Manifest.Digest}}' 2>/dev/null || echo "")
+
+          echo "previous_stable_digest=$STABLE_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Current :stable digest (will be replaced): ${STABLE_DIGEST:-<none>}"
 
           if [ "$STABLE_DIGEST" = "$LATEST_DIGEST" ]; then
             echo ":stable already points to this digest — nothing to promote"
@@ -208,14 +238,20 @@ jobs:
       - name: Build promotion predicate
         if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'
         run: |
+          # replacedDigest is the rollback record: audit.yml can only alert,
+          # and nothing else in the repo archives the digest :stable pointed at
+          # before this run overwrote it. Putting it in the signed promotion
+          # predicate means the value survives log retention. See SUP-17.
           jq -n \
             --arg digest "${{ steps.latest.outputs.digest }}" \
+            --arg replaced_digest "${{ steps.latest.outputs.previous_stable_digest }}" \
             --arg promoted_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg cooling_period_days "${{ steps.latest.outputs.age_days }}" \
             --arg high_critical_count "${{ steps.scan.outputs.high_count }}" \
             --arg workflow_run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             '{
               digest: $digest,
+              replacedDigest: (if $replaced_digest == "" then null else $replaced_digest end),
               promotedAt: $promoted_at,
               promotedTags: ["stable", "secure"],
               sourceTag: "latest",
@@ -238,11 +274,30 @@ jobs:
 
       - name: Promotion summary
         if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'
+        env:
+          PREVIOUS_STABLE_DIGEST: ${{ steps.latest.outputs.previous_stable_digest }}
         run: |
           echo "## Promoted to :stable and :secure" >> $GITHUB_STEP_SUMMARY
           echo "**Digest:** \`${{ steps.latest.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Cooling period:** ${{ steps.latest.outputs.age_days }} days" >> $GITHUB_STEP_SUMMARY
           echo "**CVE scan:** Clean (0 HIGH/CRITICAL)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          # Rollback record. audit.yml alerts but cannot re-tag, and nothing
+          # else archives the digest :stable pointed at before this run. See
+          # SUP-17. Rollback stays a deliberate manual action.
+          if [ -n "$PREVIOUS_STABLE_DIGEST" ]; then
+            echo "**Previous :stable digest (replaced by this run):** \`${PREVIOUS_STABLE_DIGEST}\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "To roll back manually:" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "docker buildx imagetools create --tag ghcr.io/zagware/zagware-scanner:stable \\" >> $GITHUB_STEP_SUMMARY
+            echo "  ghcr.io/zagware/zagware-scanner@${PREVIOUS_STABLE_DIGEST}" >> $GITHUB_STEP_SUMMARY
+            echo "docker buildx imagetools create --tag ghcr.io/zagware/zagware-scanner:secure \\" >> $GITHUB_STEP_SUMMARY
+            echo "  ghcr.io/zagware/zagware-scanner@${PREVIOUS_STABLE_DIGEST}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Previous :stable digest:** none — this is the first promotion, so there is nothing to roll back to." >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
           echo "cosign verify ghcr.io/zagware/zagware-scanner:stable \\" >> $GITHUB_STEP_SUMMARY

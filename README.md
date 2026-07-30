@@ -1,7 +1,7 @@
 # Zagware Scanner
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/Docker-ghcr.io%2Fzagware%2Fzagware--scanner-2496ED?logo=docker&logoColor=white)](https://github.com/zagware/zagware-scanner/pkgs/container/zagware-scanner)
+[![Docker](https://img.shields.io/badge/Docker-ghcr.io%2Fzagware%2Fzagware--scanner-2496ED?logo=docker&logoColor=white)](https://github.com/orgs/zagware/packages/container/package/zagware-scanner)
 [![Platforms](https://img.shields.io/badge/CI-GitHub%20%7C%20GitLab%20%7C%20Bitbucket%20%7C%20Azure%20DevOps-555)](https://github.com/zagware/zagware-scanner)
 
 **Catch security issues before they reach your main branch.**
@@ -18,6 +18,30 @@ Three scan engines, one container:
 | **[Syft](https://github.com/anchore/syft)** (Anchore, Apache 2.0) | Package manifests and lockfiles — generates the SBOM Grype scans | Software Bill of Materials (SPDX) |
 | **[Grype](https://github.com/anchore/grype)** (Anchore, Apache 2.0) | Package manifests and lockfiles (npm, pip, Go, Maven, Gem…) | CVEs, GHSA advisories — with CVSS, EPSS, and KEV catalog status |
 | **[betterleaks](https://github.com/betterleaks/betterleaks)** (betterleaks, MIT) | Filesystem contents (working-tree state) | Leaked credentials — API keys, tokens, private keys, and other secret patterns |
+
+---
+
+**Contents**
+
+- [How it works](#how-it-works)
+- [Image tags and release channels](#image-tags-and-release-channels)
+- [Quick start](#quick-start)
+- [PR comment](#pr-comment)
+- [Supported IaC formats](#supported-iac-formats-kics)
+- [Supported dependency ecosystems](#supported-dependency-ecosystems-syft--grype)
+- [Secrets detection](#secrets-detection-betterleaks)
+- [Configuration](#configuration)
+- [Scan artifacts](#scan-artifacts)
+- [How findings are fingerprinted](#how-findings-are-fingerprinted)
+- [Pinning to a specific version](#pinning-to-a-specific-version)
+- [Supply chain security](#supply-chain-security)
+- [Self-hosting](#self-hosting)
+- [Frequently asked questions](#frequently-asked-questions)
+- [Suppressions](#suppressions)
+- [Severity filtering](#severity-filtering)
+- [Telemetry](#telemetry)
+- [Contributing](#contributing)
+- [License](#license)
 
 ---
 
@@ -38,7 +62,7 @@ historical tracking, trend charts, and suppression management.
 
 | Tag | Description |
 |---|---|
-| `:<version>` (e.g. `:2.2.0`) | Immutable per release. Pin by digest for the strongest guarantee. |
+| `:<version>` | Immutable per release. Pick a tag from the [releases](https://github.com/zagware/zagware-scanner/releases) page. Pin by digest for the strongest guarantee. |
 | `:latest` | Newest release. Moves on every tag push. **Not** security-vetted. |
 | `:stable` | Promoted from `:latest` after a 14-day cooling period, a clean CVE scan, and a signature-verify check. **Not yet published** — no release has completed a full promotion cycle at time of writing. |
 | `:secure` | Identical digest to `:stable`, once `:stable` exists. |
@@ -134,6 +158,12 @@ jobs:
 `ZAGWARE_PLATFORM_URL` and `ZAGWARE_PLATFORM_TOKEN` are optional; omit them to run the scanner
 standalone (PR comment only, no platform upload).
 
+> **A new secret fails the job by default on public repositories.**
+> `ZAGWARE_SECRETS_FAIL_ON_PUBLIC` defaults to `true`, so on a public repo the scanner exits 1 —
+> blocking the merge — the first time a PR introduces a new secret, even with `ZAGWARE_FAIL_ON_NEW`
+> left at its `false` default. Set `ZAGWARE_SECRETS_FAIL_ON_PUBLIC: "false"` to opt out, or
+> `ZAGWARE_SECRETS_ENABLED: "false"` to turn secrets scanning off entirely.
+
 The `issue_comment` trigger and `contents: write` permission are required for the
 [interactive suppression](#suppressions) feature (`/zagware suppress <id> <reason>` PR comments).
 If you don't need that, you can omit them and keep just the `pull_request` trigger with
@@ -162,8 +192,18 @@ shape, different edges:
 | Cross-org / cross-group source | No — source workflow must be in the same org | No — policy CI file must be in the same group hierarchy |
 
 ```bash
-# One-time: define a custom property and create the org-level ruleset
-curl -fsSL https://raw.githubusercontent.com/zagware/security-workflows/main/rulesets/setup-org-level.sh | bash -s <your-org>
+# One-time: define a custom property and create the org-level ruleset.
+# The helper script lives in the separate zagware/security-workflows repository.
+# Download it at a pinned commit, read it, then run it -- never pipe a mutable
+# branch ref straight into a shell. Resolve the current commit SHA with:
+#   gh api repos/zagware/security-workflows/commits/main --jq .sha
+curl -fsSLO https://raw.githubusercontent.com/zagware/security-workflows/<commit-sha>/rulesets/setup-org-level.sh
+
+# Review it before running: it PATCHes your organization's custom-property
+# schema and POSTs an organization ruleset using your gh credentials.
+less setup-org-level.sh
+
+bash setup-org-level.sh <your-org>
 
 # Opt a repo in (or out) without touching the ruleset itself
 gh api orgs/<org>/properties/values -X PATCH \
@@ -171,6 +211,19 @@ gh api orgs/<org>/properties/values -X PATCH \
   -f 'properties[][property_name]=zagware-scan-scope' \
   -f 'properties[][value]=enabled'
 ```
+
+> **The setup script is not part of this repository.** It is maintained in
+> [`zagware/security-workflows`](https://github.com/zagware/security-workflows) and is therefore
+> outside this project's release, signing, and checksum guarantees. That is precisely why the
+> snippet above pins a commit SHA and reads the script before executing it, rather than piping
+> `main` into `bash`.
+>
+> **Known defect, verified 2026-07-30 at commit `d4189ff`:** the script sets
+> `SRC_REPO="zagware-security-workflows"`, but the repository is named `security-workflows`. Its
+> step 2 (`gh api repos/<org>/<SRC_REPO>`) consequently 404s *after* step 1 has already defined the
+> `zagware-scan-scope` property, leaving a stray property with no ruleset. Set `SRC_REPO` to your
+> own org's source-workflow repository while reviewing the script. The fix belongs in
+> `zagware/security-workflows`, not in this repo.
 
 See [`zagware/security-workflows`](https://github.com/zagware/security-workflows) for the reference
 source workflow, ready-to-fire ruleset JSON, and setup script — verified live end-to-end against a
@@ -251,6 +304,10 @@ file (1).
 
 Required repository variables: `BITBUCKET_API_TOKEN` (Atlassian API token with Bitbucket read/write
 scopes) and `ATLASSIAN_EMAIL`.
+
+Optional: `BITBUCKET_GIT_USER` — the git username paired with your Atlassian API token in the clone
+URL. It defaults to `<workspace>-admin`, which is a workspace convention rather than a guarantee.
+Set it explicitly if the very first clone fails with a git authentication error.
 
 ```yaml
 pipelines:
@@ -403,7 +460,7 @@ If the PR is clean: **✅ No new security findings introduced by this PR.**
 
 ---
 
-## Supported IaC formats ([KICS](https://kics.io))
+## Supported IaC formats ([KICS][])
 
 | Platform | File types |
 |---|---|
@@ -424,7 +481,7 @@ KICS auto-detects file types — no configuration needed.
 
 ---
 
-## Supported dependency ecosystems ([Syft](https://github.com/anchore/syft) + [Grype](https://github.com/anchore/grype))
+## Supported dependency ecosystems ([Syft][] + [Grype][])
 
 | Ecosystem | Detected via |
 |---|---|
@@ -436,9 +493,14 @@ KICS auto-detects file types — no configuration needed.
 | Rust | `Cargo.lock` |
 | PHP | `composer.lock` |
 | .NET | `packages.lock.json` |
-| OS packages | Alpine (`apk`), Debian/Ubuntu (`dpkg`), RHEL/CentOS (`rpm`) in Dockerfiles |
 
 SCA scanning is enabled by default when manifest files are detected. Set `ZAGWARE_SCA_ENABLED=false` to disable it.
+
+> **OS packages inside container images are not scanned.** Syft runs in filesystem (`dir:`) mode
+> against the repository working tree, so it catalogues manifests and lockfiles committed to the
+> repo. It does not build or pull the images your Dockerfiles reference, and a source checkout has
+> no installed `apk`/`dpkg`/`rpm` database to catalogue. Scan built images separately — for example
+> `grype <image>` in your image-build pipeline.
 
 ---
 
@@ -476,7 +538,7 @@ it is never silently misread as the opposite of what you intended.
 | `ZAGWARE_PLATFORM_URL` | — | Base URL of the Zagware platform, e.g. `https://app.zagware.io`. No trailing slash. Required for dashboard upload. |
 | `ZAGWARE_PLATFORM_TOKEN` | — | API token (`gtp_…`) from **Settings → API Tokens**. Required for dashboard upload. |
 | `ZAGWARE_MIN_SEVERITY` | all | Minimum severity to report: `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` `TRACE`. Findings below this level are excluded from both scan and PR comment. |
-| `ZAGWARE_FAIL_ON_NEW` | `false` | Exit 1 when new findings are found at or above `ZAGWARE_MIN_SEVERITY`. Blocks the merge when set to `true`. |
+| `ZAGWARE_FAIL_ON_NEW` | `false` | Exit 1 when the PR introduces new findings, blocking the merge. Counts IaC, SCA **and Secrets** findings in one total: IaC/SCA findings count only at or above `ZAGWARE_MIN_SEVERITY`, while new secrets always count — betterleaks has no severity, so `ZAGWARE_MIN_SEVERITY` never filters them. |
 | `ZAGWARE_EXCLUDE_PATHS` | `.git` | Comma-separated paths or globs to exclude from IaC scanning. |
 | `ZAGWARE_SCA_ENABLED` | `true` | Set `false` to skip Grype dependency scanning entirely. |
 | `ZAGWARE_SECRETS_ENABLED` | `true` | Set `false` to skip betterleaks secrets scanning entirely. |
@@ -487,16 +549,23 @@ it is never silently misread as the opposite of what you intended.
 | `ZAGWARE_TELEMETRY` | _(on)_ | Set `off` to disable anonymous usage telemetry. See [Telemetry](#telemetry). |
 | `ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME` | `false` | Set `true` to send your org/repo name in clear instead of a one-way hash. |
 
-### Platform inputs (GitHub Actions only)
+### Platform inputs
 
-Ignored, and unnecessary to set, on GitLab CI, Bitbucket Pipelines, and Azure DevOps — those
-three resolve base/head refs and the PR number from their own native CI variables instead.
+**GitHub Actions.** The three variables below are GitHub-only — ignored, and unnecessary to set, on
+GitLab CI, Bitbucket Pipelines, and Azure DevOps, which resolve base/head refs and the PR number
+from their own native CI variables instead.
 
 | Variable | Required? | Description |
 |---|---|---|
 | `PR_NUMBER` | **Required** | The pull request number, e.g. `${{ github.event.pull_request.number \|\| github.event.issue.number }}`. Missing this raises an uncaught error before the scan can post a comment. |
 | `ZAGWARE_BASE_REF` | Only for `issue_comment`-triggered runs | Overrides `GITHUB_BASE_REF`. GitHub Actions reserves `GITHUB_*` names and silently ignores a workflow-declared override for them on `docker://` actions, so a `/zagware suppress` re-run (which is `issue_comment`-triggered, not `pull_request`-triggered) needs this to resolve the base branch. See [`examples/github-actions.yml`](examples/github-actions.yml) for how to compute it via the GitHub API. |
 | `ZAGWARE_HEAD_REF` | Only for `issue_comment`-triggered runs | Same reasoning as `ZAGWARE_BASE_REF`, overriding `GITHUB_HEAD_REF` (falls back to `GITHUB_SHA` otherwise). |
+
+**Bitbucket Pipelines.**
+
+| Variable | Required? | Description |
+|---|---|---|
+| `BITBUCKET_GIT_USER` | Optional | Git username paired with `BITBUCKET_API_TOKEN` in the clone URL. Defaults to `<workspace>-admin` — a workspace convention, not a guarantee. Set it if cloning fails with a git authentication error. |
 
 ### Debugging & advanced
 
@@ -559,14 +628,19 @@ Pin by tag for reproducibility. Pin by digest for the strongest guarantee:
 
 ```yaml
 # GitHub Actions — pin by version tag
-uses: docker://ghcr.io/zagware/zagware-scanner:2.0.5
+uses: docker://ghcr.io/zagware/zagware-scanner:<version>
 
 # GitLab CI / Bitbucket — pin by tag
-image: ghcr.io/zagware/zagware-scanner:2.0.5
+image: ghcr.io/zagware/zagware-scanner:<version>
 
 # Pin by digest (strongest — immune to tag mutation)
 uses: docker://ghcr.io/zagware/zagware-scanner@sha256:<digest>
 ```
+
+Replace `<version>` with a published release tag from the
+[releases](https://github.com/zagware/zagware-scanner/releases) page. The placeholder is
+deliberate — a hardcoded version number in this README goes stale on the next release, and a stale
+pin in a copy-paste example is worse than no example at all.
 
 Digests are in the [releases](https://github.com/zagware/zagware-scanner/releases) notes
 and in the build summary of each [publish workflow run](https://github.com/zagware/zagware-scanner/actions).
@@ -618,9 +692,11 @@ cosign verify ghcr.io/zagware/zagware-scanner:latest \
 gh attestation verify oci://ghcr.io/zagware/zagware-scanner:latest \
   --repo zagware/zagware-scanner
 
-# Inspect the SBOM (SPDX format)
-cosign download attestation ghcr.io/zagware/zagware-scanner:latest \
-  | jq -r '.payload' | base64 -d | jq .predicate.packages[].name
+# Inspect the SBOM (SPDX format). BuildKit attaches it as an OCI referrer
+# attestation inside the image index -- not as the cosign sha256-<digest>.att
+# sidecar tag -- so retrieve it with imagetools, not `cosign download attestation`.
+docker buildx imagetools inspect ghcr.io/zagware/zagware-scanner:latest \
+  --format '{{ json .SBOM.SPDX }}' | jq -r '.packages[].name'
 ```
 
 ---
@@ -675,9 +751,9 @@ are optional — omit them and the scanner works without any platform account.
 
 | Platform | What's needed |
 |---|---|
-| GitHub Actions | `permissions: pull-requests: write` (GITHUB_TOKEN is automatic) |
+| GitHub Actions | `permissions: pull-requests: write`; add `contents: write` and the `issue_comment: [created]` trigger for [`/zagware suppress`](#suppressions). `PR_NUMBER` must be passed to the step. `GITHUB_TOKEN` is automatic. |
 | GitLab CI | `GITLAB_TOKEN` with `api` scope |
-| Bitbucket | `BITBUCKET_API_TOKEN` (Atlassian API token) + `ATLASSIAN_EMAIL` |
+| Bitbucket | `BITBUCKET_API_TOKEN` (Atlassian API token) + `ATLASSIAN_EMAIL`; optionally `BITBUCKET_GIT_USER` (defaults to `<workspace>-admin`) if cloning fails to authenticate |
 | Azure DevOps | Build Service: Contribute to pull requests + OAuth token access |
 
 ---
@@ -791,8 +867,10 @@ env:
 any threshold — a CVE Grype couldn't classify is always shown, since hiding it could hide
 something critical.
 
-When `ZAGWARE_FAIL_ON_NEW=true`, the scanner exits 1 (breaking CI) if any **new** finding at or
-above the configured threshold is introduced by the PR. This applies to both IaC and SCA findings.
+When `ZAGWARE_FAIL_ON_NEW=true`, the scanner exits 1 (breaking CI) if the PR introduces any **new**
+finding. This applies to IaC, SCA **and Secrets** findings — all three share one new-findings total.
+IaC and SCA findings count only at or above the configured threshold; secrets are counted regardless
+of `ZAGWARE_MIN_SEVERITY`, since betterleaks findings have no severity to compare against.
 Existing findings on the base branch are ignored — only net-new findings gate the merge.
 
 Secrets findings are unaffected by `ZAGWARE_MIN_SEVERITY` (betterleaks has no severity taxonomy) —
@@ -826,16 +904,30 @@ credentials are ever sent.** Full transparency below — this is exactly what le
 ### What is never sent
 
 File contents · file paths · finding descriptions · CVE IDs · package names/versions ·
-branch names · commit SHAs · CI tokens/secrets · IP-based geolocation (`$ip: 0` is set explicitly
-to disable PostHog's IP capture).
+branch names · commit SHAs · CI tokens/secrets.
 
-### Identity: hashed by default
+IP-based geolocation is disabled by sending PostHog's documented
+`$geoip_disable: true` property, and no `$ip` value is sent. (Earlier releases sent `$ip: 0`,
+which does **not** work — PostHog's GeoIP plugin treats `0` as falsy, discards it, and falls back
+to the connecting IP. If you ran a version before this fix, assume the runner's public IP was
+captured and geolocated.)
 
-`repo_id`/`org_id` are a one-way SHA-256 hash of your platform + repo/org name — stable across
-runs (so PostHog can group "same repo scanned N times") but **not reversible** to your actual
-repo/org name by Zagware or anyone with PostHog access. If you're comfortable with Zagware seeing
-the plaintext name (e.g. for support purposes, or if you already share it via the platform
-integration), set `ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME=true`.
+### Identity: pseudonymous by default
+
+`repo_id`/`org_id` are an unsalted SHA-256 hash of your platform + repo/org name, stable across
+runs so PostHog can group "same repo scanned N times".
+
+> **This is a pseudonym, not anonymity.** The input space (`owner/repo` strings) is small, public
+> and fully enumerable, so for a **public** repository anyone holding the hash — including
+> Zagware — can recover the original name from a precomputed table. It reduces casual exposure;
+> it does not prevent identification. Salting per-install would break the cross-run grouping the
+> field exists for, and a CI container has nowhere durable to keep a salt, so we describe the
+> property accurately instead of overclaiming it.
+
+If that is not acceptable for your repo, set `ZAGWARE_TELEMETRY: "off"` — nothing is sent at all.
+If you're comfortable with Zagware seeing the plaintext name (e.g. for support purposes, or if
+you already share it via the platform integration), set
+`ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME=true`.
 
 ### Disabling
 
@@ -868,3 +960,12 @@ the Docker image (KICS, Syft, Grype, betterleaks, and the Debian base image) are
 own vendors, licenses, and pinned versions in [NOTICE](NOTICE).
 
 Copyright 2026 Zagware Ltd.
+
+<!-- Collapsed reference links, used in the two headings above. An inline
+     link written directly inside a heading corrupts its anchor slug for
+     every tool that does not strip link markup; the collapsed `[Name][]`
+     form renders identically and keeps `#supported-iac-formats-kics` and
+     `#supported-dependency-ecosystems-syft--grype` resolvable. -->
+[KICS]: https://kics.io
+[Syft]: https://github.com/anchore/syft
+[Grype]: https://github.com/anchore/grype

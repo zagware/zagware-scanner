@@ -142,7 +142,7 @@ class TestApplySuppressionCommandsRefusesSymlinkWrite:
         repo = _make_repo(tmp_path)
 
         calls = []
-        monkeypatch.setattr(scanner, "_git", lambda args, cwd=None: calls.append(args))
+        monkeypatch.setattr(scanner, "_git", lambda args, cwd=None, env=None: calls.append(args))
 
         pushed = scanner.apply_suppression_commands(
             str(repo), "https://example.invalid/repo.git", "feature-branch",
@@ -155,19 +155,12 @@ class TestApplySuppressionCommandsRefusesSymlinkWrite:
         assert any(a[:1] == ["push"] for a in calls)
 
 
-class TestBlameSuppressionsFileRefusesSymlink:
-    def test_short_circuits_before_ever_invoking_git(self, tmp_path, monkeypatch):
-        repo = _make_repo(tmp_path)
-        (repo / ".zagware").mkdir()
-        os.symlink(tmp_path / "nonexistent-target", repo / ".zagware" / "suppressions.yaml")
-
-        def _must_not_be_called(*a, **k):
-            pytest.fail("_blame_suppressions_file must not shell out to git for a symlinked file")
-
-        monkeypatch.setattr(scanner.subprocess, "run", _must_not_be_called)
-
-        assert scanner._blame_suppressions_file(str(repo)) == {}
-
-    def test_returns_empty_when_file_does_not_exist(self, tmp_path):
-        repo = _make_repo(tmp_path)
-        assert scanner._blame_suppressions_file(str(repo)) == {}
+# NOTE: TestBlameSuppressionsFileRefusesSymlink was removed alongside
+# _blame_suppressions_file() itself. SEC-10 deleted that git-blame attribution
+# fallback outright rather than relabelling it: the scanner clones with
+# --depth=1, so blame attributes every line to the single checked-out commit
+# and credited whoever pushed last for suppressions added long before. Its
+# symlink guard is therefore moot -- there is no longer any code path that
+# shells out to `git blame` against the scanned worktree. The read/write
+# symlink guards above still cover every remaining path that touches
+# .zagware/suppressions.yaml.

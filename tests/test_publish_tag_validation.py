@@ -61,6 +61,24 @@ def _run_set_image_tag(input_tag: str, event_name: str, tmp_path: Path) -> subpr
     return proc
 
 
+def _output_value(gh_output: str) -> str:
+    """Read the `value` step output back out of a $GITHUB_OUTPUT file written
+    in the heredoc delimiter form GitHub documents for untrusted values -- the
+    form SUP-19 requires instead of a single `value=...` line. Returns "" when
+    nothing was written."""
+    lines = gh_output.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("value<<"):
+            delim = line.split("<<", 1)[1]
+            body = []
+            for rest in lines[i + 1:]:
+                if rest == delim:
+                    return "\n".join(body)
+                body.append(rest)
+            raise AssertionError(f"unterminated heredoc in GITHUB_OUTPUT:\n{gh_output}")
+    return ""
+
+
 class TestRejectsReservedTags:
     @pytest.mark.parametrize("reserved", ["stable", "secure"])
     def test_dispatch_onto_stable_or_secure_is_rejected(self, reserved, tmp_path):
@@ -74,7 +92,7 @@ class TestRejectsReservedTags:
         tag push must be completely unaffected."""
         proc = _run_set_image_tag("", "push", tmp_path)
         assert proc.returncode == 0, proc.stderr
-        assert "value=2.9.0" in proc.gh_output
+        assert _output_value(proc.gh_output) == "2.9.0"
 
 
 class TestRejectsMalformedInput:
@@ -97,7 +115,7 @@ class TestAcceptsValidInput:
     def test_valid_dispatch_input_is_accepted(self, good_input, tmp_path):
         proc = _run_set_image_tag(good_input, "workflow_dispatch", tmp_path)
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert f"value={good_input}" in proc.gh_output
+        assert _output_value(proc.gh_output) == good_input
 
 
 class TestLatestTagConditionalOnPushEvent:

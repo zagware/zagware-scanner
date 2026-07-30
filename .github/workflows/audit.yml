@@ -1,6 +1,11 @@
 # Weekly audit of the :stable image for newly-disclosed CVEs.
 # If new HIGH/CRITICAL vulnerabilities are found, opens a GitHub issue
-# to alert maintainers. Optionally rolls :stable back to the prior digest.
+# to alert maintainers. This workflow ALERTS ONLY -- it never re-tags
+# anything, and its permissions (issues: write, contents: read) are
+# deliberately insufficient to move a tag. Rolling :stable back is a
+# manual operation; promote.yml records the digest it replaced in its
+# step summary and promotion attestation so the prior digest is on
+# record when it is needed. See SUP-17.
 
 name: Audit Stable Image
 
