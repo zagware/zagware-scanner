@@ -39,7 +39,7 @@ import hashlib
 
 
 # ── Internal constants ─────────────────────────────────────────────────────────
-__version__ = "2.9.0"
+__version__ = "2.10.0"
 
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
@@ -61,8 +61,24 @@ _SEVERITY_EMOJI = {
 _SCA_ENABLED      = os.environ.get("ZAGWARE_SCA_ENABLED", "true").lower() != "false"
 _GRYPE_BIN        = os.environ.get("_ZAGWARE_GRYPE_BIN",  "/usr/bin/grype")
 _SYFT_BIN         = os.environ.get("_ZAGWARE_SYFT_BIN",   "/usr/bin/syft")
-_SCA_SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NEGLIGIBLE"]
-_SCA_SEVERITY_EMOJI = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "NEGLIGIBLE": "⚪"}
+_SCA_SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NEGLIGIBLE", "UNKNOWN"]
+_SCA_SEVERITY_EMOJI = {
+    "CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵",
+    "NEGLIGIBLE": "⚪", "UNKNOWN": "❓",
+}
+# Threshold rank map for ZAGWARE_MIN_SEVERITY against SCA findings — kept separate
+# from the display order above. _MIN_SEVERITY is validated at startup against the
+# 6-tier IaC _SEVERITY_ORDER (which has INFO/TRACE, absent from Grype's own severity
+# set), so this map covers all six IaC tiers, not just the five/six SCA display
+# buckets — see QUAL-03: INFO/TRACE previously fell through a rank.get(..., 0)
+# default and silently collapsed the threshold to CRITICAL-only. UNKNOWN (a real
+# Grype severity value Grype itself emits, not just our own missing-key default)
+# ranks below CRITICAL so it is NEVER excluded by any threshold — hiding a finding
+# Grype could not classify is worse than over-showing it. See QUAL-07.
+_SCA_MIN_RANK = {
+    "CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "TRACE": 4,
+    "UNKNOWN": -1,
+}
 _SCA_MANIFESTS = [
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
     "go.sum", "Cargo.lock",
@@ -588,11 +604,22 @@ class GitLab(Platform):
         mr  = os.environ["CI_MERGE_REQUEST_IID"]
         api = f"{self._server}/api/v4/projects/{self._project_id}/merge_requests/{mr}/notes"
 
-        notes = _http("GET", f"{api}?per_page=100", headers=self._headers())
-        assert isinstance(notes, list)
-        existing_id = next(
-            (n["id"] for n in notes if _COMMENT_MARKER in n.get("body", "")), None
-        )
+        # Paginate through existing notes to find ours — GitLab's /notes endpoint
+        # returns system notes (label changes, pushes, approvals) intermixed with
+        # user comments, newest-first, so an active MR can push the scanner's own
+        # note past a single 100-item page. See QUAL-12.
+        existing_id: int | None = None
+        page = 1
+        while not existing_id:
+            notes = _http("GET", f"{api}?per_page=100&page={page}", headers=self._headers())
+            assert isinstance(notes, list)
+            for n in notes:
+                if _COMMENT_MARKER in n.get("body", ""):
+                    existing_id = n["id"]
+                    break
+            if len(notes) < 100:
+                break
+            page += 1
 
         if existing_id:
             _http("PUT", f"{api}/{existing_id}", {"body": body}, self._headers())
@@ -700,14 +727,22 @@ class Bitbucket(Platform):
         api = (f"https://api.bitbucket.org/2.0/repositories"
                f"/{self._workspace}/{self._slug}/pullrequests/{pr}/comments")
 
-        data     = _http("GET", f"{api}?pagelen=100", headers=self._headers())
-        assert isinstance(data, dict)
-        existing = next(
-            (c["id"] for c in data.get("values", [])
-             if _BB_COMMENT_MARKER in c.get("content", {}).get("raw", "")
-             or "## Zagware IaC Scanner" in c.get("content", {}).get("raw", "")),
-            None,
-        )
+        # Follow the response envelope's "next" URL rather than assuming a
+        # single page — a PR with over 100 comments would otherwise never
+        # find the scanner's own comment and duplicate it on every push. See
+        # QUAL-12. The "## Zagware IaC Scanner" string fallback matcher this
+        # loop used to also check for was dead: no rendered comment has ever
+        # contained that heading text (see QUAL-05).
+        existing: int | None = None
+        url = f"{api}?pagelen=100"
+        while url and not existing:
+            data = _http("GET", url, headers=self._headers())
+            assert isinstance(data, dict)
+            for c in data.get("values", []):
+                if _BB_COMMENT_MARKER in c.get("content", {}).get("raw", ""):
+                    existing = c["id"]
+                    break
+            url = data.get("next") if not existing else None
         payload = {"content": {"raw": body}}
 
         if existing:
@@ -1118,12 +1153,14 @@ def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
                 if u and u not in urls:
                     urls.append(u)
             severity = (vuln.get("severity") or "UNKNOWN").upper()
-            # Apply ZAGWARE_MIN_SEVERITY to SCA findings (map NEGLIGIBLE→LOW for comparison)
+            # Apply ZAGWARE_MIN_SEVERITY to SCA findings (map NEGLIGIBLE→LOW for
+            # comparison), via the module-level _SCA_MIN_RANK — not a dict rebuilt
+            # from _SCA_SEVERITY_ORDER's position on every match. Startup validation
+            # guarantees _MIN_SEVERITY is one of the six IaC tiers, all present as
+            # _SCA_MIN_RANK keys, so the subscript below is safe. See QUAL-03/22.
             if _MIN_SEVERITY:
                 sca_sev = "LOW" if severity == "NEGLIGIBLE" else severity
-                sca_rank = {s: i for i, s in enumerate(_SCA_SEVERITY_ORDER)}
-                min_rank = sca_rank.get(_MIN_SEVERITY, 0)
-                if sca_rank.get(sca_sev, 99) > min_rank:
+                if _SCA_MIN_RANK.get(sca_sev, -1) > _SCA_MIN_RANK[_MIN_SEVERITY]:
                     continue  # below threshold — skip
             findings.append({
                 "vulnerability_id": vuln_id,
@@ -1132,8 +1169,15 @@ def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
                 "severity":         severity,
                 "cvss_score":       cvss,
                 "epss_score":       epss,
-                "kev_listed":       vuln.get("kev") is not None,
-                "risk_score":       vuln.get("riskScore"),
+                # Grype's real field names (verified against the bundled v0.112.0
+                # source, grype/presenter/models/vulnerability_metadata.go and
+                # vulnerability.go): KEV is "knownExploited" (a list, non-empty
+                # when listed), risk is "risk" (float64) on the outer Vulnerability
+                # struct, not nested under "vulnerability". "kev"/"riskScore" are
+                # not real Grype keys — reading them always returned
+                # None/False. See QUAL-06.
+                "kev_listed":       bool(vuln.get("knownExploited")),
+                "risk_score":       vuln.get("risk"),
                 "description":      vuln.get("description") or "",
                 "vuln_urls":        urls,
                 "fix_versions":     fix.get("versions") or [],
@@ -1598,6 +1642,7 @@ def _parse_suppressions_file(scan_dir: str) -> dict[str, dict]:
                 "reason":   current.get("reason", ""),
                 "added_by": current.get("suppressed_by"),
                 "added_at": current.get("suppressed_at"),
+                "expires":  current.get("expires"),
             }
 
     for line in text.splitlines():
@@ -1623,11 +1668,45 @@ def load_suppressions(scan_dir: str) -> set[str]:
     """Load suppression similarity IDs from .zagware/suppressions.yaml in the scanned repo.
 
     Returns a set of similarity_id strings to exclude from new-findings diff.
+
+    Suppressions carrying an `expires:` date (ISO, e.g. "2026-12-31") past
+    today are dropped here rather than returned as active — see QUAL-11: the
+    field was documented and parsed but never actually enforced, so a
+    suppression the user explicitly time-boxed lapsed silently, never. An
+    unparseable expires value is not silently swallowed either: it is logged
+    and the suppression stays active (the safer default — a malformed date
+    should not unexpectedly re-open a finding and fail an unrelated build)
+    until the entry is fixed.
     """
     records = _parse_suppressions_file(scan_dir)
-    if records:
-        log.info("Loaded %d suppression(s) from %s", len(records), _SUPPRESSIONS_PATH)
-    return set(records.keys())
+    if not records:
+        return set()
+
+    today = datetime.now(timezone.utc).date()
+    active: set[str] = set()
+    expired_count = 0
+    for sid, rec in records.items():
+        expires = rec.get("expires")
+        if expires:
+            try:
+                expiry_date = datetime.fromisoformat(expires).date()
+            except ValueError:
+                log.warning(
+                    "Suppression %s: unparseable expires date %r — expiry not "
+                    "enforced, suppression remains active until this is fixed",
+                    sid[:16], expires,
+                )
+            else:
+                if expiry_date < today:
+                    expired_count += 1
+                    log.info("Suppression %s expired on %s — no longer excluded from new findings",
+                             sid[:16], expires)
+                    continue
+        active.add(sid)
+
+    log.info("Loaded %d suppression(s) from %s (%d expired and dropped)",
+             len(active), _SUPPRESSIONS_PATH, expired_count)
+    return active
 
 
 def _blame_suppressions_file(pr_dir: str) -> dict[str, tuple[str, str]]:
@@ -1700,10 +1779,14 @@ def render_comment(
         s = q.get("severity", "UNKNOWN")
         sev_counts[s] = sev_counts.get(s, 0) + len(q["files"])
 
-    # On GitHub/GitLab the HTML comment is hidden; on Bitbucket it renders as text.
-    # For Bitbucket we omit it from the top and embed an invisible CommonMark link
-    # reference definition at the bottom instead.
-    marker_line = _COMMENT_MARKER if collapsible else ""
+    # On GitHub/GitLab/Azure the marker is a hidden HTML comment; on Bitbucket
+    # (which strips HTML comments) it is an invisible CommonMark link-reference
+    # definition instead. Both are emitted as the FIRST line here, not appended
+    # after everything else — appending let the truncation step below cut the
+    # marker off any comment over _MAX_COMMENT chars, so post_or_update_comment
+    # could never find its own comment on a large Bitbucket PR and duplicated it
+    # on every push. See QUAL-05.
+    marker_line = _COMMENT_MARKER if collapsible else _BB_COMMENT_MARKER
 
     L: list[str] = (
         ([marker_line, ""] if marker_line else []) + [
@@ -1729,8 +1812,9 @@ def render_comment(
         L.append("")
     else:
         summary = " &nbsp;·&nbsp; ".join(
-            f"{_SEVERITY_EMOJI[s]} **{sev_counts[s]}** {s}"
-            for s in _SEVERITY_ORDER if s in sev_counts
+            f"{_SEVERITY_EMOJI.get(s, '❓')} **{sev_counts[s]}** {s}"
+            for s in _SEVERITY_ORDER + sorted(k for k in sev_counts if k not in _SEVERITY_ORDER)
+            if s in sev_counts
         )
         L += [
             f"> ⚠️ **{total_new} new finding(s) introduced by this PR**",
@@ -1738,12 +1822,18 @@ def render_comment(
             "",
         ]
 
-        for sev in _SEVERITY_ORDER:
-            qs = [q for q in novel if q.get("severity") == sev]
+        # Widen past _SEVERITY_ORDER's six known tiers so a KICS severity outside
+        # them (custom ZAGWARE_QUERIES_PATH query, missing key, future KICS release)
+        # is still rendered instead of silently vanishing — see QUAL-14.
+        for sev in _SEVERITY_ORDER + sorted(k for k in sev_counts if k not in _SEVERITY_ORDER):
+            # .get("severity", "UNKNOWN") — same default used to build sev_counts
+            # above; a bare .get("severity") would compare None to "UNKNOWN" and
+            # never match, dropping any query with no severity key at all.
+            qs = [q for q in novel if q.get("severity", "UNKNOWN") == sev]
             if not qs:
                 continue
             count = sum(len(q["files"]) for q in qs)
-            emoji = _SEVERITY_EMOJI[sev]
+            emoji = _SEVERITY_EMOJI.get(sev, "❓")
 
             # Section header — collapsible on GitHub/GitLab, plain heading on Bitbucket
             if collapsible:
@@ -1808,13 +1898,16 @@ def render_sca_section(
     else:
         summary = " &nbsp;·&nbsp; ".join(
             f"{_SCA_SEVERITY_EMOJI.get(s, '❓')} **{len(by_sev[s])}** {s}"
-            for s in _SCA_SEVERITY_ORDER if s in by_sev
+            for s in _SCA_SEVERITY_ORDER + sorted(k for k in by_sev if k not in _SCA_SEVERITY_ORDER)
+            if s in by_sev
         )
         L += [
             f"> ⚠️ **{len(novel_sca)} new vulnerability(ies) introduced by this PR**",
             f"> {summary}", "",
         ]
-        for sev in _SCA_SEVERITY_ORDER:
+        # Widen past the known buckets so a future/unrecognised Grype severity
+        # string is counted-and-rendered together, never counted-but-invisible.
+        for sev in _SCA_SEVERITY_ORDER + sorted(k for k in by_sev if k not in _SCA_SEVERITY_ORDER):
             findings = by_sev.get(sev, [])
             if not findings:
                 continue
@@ -2608,9 +2701,9 @@ def main() -> int:
             "\n\n---\n<sub>Zagware Scanner &nbsp;·&nbsp; "
             "[zagware/zagware-scanner](https://github.com/zagware/zagware-scanner)</sub>"
         )
-        if not platform.supports_html_details():
-            # Bitbucket: append invisible CommonMark link-reference definition as the comment marker
-            comment += "\n" + _BB_COMMENT_MARKER
+        # (No Bitbucket marker append here -- render_comment already emits
+        # _BB_COMMENT_MARKER as the FIRST line for non-collapsible platforms,
+        # so it survives the truncation below. See QUAL-05.)
 
         # Truncate the combined comment (IaC + SCA + Secrets) to platform limit
         if len(comment) > _MAX_COMMENT:

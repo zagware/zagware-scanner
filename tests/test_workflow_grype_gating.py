@@ -18,11 +18,13 @@ these tests again.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
 import subprocess
 import textwrap
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -210,3 +212,82 @@ class TestPublishYmlSelfScanStep:
         proc = _run_bash_step(script, tmp_path, GARBAGE_OUTPUT_GRYPE)
         assert proc.returncode == 0
         assert "UNKNOWN" in proc.gh_summary
+
+
+PREDICATE_EXPR_MAP = {
+    "steps.latest.outputs.digest": TEST_DIGEST,
+    "steps.latest.outputs.age_days": "17",
+    "steps.scan.outputs.high_count": "0",
+    "github.server_url": "https://github.com",
+    "github.repository": "zagware/zagware-scanner",
+    "github.run_id": "123456789",
+}
+
+
+def _resolve_predicate_expressions(script: str) -> str:
+    """Substitute the wider set of `${{ ... }}` expressions the "Build
+    promotion predicate" step references (steps.*.outputs.* plus github.*),
+    the way the Actions runner would before handing the script to bash."""
+    resolved = script
+    for expr, value in PREDICATE_EXPR_MAP.items():
+        resolved = re.sub(r"\$\{\{\s*" + re.escape(expr) + r"\s*\}\}", value, resolved)
+    assert "${{" not in resolved, f"unresolved GH expression left in script:\n{resolved}"
+    return resolved
+
+
+def _run_predicate_step(script: str, tmp_path: Path) -> subprocess.CompletedProcess:
+    """Execute the predicate-building step's bash directly -- it shells out
+    only to jq/date, no fake binary needed."""
+    resolved = _resolve_predicate_expressions(script)
+    return subprocess.run(
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", resolved],
+        cwd=tmp_path, capture_output=True, text=True, timeout=15,
+    )
+
+
+@pytest.mark.integration
+class TestPromoteYmlPredicateStep:
+    """SUP-05: actions/attest requires predicate-type (always required) and
+    exactly one of predicate/predicate-path (both required). Before the fix,
+    promote.yml's "Attest promotion" step supplied neither, so the workflow
+    re-tagged and signed :stable/:secure and then failed red at attestation
+    -- tags moved, run failed. This locks in (1) the shipped bash that builds
+    the predicate JSON, and (2) that the attest step's own `with:` block
+    actually declares the two required inputs."""
+
+    STEP = "Build promotion predicate"
+
+    def test_produces_valid_predicate_json(self, tmp_path):
+        script = _extract_run_block(".github/workflows/promote.yml", self.STEP)
+        predicate_path = Path("/tmp/promotion-predicate.json")
+        predicate_path.unlink(missing_ok=True)
+        proc = _run_predicate_step(script, tmp_path)
+        assert proc.returncode == 0, proc.stderr
+        predicate = json.loads(predicate_path.read_text())
+        assert predicate["digest"] == TEST_DIGEST
+        assert predicate["promotedTags"] == ["stable", "secure"]
+        assert predicate["sourceTag"] == "latest"
+        # real ints, not the string forms the GH expressions resolve to
+        assert predicate["coolingPeriodDays"] == 17
+        assert predicate["cveScan"] == {"tool": "grype", "highOrCriticalCount": 0}
+        assert predicate["workflowRun"] == (
+            "https://github.com/zagware/zagware-scanner/actions/runs/123456789"
+        )
+        # a real timestamp, not a literal unresolved expression
+        datetime.fromisoformat(predicate["promotedAt"].replace("Z", "+00:00"))
+        predicate_path.unlink(missing_ok=True)
+
+    def test_attest_step_declares_required_predicate_inputs(self):
+        """Direct regression for the review's exact defect: predicate-type is
+        a required input to actions/attest and neither it nor
+        predicate/predicate-path was ever supplied."""
+        doc = yaml.safe_load((REPO_ROOT / ".github/workflows/promote.yml").read_text())
+        steps = doc["jobs"]["promote"]["steps"]
+        attest_step = next(s for s in steps if s.get("name") == "Attest promotion")
+        with_block = attest_step.get("with", {})
+        assert with_block.get("predicate-type"), "predicate-type is required by actions/attest"
+        has_predicate = bool(with_block.get("predicate"))
+        has_predicate_path = bool(with_block.get("predicate-path"))
+        assert has_predicate != has_predicate_path, (
+            "actions/attest requires exactly one of predicate or predicate-path"
+        )

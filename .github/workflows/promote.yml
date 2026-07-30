@@ -202,12 +202,36 @@ jobs:
 
           echo "✓ Signed :stable and :secure"
 
+      - name: Build promotion predicate
+        if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'
+        run: |
+          jq -n \
+            --arg digest "${{ steps.latest.outputs.digest }}" \
+            --arg promoted_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg cooling_period_days "${{ steps.latest.outputs.age_days }}" \
+            --arg high_critical_count "${{ steps.scan.outputs.high_count }}" \
+            --arg workflow_run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+              digest: $digest,
+              promotedAt: $promoted_at,
+              promotedTags: ["stable", "secure"],
+              sourceTag: "latest",
+              coolingPeriodDays: ($cooling_period_days | tonumber),
+              cveScan: {
+                tool: "grype",
+                highOrCriticalCount: ($high_critical_count | tonumber)
+              },
+              workflowRun: $workflow_run
+            }' > /tmp/promotion-predicate.json
+
       - name: Attest promotion
         if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'
         uses: actions/attest@ce27ba3b4a9a139d9a20a4a07d69fabb52f1e5bc # v2
         with:
           subject-name: ghcr.io/zagware/zagware-scanner
           subject-digest: ${{ steps.latest.outputs.digest }}
+          predicate-type: https://zagware.io/attestations/promotion/v1
+          predicate-path: /tmp/promotion-predicate.json
 
       - name: Promotion summary
         if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'
