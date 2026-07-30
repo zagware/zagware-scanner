@@ -49,7 +49,7 @@ class TestNoticeFile:
         assert "Anchore" in text
         assert "MIT" in text  # betterleaks -- the one non-Apache-2.0 component
         assert "2.1.20" in text  # KICS version
-        assert "v1.19.0" in text  # Syft version
+        assert "v1.50.0" in text  # Syft version
         assert "v0.112.0" in text  # Grype version
         assert "1.7.2" in text  # betterleaks version
 

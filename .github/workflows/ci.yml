@@ -106,12 +106,18 @@ jobs:
             # Terraform IaC scanner, including every KICS version in range.
             printf "resource \"aws_security_group\" \"bad\" {\n  name = \"smoke-test\"\n  ingress {\n    from_port   = 22\n    to_port     = 22\n    protocol    = \"tcp\"\n    cidr_blocks = [\"0.0.0.0/0\"]\n  }\n}\n" > main.tf
 
-            # Real Grype finding: an old, CVE-laden lodash pin.
-            printf "{\"name\": \"smoke-test\", \"version\": \"1.0.0\", \"dependencies\": {\"lodash\": \"4.17.15\"}}\n" > package.json
+            # Real Grype finding: an old, CVE-laden lodash pin. Syft's npm
+            # cataloger needs a real lockfile -- a bare package.json (with no
+            # package-lock.json) yields zero packages, discovered by actually
+            # running this against a real build rather than trusting a stub.
+            printf "{\"name\":\"smoke-test\",\"version\":\"1.0.0\",\"lockfileVersion\":3,\"requires\":true,\"packages\":{\"\":{\"name\":\"smoke-test\",\"version\":\"1.0.0\",\"dependencies\":{\"lodash\":\"4.17.15\"}},\"node_modules/lodash\":{\"version\":\"4.17.15\",\"resolved\":\"https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz\",\"integrity\":\"sha512-8xOcRHvCjnocdS5cpwXQXVzmmh5e5+saE2QGoeQmbKmRS6J3VQppPOIt0MnmE+4xlZoumy0GPG0D0MVIQbNA1A==\"}}}\n" > package-lock.json
 
-            # Real betterleaks finding: AWS docs own published example access
-            # key ID -- the standard placeholder secret-scanner fixtures use.
-            printf "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n" > .env
+            # Real betterleaks finding: a PEM private-key block. AWS's own
+            # published EXAMPLE key id (a common smoke-test placeholder) is
+            # NOT usable here -- gitleaks-family scanners, betterleaks
+            # included, allowlist it by default (confirmed against the real
+            # bundled binary: 0 findings). A private-key block is not.
+            printf -- "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA1c7+9z5Pad7OejecsQ0bu3aumqCLQPTGorAdc7OZ2ZfEqYCu\nQXn5UokEz2fXVXKa1LOhbFtMdlsPqz1JcRVUeuVLFqYAe6xppfF5wLIVs0ARfOb+\nEXAMPLEFAKEKEYCONTENTFOROURSMOKETESTINGONLY123456789NOTREALDATA\n-----END RSA PRIVATE KEY-----\n" > id_rsa
 
             echo "--- KICS scan (expect >=1 finding) ---"
             kics scan --path . --queries-path /opt/iac-rules/assets/queries \
@@ -125,7 +131,7 @@ jobs:
             syft scan dir:. -o syft-json=/tmp/out/sbom.json --quiet
             PKGCOUNT=$(python3 -c "import json; print(len(json.load(open(\"/tmp/out/sbom.json\")).get(\"artifacts\", [])))")
             echo "Syft packages: $PKGCOUNT"
-            if [ "$PKGCOUNT" -lt 1 ]; then echo "ERROR: Syft found 0 packages in a fixture with a package.json"; exit 1; fi
+            if [ "$PKGCOUNT" -lt 1 ]; then echo "ERROR: Syft found 0 packages in a fixture with a package-lock.json"; exit 1; fi
 
             echo "--- Grype (vulnerability matching) ---"
             grype sbom:/tmp/out/sbom.json -o json --quiet > /tmp/out/grype.json
@@ -138,7 +144,7 @@ jobs:
               --exit-code 0 --no-color --no-banner
             SECRETCOUNT=$(python3 -c "import json; d=json.load(open(\"/tmp/out/secrets.json\")); print(len(d) if d else 0)")
             echo "betterleaks findings: $SECRETCOUNT"
-            if [ "$SECRETCOUNT" -lt 1 ]; then echo "ERROR: betterleaks found 0 secrets against a fixture with a known AWS example key ID"; exit 1; fi
+            if [ "$SECRETCOUNT" -lt 1 ]; then echo "ERROR: betterleaks found 0 secrets against a fixture with a PEM private-key block"; exit 1; fi
 
             echo "✓ All four engines executed and produced real findings against known-bad fixtures"
           '

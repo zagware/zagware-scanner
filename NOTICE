@@ -21,7 +21,7 @@ Syft
   Vendor:    Anchore
   License:   Apache-2.0
   Source:    https://github.com/anchore/syft
-  Version:   v1.19.0
+  Version:   v1.50.0
   Role:      Generates the SBOM that Grype scans for known vulnerabilities.
 
 Grype
