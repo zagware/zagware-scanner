@@ -21,6 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Install Grype
+        uses: ./.github/actions/install-grype
+
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -48,10 +51,21 @@ jobs:
         if: steps.stable.outputs.skip != 'true'
         id: scan
         run: |
-          SCAN_OUTPUT=$(grype "ghcr.io/zagware/zagware-scanner@${{ steps.stable.outputs.digest }}" \
-            -o json --fail-on high 2>&1) || true
+          IMAGE_REF="ghcr.io/zagware/zagware-scanner@${{ steps.stable.outputs.digest }}"
 
-          HIGH_COUNT=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length' 2>/dev/null || echo "0")
+          set +e
+          SCAN_JSON=$(grype "$IMAGE_REF" -o json 2>/tmp/grype-stderr.log)
+          GRYPE_EXIT=$?
+          set -e
+
+          if [ "$GRYPE_EXIT" -ne 0 ] || ! echo "$SCAN_JSON" | jq -e '.matches | type == "array"' >/dev/null 2>&1; then
+            echo "::error::Grype scan of $IMAGE_REF failed or returned unparseable output (exit $GRYPE_EXIT)."
+            echo "::error::This is a SCAN FAILURE, not zero vulnerabilities — the audit cannot make a determination this run."
+            cat /tmp/grype-stderr.log
+            exit 1
+          fi
+
+          HIGH_COUNT=$(echo "$SCAN_JSON" | jq '[.matches[] | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length')
 
           echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
           echo "Found $HIGH_COUNT HIGH/CRITICAL vulnerabilities in :stable"

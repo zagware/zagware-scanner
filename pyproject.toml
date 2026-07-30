@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: exercises real subprocesses/git/network-adjacent behaviour, still fast",
+    "docker: builds and runs the actual container image; requires a running Docker daemon",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*"]

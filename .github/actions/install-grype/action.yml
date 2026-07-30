@@ -1,0 +1,34 @@
+name: Install Grype
+description: >
+  Installs the pinned, checksum-verified Grype CLI used by every CVE-gating
+  step in this repo (audit.yml, promote.yml, publish.yml's self-scan). None of
+  those workflows had Grype installed before REVIEW-2026-07-30.md SUP-01 —
+  every `grype ...` invocation was silently failing with "command not found",
+  and the fallback `|| echo "0"` / `|| echo "999"` patterns each workflow used
+  fabricated a result instead of failing loudly. This action exists so that
+  bug class can't recur independently in three places, and so the pinned
+  version+checksum has exactly one source (see SUP-08 for folding the
+  Dockerfile's own copy of the same values into this one too).
+
+  SHA256-verified against the exact same GRYPE_VERSION/GRYPE_CHECKSUM pinned
+  in ../../../Dockerfile — keep the two in sync until SUP-08 unifies them.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Grype (pinned, checksum-verified)
+      shell: bash
+      env:
+        GRYPE_VERSION: v0.112.0
+        GRYPE_VER: 0.112.0
+        GRYPE_CHECKSUM: 434bae8af635b6308d7a33ea842c6216dc382d4ec49fe3873f927b7805cc69e2
+      run: |
+        curl -fL \
+          "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_linux_amd64.deb" \
+          -o /tmp/grype.deb
+        echo "${GRYPE_CHECKSUM}  /tmp/grype.deb" | sha256sum -c -
+        sudo dpkg -i /tmp/grype.deb
+        rm /tmp/grype.deb
+        # Fail loudly here, not three steps later with a misleading fabricated
+        # count, if the install silently produced a broken/missing binary.
+        grype version

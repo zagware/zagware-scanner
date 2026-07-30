@@ -39,7 +39,7 @@ import hashlib
 
 
 # ── Internal constants ─────────────────────────────────────────────────────────
-__version__ = "2.8.2"
+__version__ = "2.9.0"
 
 _SCANNER_BIN   = os.environ.get("_ZAGWARE_SCANNER_BIN", "/usr/local/bin/kics")
 _QUERIES_PATH  = os.environ.get("ZAGWARE_QUERIES_PATH",  "/opt/iac-rules/assets/queries")
@@ -78,6 +78,13 @@ _SECRETS_BIN     = os.environ.get("_ZAGWARE_SECRETS_BIN", "/usr/local/bin/better
 # Betterleaks has no severity taxonomy, so repo visibility is the priority signal instead —
 # a leaked credential in a public repo is immediately exposed to the world.
 _SECRETS_FAIL_ON_PUBLIC = os.environ.get("ZAGWARE_SECRETS_FAIL_ON_PUBLIC", "true").lower() != "false"
+# When repo_visibility() cannot be determined (transient API error, missing
+# permission, GitHub Enterprise quirk), ZAGWARE_SECRETS_FAIL_ON_PUBLIC treats
+# "unknown" the same as "public" (fail closed) by default — see QUAL-02. Set
+# this to explicitly opt out, e.g. for an air-gapped install where visibility
+# can never be resolved and the operator has independently confirmed the repo
+# is private.
+_ASSUME_PRIVATE = os.environ.get("ZAGWARE_ASSUME_PRIVATE", "false").lower() == "true"
 
 def _severities_below() -> list[str]:
     """Return severities to pass to --exclude-severities based on ZAGWARE_MIN_SEVERITY.
@@ -452,9 +459,11 @@ class GitHub(Platform):
             log.info("Posted GitHub comment on PR #%s", pr)
 
     def read_pr_comments(self) -> list[dict]:
-        """Return PR comments as {body, author, created_at} dicts — author/created_at
-        are used to attribute /zagware suppress commands for the suppression audit
-        trail (see collect_suppression_records())."""
+        """Return PR comments as {body, author, created_at, author_association} dicts.
+        author/created_at attribute /zagware suppress commands for the suppression audit
+        trail (see collect_suppression_records()); author_association gates which comments
+        the scanner will treat as authorized suppress commands (see SEC-01,
+        _filter_authorized_comments())."""
         owner, repo = self._repo.split("/", 1)
         pr  = os.environ.get("PR_NUMBER", "").strip()
         if not pr:
@@ -468,9 +477,10 @@ class GitHub(Platform):
                 break
             for c in comments:
                 result.append({
-                    "body":       c.get("body", ""),
-                    "author":     (c.get("user") or {}).get("login") or "unknown",
-                    "created_at": c.get("created_at", ""),
+                    "body":               c.get("body", ""),
+                    "author":             (c.get("user") or {}).get("login") or "unknown",
+                    "created_at":         c.get("created_at", ""),
+                    "author_association": c.get("author_association", ""),
                 })
             if len(comments) < 100:
                 break
@@ -487,7 +497,7 @@ class GitHub(Platform):
             assert isinstance(data, dict)
             return "private" if data.get("private") else "public"
         except Exception as exc:
-            log.debug("Could not determine repo visibility: %s", exc)
+            log.warning("Could not determine repo visibility: %s", exc)
             return "unknown"
 
 
@@ -673,7 +683,7 @@ class Bitbucket(Platform):
             assert isinstance(data, dict)
             return "private" if data.get("is_private") else "public"
         except Exception as exc:
-            log.debug("Could not determine repo visibility: %s", exc)
+            log.warning("Could not determine repo visibility: %s", exc)
             return "unknown"
 
     def pr_number(self) -> int | None:
@@ -779,7 +789,7 @@ class AzureDevOps(Platform):
             vis = (data.get("visibility") or "").strip().lower()
             return vis if vis in ("public", "private") else "unknown"
         except Exception as exc:
-            log.debug("Could not determine repo visibility: %s", exc)
+            log.warning("Could not determine repo visibility: %s", exc)
             return "unknown"
 
     def pr_number(self) -> int | None:
@@ -902,6 +912,16 @@ def clone_and_checkout_sha(url: str, base_branch: str, sha: str, dest: str) -> N
 
 # ── Scan ───────────────────────────────────────────────────────────────────────
 
+class ScanFailure(RuntimeError):
+    """Raised when a scan TOOL crashes, times out, or produces unreadable
+    output — as distinct from the tool running successfully and finding zero
+    issues. Subclasses RuntimeError so any existing `except RuntimeError`
+    handler still catches it; callers that need to distinguish scan failures
+    specifically should catch ScanFailure. Callers MUST NOT treat this the
+    same as an empty result list. See QUAL-01 in REVIEW-2026-07-30.md.
+    """
+
+
 def run_scan(path: str, output_json: str) -> dict:
     """Run the IaC scanner on *path*, write JSON to *output_json*, return parsed results.
 
@@ -944,7 +964,7 @@ def run_scan(path: str, output_json: str) -> dict:
             return json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError) as exc:
         # Output missing = KICS crashed before writing. This is NOT 'no findings'.
-        raise RuntimeError(
+        raise ScanFailure(
             f"KICS output not readable ({exc}) — scanner may have crashed. "
             f"Exit code: {result.returncode}. This is NOT 'no findings'; it is a scanner failure."
         ) from exc
@@ -1009,7 +1029,7 @@ def _run_syft(path: str, sbom_out: str) -> bool:
         # Accept output even on non-zero exit (Syft may emit warnings as errors)
         return Path(sbom_out).exists() and Path(sbom_out).stat().st_size > 0
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log.debug("Syft unavailable: %s", e)
+        log.error("Syft unavailable: %s", e)
         return False
 
 
@@ -1028,7 +1048,7 @@ def _run_grype(sbom_path: str, grype_out: str) -> bool:
             return True
         return False
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log.debug("Grype unavailable: %s", e)
+        log.error("Grype unavailable: %s", e)
         return False
 
 
@@ -1037,8 +1057,12 @@ def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
 
     Returns:
         None  — SCA disabled or no manifest files found (skipped, not scanned).
-        []    — Scanned successfully, zero vulnerabilities found.
-        [...]  — Scanned successfully, vulnerabilities found.
+        [...] — Scanned successfully; may be empty ([]) if genuinely clean.
+
+    Raises:
+        ScanFailure — Syft or Grype crashed, timed out, or produced unreadable
+        output. Callers MUST treat this as a failed scan, not as "zero
+        findings" — see QUAL-01 in REVIEW-2026-07-30.md.
     """
     if not _SCA_ENABLED:
         return None
@@ -1049,17 +1073,16 @@ def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
     grype_out = f"{tmp_dir}/grype_{label}.json"
     log.info("SCA: running Syft on %s...", label)
     if not _run_syft(path, sbom_out):
-        log.warning("SCA: Syft failed for %s", label)
-        return []
+        raise ScanFailure(f"SCA: Syft failed for {label} — this is NOT 'no findings'; it is a scanner failure.")
     log.info("SCA: running Grype on %s...", label)
     if not _run_grype(sbom_out, grype_out):
-        log.warning("SCA: Grype failed for %s", label)
-        return []
+        raise ScanFailure(f"SCA: Grype failed for {label} — this is NOT 'no findings'; it is a scanner failure.")
     try:
         data = json.loads(Path(grype_out).read_text())
     except Exception as e:
-        log.warning("SCA: could not read Grype output: %s", e)
-        return []
+        raise ScanFailure(
+            f"SCA: could not read Grype output for {label}: {e} — this is NOT 'no findings'; it is a scanner failure."
+        ) from e
     findings: list[dict] = []
     for match in data.get("matches", []):
         try:
@@ -1162,8 +1185,12 @@ def run_secrets_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
 
     Returns:
         None  — secrets scanning disabled (ZAGWARE_SECRETS_ENABLED=false).
-        []    — scanned successfully (zero findings), or the scan tool failed.
-        [...] — scanned successfully, findings present.
+        [...] — scanned successfully; may be empty ([]) if genuinely clean.
+
+    Raises:
+        ScanFailure — betterleaks crashed, timed out, or produced unreadable
+        output. Callers MUST treat this as a failed scan, not as "zero
+        findings" — see QUAL-01 in REVIEW-2026-07-30.md.
     """
     if not _SECRETS_ENABLED:
         return None
@@ -1184,8 +1211,9 @@ def run_secrets_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
         # otherwise every finding would show as "new" even when unchanged.
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=path, timeout=300)
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log.warning("Secrets: betterleaks unavailable for %s: %s", label, e)
-        return []
+        raise ScanFailure(
+            f"Secrets: betterleaks unavailable for {label}: {e} — this is NOT 'no findings'; it is a scanner failure."
+        ) from e
     if result.returncode != 0:
         log.warning("Secrets: betterleaks exited %d for %s: %s", result.returncode, label,
                     (result.stderr or result.stdout or "").strip()[:400])
@@ -1193,8 +1221,9 @@ def run_secrets_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
     try:
         raw = json.loads(Path(out_json).read_text())
     except (FileNotFoundError, json.JSONDecodeError) as e:
-        log.warning("Secrets: could not read betterleaks output for %s: %s", label, e)
-        return []
+        raise ScanFailure(
+            f"Secrets: could not read betterleaks output for {label}: {e} — this is NOT 'no findings'; it is a scanner failure."
+        ) from e
     if not raw:  # betterleaks writes the literal JSON `null` when zero findings
         log.info("Secrets %s: 0 finding(s)", label)
         return []
@@ -1242,13 +1271,55 @@ def new_secrets_findings(
 
 # ── Interactive suppression from PR comments ──────────────────────────────────
 
+_SUPPRESS_ALLOWED_ASSOCIATIONS = {
+    a.strip().upper()
+    for a in os.environ.get(
+        "ZAGWARE_SUPPRESS_ALLOWED_ASSOCIATIONS", "OWNER,MEMBER,COLLABORATOR"
+    ).split(",")
+    if a.strip()
+}
+
+# Anchored to the start of the (already-stripped) line, with MULTILINE so the
+# anchor also holds per-line when checking a whole comment body — this is what
+# stops the scanner's own instructional text ("/zagware suppress <id> <reason>",
+# quoted back at it by a reply) from being mistaken for an authored command.
+# Reason is optional: "/zagware suppress <id>" with no trailing text is a
+# valid command, not a silent no-op.
 _SUPPRESS_CMD_RE = _re.compile(
-    r'/zagware\s+suppress\s+(\S+)\s+(.*)', _re.IGNORECASE,
+    r'^/zagware\s+suppress\s+(\S+)(?:\s+(.*))?', _re.IGNORECASE | _re.MULTILINE,
 )
+
+
+def _filter_authorized_comments(comments: list[dict]) -> list[dict]:
+    """Drop comments whose author is not authorized to issue /zagware suppress
+    commands (see _SUPPRESS_ALLOWED_ASSOCIATIONS above). Default-deny: a
+    comment with no author_association field — the platform doesn't provide
+    one, or it's empty — is rejected rather than silently trusted.
+
+    MUST be called on every comment list before it reaches
+    parse_suppression_commands(); that function does not itself check
+    authorization. See SEC-01 in REVIEW-2026-07-30.md.
+    """
+    allowed: list[dict] = []
+    for c in comments:
+        assoc = (c.get("author_association") or "").strip().upper()
+        if assoc in _SUPPRESS_ALLOWED_ASSOCIATIONS:
+            allowed.append(c)
+        elif "/zagware suppress" in c.get("body", "").lower():
+            log.warning(
+                "Ignoring /zagware suppress command from '%s' — author_association "
+                "'%s' not in allowed set %s",
+                c.get("author", "unknown"), assoc or "(none)",
+                sorted(_SUPPRESS_ALLOWED_ASSOCIATIONS),
+            )
+    return allowed
 
 
 def parse_suppression_commands(comments: list[dict]) -> list[tuple[str, str, str, str]]:
     """Parse /zagware suppress <id> <reason> commands from PR comments.
+
+    Callers MUST pass comments through _filter_authorized_comments() first —
+    this function does not itself check authorization (see SEC-01).
 
     Returns list of (similarity_id, reason, author, created_at) tuples. author/created_at
     identify who posted the command and when — used to attribute the suppression audit
@@ -1256,21 +1327,25 @@ def parse_suppression_commands(comments: list[dict]) -> list[tuple[str, str, str
     """
     commands: list[tuple[str, str, str, str]] = []
     for c in comments:
-        body   = c.get("body", "")
+        body = c.get("body", "")
+        if _COMMENT_MARKER in body or _BB_COMMENT_MARKER in body:
+            continue  # the scanner's own comment — never a trusted command source
         author = c.get("author") or "unknown"
         created_at = c.get("created_at", "")
         for line in body.splitlines():
-            m = _SUPPRESS_CMD_RE.search(line.strip())
+            m = _SUPPRESS_CMD_RE.match(line.strip())
             if m:
                 sim_id = m.group(1).strip()
-                # Strip trailing non-hex characters (e.g. a copy-pasted "…" truncation marker)
-                sim_id = _re.sub(r'[^0-9a-fA-F]+$', '', sim_id)
+                # Strip leading/trailing non-hex chars (e.g. copy-pasted backticks
+                # or a "…" truncation marker), not just trailing.
+                sim_id = _re.sub(r'^[^0-9a-fA-F]+|[^0-9a-fA-F]+$', '', sim_id)
                 if not sim_id:
                     continue
-                reason = m.group(2).strip() or "Suppressed via PR comment"
+                reason = (m.group(2) or "").strip() or "Suppressed via PR comment"
                 # Strip "reason:" prefix if present
                 if reason.lower().startswith("reason:"):
                     reason = reason[7:].strip()
+                log.info("Parsed suppress command: id=%s author=%s", sim_id[:16], author)
                 commands.append((sim_id, reason, author, created_at))
     return commands
 
@@ -1320,7 +1395,27 @@ def apply_suppression_commands(
     if not commands:
         return False
 
-    supp_path = Path(pr_dir) / _SUPPRESSIONS_PATH
+    base = Path(pr_dir).resolve()
+    supp_path = base / _SUPPRESSIONS_PATH
+
+    # Same symlink + containment guard as _safe_read_suppressions_file, applied
+    # before any write: without it a hostile PR's symlinked suppressions.yaml
+    # turns an authorized suppress command into a root-level arbitrary write
+    # inside the container. Checked BEFORE mkdir too, since an intermediate
+    # symlinked .zagware/ directory would otherwise have mkdir(parents=True)
+    # silently create paths through it. See SEC-04.
+    if supp_path.is_symlink():
+        log.error("Refusing to write %s — it is a symlink, not a regular file", _SUPPRESSIONS_PATH)
+        return False
+    try:
+        resolved_target = supp_path.resolve()
+    except OSError as exc:
+        log.error("Refusing to write %s: %s", _SUPPRESSIONS_PATH, exc)
+        return False
+    if not resolved_target.is_relative_to(base):
+        log.error("Refusing to write %s — it resolves outside the scanned repository", _SUPPRESSIONS_PATH)
+        return False
+
     supp_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Read existing suppressions to avoid duplicates
@@ -1333,10 +1428,9 @@ def apply_suppression_commands(
 
     # Build YAML entries
     yaml_lines: list[str] = []
-    if supp_path.exists():
-        current_text = supp_path.read_text(encoding="utf-8")
-    else:
-        current_text = "# Zagware Scanner — Suppressions\n# Auto-managed by /zagware suppress commands\n\n"
+    current_text = _safe_read_suppressions_file(pr_dir) or (
+        "# Zagware Scanner — Suppressions\n# Auto-managed by /zagware suppress commands\n\n"
+    )
 
     for sid, reason, author, created_at in new_entries:
         safe_reason = reason.replace('"', '\\"')
@@ -1347,7 +1441,14 @@ def apply_suppression_commands(
             yaml_lines.append(f'  suppressed_at: "{created_at}"')
         yaml_lines.append("")
 
-    supp_path.write_text(current_text.rstrip() + "\n\n" + "\n".join(yaml_lines), encoding="utf-8")
+    new_text = current_text.rstrip() + "\n\n" + "\n".join(yaml_lines)
+    try:
+        fd = os.open(str(supp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new_text)
+    except OSError as exc:
+        log.error("Refusing to write %s: %s", _SUPPRESSIONS_PATH, exc)
+        return False
 
     # Git commit and push
     try:
@@ -1377,15 +1478,17 @@ _SECRET_PATTERNS = [
     _re.compile(r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'),
 ]
 
-_SECRET_CATEGORIES = {"secrets", "password", "credential", "key", "token", "authentication"}
+_SECRET_CATEGORIES = {"secret management"}  # exact KICS category string (verified
+                                             # against the pinned rules commit, see
+                                             # Dockerfile KICS_RULES_COMMIT) — "Encryption"
+                                             # etc. are NOT secret-value-shaped findings
 
 
 def _redact_value(val, category: str = "") -> str:
     """Mask secret-like values before rendering in comments or writing to artifacts."""
     if not val or not isinstance(val, str):
         return val if val else ""
-    cat_lower = (category or "").lower()
-    if any(k in cat_lower for k in _SECRET_CATEGORIES):
+    if (category or "").strip().lower() in _SECRET_CATEGORIES:
         return "***REDACTED***"
     result = val
     for pat in _SECRET_PATTERNS:
@@ -1394,7 +1497,12 @@ def _redact_value(val, category: str = "") -> str:
 
 
 def _redact_kics_results(results: dict) -> dict:
-    """Deep-copy KICS results with actual_value redacted to prevent secret leakage."""
+    """Deep-copy KICS results with actual_value and expected_value redacted to
+    prevent secret leakage. actual_value gets the full category+pattern check
+    (see _redact_value); expected_value is normally a policy statement rather
+    than a literal value pulled from the resource, but gets the same regex
+    pattern pass as defense-in-depth since some queries do populate it from
+    resource content. See SEC-02."""
     import copy
     redacted = copy.deepcopy(results)
     for q in redacted.get("queries", []):
@@ -1402,12 +1510,70 @@ def _redact_kics_results(results: dict) -> dict:
         for f in q.get("files", []):
             if "actual_value" in f:
                 f["actual_value"] = _redact_value(f.get("actual_value", ""), cat)
+            if "expected_value" in f:
+                f["expected_value"] = _redact_value(f.get("expected_value", ""))
     return redacted
 
 
 # ── Suppressions ──────────────────────────────────────────────────────────────
 
 _SUPPRESSIONS_PATH = os.environ.get("ZAGWARE_SUPPRESSIONS_FILE", ".zagware/suppressions.yaml")
+
+_MAX_SUPPRESSIONS_FILE_SIZE = 1024 * 1024  # 1 MiB — bounds the read regardless of
+                                            # what a hostile symlink target points at
+
+
+def _safe_read_suppressions_file(scan_dir: str) -> str | None:
+    """Read .zagware/suppressions.yaml from *scan_dir*, refusing to follow a
+    symlink and refusing to read a path that resolves outside *scan_dir*.
+    Returns None if the file doesn't exist or fails either check — callers
+    treat None the same as "no suppressions file".
+
+    Git checks out symlinks verbatim, so a hostile PR can commit
+    .zagware/suppressions.yaml (or the .zagware directory itself) as a
+    symlink to an arbitrary path. Without this guard, a PR-only attacker with
+    no other privilege could make the scanner read any file the process can
+    reach — its content gets parsed as key:value pairs and the "reason"
+    fields get uploaded to the platform (collect_suppression_records) —
+    or hang the scan by pointing it at /dev/zero. See SEC-04.
+    """
+    base = Path(scan_dir).resolve()
+    supp_file = base / _SUPPRESSIONS_PATH
+
+    if supp_file.is_symlink():
+        log.warning("Refusing to read %s — it is a symlink, not a regular file", _SUPPRESSIONS_PATH)
+        return None
+
+    try:
+        resolved = supp_file.resolve()
+    except OSError as exc:
+        log.warning("Could not resolve %s: %s", _SUPPRESSIONS_PATH, exc)
+        return None
+    if not resolved.is_relative_to(base):
+        log.warning("Refusing to read %s — it resolves outside the scanned repository", _SUPPRESSIONS_PATH)
+        return None
+    if not resolved.exists():
+        return None
+
+    # O_NOFOLLOW closes the TOCTOU window between the is_symlink() check above
+    # and this open() — if the final path component became a symlink in the
+    # meantime, the open fails instead of following it.
+    try:
+        fd = os.open(str(resolved), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        log.warning("Refusing to read %s: %s", _SUPPRESSIONS_PATH, exc)
+        return None
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            data = f.read(_MAX_SUPPRESSIONS_FILE_SIZE + 1)
+    except OSError as exc:
+        log.warning("Could not read %s: %s", _SUPPRESSIONS_PATH, exc)
+        return None
+    if len(data) > _MAX_SUPPRESSIONS_FILE_SIZE:
+        log.warning("%s exceeds %d bytes — refusing to parse (truncated or hostile file?)",
+                     _SUPPRESSIONS_PATH, _MAX_SUPPRESSIONS_FILE_SIZE)
+        return None
+    return data
 
 
 def _parse_suppressions_file(scan_dir: str) -> dict[str, dict]:
@@ -1418,13 +1584,8 @@ def _parse_suppressions_file(scan_dir: str) -> dict[str, dict]:
     Entries written by hand (or predating this field) have added_by=added_at=None —
     callers needing attribution for those fall back to _blame_suppressions_file().
     """
-    supp_file = Path(scan_dir) / _SUPPRESSIONS_PATH
-    if not supp_file.exists():
-        return {}
-    try:
-        text = supp_file.read_text(encoding="utf-8")
-    except Exception as e:
-        log.warning("Could not read suppressions file %s: %s", supp_file, e)
+    text = _safe_read_suppressions_file(scan_dir)
+    if text is None:
         return {}
 
     records: dict[str, dict] = {}
@@ -1484,7 +1645,7 @@ def _blame_suppressions_file(pr_dir: str) -> dict[str, tuple[str, str]]:
     YAML by apply_suppression_commands() at the moment a /zagware suppress command lands.
     """
     supp_path = Path(pr_dir) / _SUPPRESSIONS_PATH
-    if not supp_path.exists():
+    if supp_path.is_symlink() or not supp_path.exists():
         return {}
     try:
         result = subprocess.run(
@@ -1610,7 +1771,7 @@ def render_comment(
                     L.append(
                         f"| `{fname}` | {f['line']} | `{resource}`"
                         f" | {f.get('issue_type', '')}"
-                        f" | {_cell(f.get('expected_value', ''))}"
+                        f" | {_cell(_redact_value(f.get('expected_value', '')))}"
                         f" | {_cell(_redact_value(f.get('actual_value', ''), q.get('category', '')))} |"
                     )
                 L.append("")
@@ -1691,16 +1852,19 @@ def render_sca_section(
 
 def render_secrets_section(
     base_secrets: list[dict] | None, head_secrets: list[dict] | None, novel_secrets: list[dict],
-    is_public: bool, collapsible: bool = True,
+    repo_visibility: str, collapsible: bool = True,
 ) -> str:
     """Return the Secrets block to append to the PR comment. Empty string if no
     secrets data.
 
     Betterleaks has no severity taxonomy, so unlike the IaC/SCA sections there is
-    no per-severity breakdown. Instead, a public-repo exposure banner is shown
-    when the repo is public and new secrets were found — a leaked credential in a
-    public repo is immediately exposed to the world, which is the priority signal
-    used in place of severity (see Platform.repo_visibility()).
+    no per-severity breakdown. Instead, an exposure banner is shown when new
+    secrets were found: a "public repo" banner when repo_visibility == "public"
+    (a leaked credential there is immediately exposed to the world, the priority
+    signal used in place of severity — see Platform.repo_visibility()), or an
+    "unknown" banner when visibility could not be determined at all — see
+    QUAL-02: ZAGWARE_SECRETS_FAIL_ON_PUBLIC applies conservatively in that case,
+    and the comment says so rather than leaving that only in the build log.
 
     Never renders the secret value itself — only rule_id/file_path/line/tags/
     validation_status, matching what run_secrets_scan() reads from the report.
@@ -1721,10 +1885,17 @@ def render_secrets_section(
         L.append("")
         return "\n".join(L)
 
-    if is_public:
+    if repo_visibility == "public":
         L += [
             "> 🌐 **PUBLIC REPOSITORY** — any leaked secret here is immediately exposed to the "
             "world. Rotate affected credentials before merging.",
+            "",
+        ]
+    elif repo_visibility == "unknown":
+        L += [
+            "> ⚠️ **Repository visibility could not be determined** — public-repo rules "
+            "(`ZAGWARE_SECRETS_FAIL_ON_PUBLIC`) were applied conservatively for this scan. "
+            "Set `ZAGWARE_ASSUME_PRIVATE=true` to opt out.",
             "",
         ]
     L += [f"> 🔴 **{len(novel_secrets)} new secret(s) introduced by this PR**", ""]
@@ -2137,6 +2308,28 @@ def _write_artifacts(
         log.warning("Failed to write artifacts: %s", exc)
 
 
+def _secrets_public_gate(repo_visibility: str, has_novel_secrets: bool) -> tuple[bool, str | None]:
+    """Decide whether new secrets should force exit_code=1 under
+    ZAGWARE_SECRETS_FAIL_ON_PUBLIC, and which reason applies.
+
+    Pure decision function (no I/O, no subprocess, no network) so the
+    fail-closed behaviour is unit-testable in isolation from the rest of
+    main()'s clone/scan machinery: "unknown" visibility is treated the same
+    as "public" (fail closed) unless the operator explicitly opts out via
+    ZAGWARE_ASSUME_PRIVATE — a transient API error or missing permission must
+    not silently disable this guarantee. See QUAL-02 in REVIEW-2026-07-30.md.
+
+    Returns (should_fail, reason) where reason is "public", "unknown", or None.
+    """
+    if not _SECRETS_FAIL_ON_PUBLIC or not has_novel_secrets:
+        return False, None
+    if repo_visibility == "public":
+        return True, "public"
+    if repo_visibility == "unknown" and not _ASSUME_PRIVATE:
+        return True, "unknown"
+    return False, None
+
+
 def main() -> int:
     t_start = time.perf_counter()
     log.info("Zagware IaC Scanner starting")
@@ -2247,17 +2440,27 @@ def main() -> int:
                 platform.repo(),
                 base_branch, '', head_branch, '',
                 platform.pr_number(),
-                base_results, pr_results,
+                _redact_kics_results(base_results), _redact_kics_results(pr_results),
             )
             timings["platform_upload_iac"] = time.perf_counter() - t0
 
         # ── SCA ──────────────────────────────────────────────────────────────
         t0 = time.perf_counter()
-        base_sca = run_sca_scan(base_dir, tmp, "base")
+        try:
+            base_sca = run_sca_scan(base_dir, tmp, "base")
+        except ScanFailure as exc:
+            log.error("SCA scan failed for base branch: %s", exc)
+            track_scan_failed(platform.name(), platform.repo(), "sca_scan")
+            return 1
         timings["sca_base"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        head_sca = run_sca_scan(pr_dir, tmp, "pr")
+        try:
+            head_sca = run_sca_scan(pr_dir, tmp, "pr")
+        except ScanFailure as exc:
+            log.error("SCA scan failed for PR branch: %s", exc)
+            track_scan_failed(platform.name(), platform.repo(), "sca_scan")
+            return 1
         timings["sca_head"] = time.perf_counter() - t0
 
         # (novel_sca computed later in the Diff section, after suppression commands resolve)
@@ -2275,11 +2478,21 @@ def main() -> int:
 
         # ── Secrets (betterleaks) ───────────────────────────────────────────────
         t0 = time.perf_counter()
-        base_secrets = run_secrets_scan(base_dir, tmp, "base")
+        try:
+            base_secrets = run_secrets_scan(base_dir, tmp, "base")
+        except ScanFailure as exc:
+            log.error("Secrets scan failed for base branch: %s", exc)
+            track_scan_failed(platform.name(), platform.repo(), "secrets_scan")
+            return 1
         timings["secrets_base"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        head_secrets = run_secrets_scan(pr_dir, tmp, "pr")
+        try:
+            head_secrets = run_secrets_scan(pr_dir, tmp, "pr")
+        except ScanFailure as exc:
+            log.error("Secrets scan failed for PR branch: %s", exc)
+            track_scan_failed(platform.name(), platform.repo(), "secrets_scan")
+            return 1
         timings["secrets_head"] = time.perf_counter() - t0
 
         # Only pay for the visibility lookup (an API call on GitHub/Bitbucket/Azure)
@@ -2318,7 +2531,7 @@ def main() -> int:
         just_suppressed: list[tuple[str, str, str, str]] = []  # (id, reason, author, created_at)
         if platform.pr_number() is not None:
             try:
-                comments = platform.read_pr_comments()
+                comments = _filter_authorized_comments(platform.read_pr_comments())
                 commands = parse_suppression_commands(comments)
                 resolved: list[tuple[str, str, str, str]] = []
                 for raw_id, reason, author, created_at in commands:
@@ -2379,7 +2592,7 @@ def main() -> int:
         )
         comment += render_secrets_section(
             base_secrets, head_secrets, novel_secrets,
-            repo_visibility == "public",
+            repo_visibility,
             collapsible=platform.supports_html_details(),
         )
         if platform.supports_interactive_suppression():
@@ -2464,15 +2677,29 @@ def main() -> int:
     # ── Fail-on-new gate (IaC + SCA + Secrets combined) ───────────────────────
     new_total  = new_count + len(novel_sca) + len(novel_secrets)
     exit_code  = 1 if (_FAIL_ON_NEW and new_total > 0) else 0
+    if exit_code:
+        log.warning("Exiting 1 — %d new finding(s) (ZAGWARE_FAIL_ON_NEW=true)", new_total)
     # Public-repo secrets are always fail-worthy regardless of ZAGWARE_FAIL_ON_NEW —
     # betterleaks has no severity to gate on, so repo visibility is the priority
     # signal instead, and a leaked credential in a public repo is urgent by definition.
-    if _SECRETS_FAIL_ON_PUBLIC and repo_visibility == "public" and novel_secrets:
+    # "unknown" visibility is treated the same as "public" (fail closed) unless the
+    # operator explicitly opts out via ZAGWARE_ASSUME_PRIVATE — a transient API
+    # error or missing permission must not silently disable this guarantee. See
+    # QUAL-02. (This elif is independent of the ZAGWARE_FAIL_ON_NEW warning above
+    # so both reasons are visible when a public/unknown repo also has new IaC/SCA
+    # findings — see QUAL-29.)
+    _, reason = _secrets_public_gate(repo_visibility, bool(novel_secrets))
+    if reason == "public":
         exit_code = 1
         log.warning("Exiting 1 — %d new secret(s) in a PUBLIC repository (ZAGWARE_SECRETS_FAIL_ON_PUBLIC=true)",
                      len(novel_secrets))
-    elif exit_code:
-        log.warning("Exiting 1 — %d new finding(s) (ZAGWARE_FAIL_ON_NEW=true)", new_total)
+    elif reason == "unknown":
+        exit_code = 1
+        log.warning(
+            "Exiting 1 — %d new secret(s) and repository visibility could not be determined; "
+            "ZAGWARE_SECRETS_FAIL_ON_PUBLIC=true applies conservatively. Set ZAGWARE_ASSUME_PRIVATE=true "
+            "to opt out (e.g. air-gapped installs where visibility can never be resolved).",
+            len(novel_secrets))
 
     track_scan_completed(
         platform.name(), platform.repo(), timings.get("total", 0.0),

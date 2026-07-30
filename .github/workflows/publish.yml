@@ -172,17 +172,35 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
 
       # ── Post-push: scan the published image for its own CVEs ─────────────────
+      # Advisory only (continue-on-error: true) — this never blocks a publish.
+      # The load-bearing CVE gate is promote.yml's 14-day-cooling-period check
+      # before :stable/:secure move; this is a same-day heads-up, deliberately
+      # not a release gate. See SUP-04.
+      - name: Install Grype
+        uses: ./.github/actions/install-grype
+
       - name: Self-scan image with Grype
         continue-on-error: true
         run: |
-          echo "Scanning published image for vulnerabilities..."
-          grype "ghcr.io/zagware/zagware-scanner@${{ steps.build.outputs.digest }}" \
-            -o json --fail-on high > /tmp/grype-self-scan.json 2>&1 || true
-          HIGH=$(jq '[.matches[] | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length' /tmp/grype-self-scan.json 2>/dev/null || echo "0")
+          IMAGE_REF="ghcr.io/zagware/zagware-scanner@${{ steps.build.outputs.digest }}"
+          echo "Scanning $IMAGE_REF for vulnerabilities..."
+
+          set +e
+          SCAN_JSON=$(grype "$IMAGE_REF" -o json 2>/tmp/grype-stderr.log)
+          GRYPE_EXIT=$?
+          set -e
+
+          if [ "$GRYPE_EXIT" -ne 0 ] || ! echo "$SCAN_JSON" | jq -e '.matches | type == "array"' >/dev/null 2>&1; then
+            echo "::warning::Grype self-scan failed or returned unparseable output (exit $GRYPE_EXIT) — vulnerability count for this release is UNKNOWN, not zero."
+            cat /tmp/grype-stderr.log
+            echo "⚠️ Self-scan did not complete — vulnerability count for this release is **UNKNOWN** (see job log)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          HIGH=$(echo "$SCAN_JSON" | jq '[.matches[] | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length')
           echo "HIGH/CRITICAL vulnerabilities in image: $HIGH"
           if [ "$HIGH" != "0" ]; then
             echo "⚠️  $HIGH HIGH/CRITICAL vulnerabilities found in the published image" >> $GITHUB_STEP_SUMMARY
-            echo "See full scan: /tmp/grype-self-scan.json" >> $GITHUB_STEP_SUMMARY
           else
             echo "✅ No HIGH/CRITICAL vulnerabilities found in the published image" >> $GITHUB_STEP_SUMMARY
           fi

@@ -36,6 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Install Grype
+        uses: ./.github/actions/install-grype
+
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
@@ -110,11 +113,22 @@ jobs:
         if: steps.latest.outputs.skip != 'true'
         id: scan
         run: |
-          echo "Scanning ghcr.io/zagware/zagware-scanner@${{ steps.latest.outputs.digest }} for CVEs..."
-          SCAN_OUTPUT=$(grype "ghcr.io/zagware/zagware-scanner@${{ steps.latest.outputs.digest }}" \
-            -o json --fail-on high 2>&1) || true
+          IMAGE_REF="ghcr.io/zagware/zagware-scanner@${{ steps.latest.outputs.digest }}"
+          echo "Scanning $IMAGE_REF for CVEs..."
 
-          HIGH_COUNT=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length' 2>/dev/null || echo "999")
+          set +e
+          SCAN_JSON=$(grype "$IMAGE_REF" -o json 2>/tmp/grype-stderr.log)
+          GRYPE_EXIT=$?
+          set -e
+
+          if [ "$GRYPE_EXIT" -ne 0 ] || ! echo "$SCAN_JSON" | jq -e '.matches | type == "array"' >/dev/null 2>&1; then
+            echo "::error::Grype scan of $IMAGE_REF failed or returned unparseable output (exit $GRYPE_EXIT)."
+            echo "::error::This is a SCAN FAILURE, not a clean result — promotion cannot proceed without a real answer."
+            cat /tmp/grype-stderr.log
+            exit 1
+          fi
+
+          HIGH_COUNT=$(echo "$SCAN_JSON" | jq '[.matches[] | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length')
 
           echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
 
@@ -131,11 +145,31 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const count = '${{ steps.scan.outputs.high_count }}';
+            const digest = '${{ steps.latest.outputs.digest }}';
+
+            // Check if a blocked-promotion issue already exists for this digest —
+            // without this, once the 14-day cooling period elapses this workflow
+            // runs daily via cron and would otherwise file a fresh issue every
+            // single day the image remains vulnerable. See SUP-03.
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'security,promotion-blocked'
+            });
+
+            const existing = issues.data.find(i => i.body && i.body.includes(digest));
+            if (existing) {
+              console.log(`Blocked-promotion issue already exists: ${existing.html_url}`);
+              return;
+            }
+
             github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Promotion blocked: ${{ steps.latest.outputs.digest }} has ${{ steps.scan.outputs.high_count }} HIGH/CRITICAL CVEs`,
-              body: `The promotion of \`ghcr.io/zagware/zagware-scanner@${{ steps.latest.outputs.digest }}\` to :stable was blocked because Grype found ${{ steps.scan.outputs.high_count }} HIGH/CRITICAL vulnerabilities.\n\nThe image remains on :latest. Once the CVEs are resolved (either by patching the base image or bumping affected packages), re-run this workflow to retry promotion.`,
+              title: `Promotion blocked: ${digest} has ${count} HIGH/CRITICAL CVEs`,
+              body: `The promotion of \`ghcr.io/zagware/zagware-scanner@${digest}\` to :stable was blocked because Grype found ${count} HIGH/CRITICAL vulnerabilities.\n\nThe image remains on :latest. Once the CVEs are resolved (either by patching the base image or bumping affected packages), re-run this workflow to retry promotion.`,
               labels: ['security', 'promotion-blocked']
             });
 

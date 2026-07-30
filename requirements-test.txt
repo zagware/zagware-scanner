@@ -1,0 +1,15 @@
+# Test-only dependencies. NEVER imported by src/scanner.py itself — the
+# scanner is deliberately stdlib-only so the runtime image needs no pip
+# install step (see README "Self-hosting"). This file is for `tests/` only
+# and is excluded from the Docker build context via .dockerignore.
+#
+# No HTTP-mocking library here: scanner.py's _http() uses stdlib urllib, not
+# `requests`, so libraries like `responses`/`httpretty` (which patch requests'
+# transport adapter) can't intercept it. Platform-adapter integration tests
+# instead monkeypatch scanner._http directly — see tests/conftest.py
+# `fake_http` fixture. That's also the correct seam: it's the actual boundary
+# between "platform adapter logic" (URL/header construction, pagination,
+# response parsing) and the network.
+pytest>=8.0
+pytest-cov>=5.0
+PyYAML>=6.0

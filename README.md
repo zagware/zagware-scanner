@@ -14,9 +14,9 @@ Three scan engines, one container:
 
 | Engine | What it scans | Detects |
 |---|---|---|
-| **KICS** (Checkmarx) | Infrastructure-as-code files (Terraform, Kubernetes, Dockerfile, CloudFormation…) | Misconfigurations, insecure defaults, open ports, missing encryption |
-| **Grype** (Anchore) | Package manifests and lockfiles (npm, pip, Go, Maven, Gem…) | CVEs, GHSA advisories — with CVSS, EPSS, and KEV catalog status |
-| **betterleaks** | Filesystem contents (working-tree state) | Leaked credentials — API keys, tokens, private keys, and other secret patterns |
+| **[KICS](https://github.com/Checkmarx/kics)** (Checkmarx, Apache 2.0) | Infrastructure-as-code files (Terraform, Kubernetes, Dockerfile, CloudFormation…) | Misconfigurations, insecure defaults, open ports, missing encryption |
+| **[Grype](https://github.com/anchore/grype)** (Anchore, Apache 2.0) | Package manifests and lockfiles (npm, pip, Go, Maven, Gem…) | CVEs, GHSA advisories — with CVSS, EPSS, and KEV catalog status |
+| **[betterleaks](https://github.com/betterleaks/betterleaks)** | Filesystem contents (working-tree state) | Leaked credentials — API keys, tokens, private keys, and other secret patterns |
 
 ---
 
@@ -316,7 +316,7 @@ If the PR is clean: **✅ No new security findings introduced by this PR.**
 
 ---
 
-## Supported IaC formats (KICS)
+## Supported IaC formats ([KICS](https://kics.io))
 
 | Platform | File types |
 |---|---|
@@ -337,7 +337,7 @@ KICS auto-detects file types — no configuration needed.
 
 ---
 
-## Supported dependency ecosystems (Grype)
+## Supported dependency ecosystems ([Grype](https://github.com/anchore/grype))
 
 | Ecosystem | Detected via |
 |---|---|
