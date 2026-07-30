@@ -1477,7 +1477,7 @@ def apply_suppression_commands(
     )
 
     for sid, reason, author, created_at in new_entries:
-        safe_reason = reason.replace('"', '\\"')
+        safe_reason = reason.replace('\\', '\\\\').replace('"', '\\"')
         yaml_lines.append(f"- id: {sid}")
         yaml_lines.append(f'  reason: "{safe_reason}"')
         yaml_lines.append(f'  suppressed_by: "{author}"')
@@ -1620,6 +1620,27 @@ def _safe_read_suppressions_file(scan_dir: str) -> str | None:
     return data
 
 
+def _unescape_suppression_reason(s: str) -> str:
+    """Reverse the writer's escaping (backslash-then-quote, in that order) --
+    a real single-pass unescape, not two independent global .replace() calls,
+    which would double-process a literal `\\"` sequence (an escaped backslash
+    immediately followed by a literal quote) into the wrong result. See
+    QUAL-24: the writer used to escape only quotes, and the reader stripped
+    every leading/trailing quote character rather than one matching pair, so
+    a reason like `he said "hi"` round-tripped as a mangled, dangling-
+    backslash string."""
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s) and s[i + 1] in ("\\", '"'):
+            out.append(s[i + 1])
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
 def _parse_suppressions_file(scan_dir: str) -> dict[str, dict]:
     """Parse .zagware/suppressions.yaml into {similarity_id: {reason, added_by, added_at}}.
 
@@ -1656,7 +1677,16 @@ def _parse_suppressions_file(scan_dir: str) -> dict[str, dict]:
         if ":" in stripped:
             key, _, val = stripped.partition(":")
             key = key.strip()
-            val = val.strip().strip('"').strip("'")
+            val = val.strip()
+            # Strip exactly one matching outer quote pair -- not
+            # .strip('"').strip("'"), which removes *every* leading/trailing
+            # occurrence and mangles a reason like `"he said \"hi\""` into
+            # `he said \"hi\` with a dangling backslash. Only a double-quoted
+            # value gets unescaped (single-quoted values carry no escapes).
+            if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+                val = _unescape_suppression_reason(val[1:-1])
+            elif len(val) >= 2 and val[0] == "'" and val[-1] == "'":
+                val = val[1:-1]
             if key == "similarity_id":
                 key = "id"
             current[key] = val

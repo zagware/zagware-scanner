@@ -40,6 +40,19 @@ jobs:
           fi
           echo "✓ Lint checks passed"
 
+      - name: Set up test venv
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q -r requirements-test.txt
+
+      - name: Run unit test suite
+        # SUP-14: CI previously never ran a single line of scanner.py -- only
+        # py_compile (proves it parses) plus a binary-existence check (proves
+        # files are present). This is the actual "exercise the scanner" step:
+        # every diff/render/suppression/severity/parity test built during this
+        # review runs against every PR and every tag push.
+        run: .venv/bin/python -m pytest tests/ -q
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -58,9 +71,74 @@ jobs:
       - name: Verify binaries exist
         run: |
           docker run --rm --entrypoint sh zagware-scanner:ci-test -c '
-            for bin in /usr/local/bin/kics /usr/bin/syft /usr/bin/grype; do
+            for bin in /usr/local/bin/kics /usr/bin/syft /usr/bin/grype /usr/local/bin/betterleaks; do
               if [ ! -x "$bin" ]; then echo "ERROR: $bin not found"; exit 1; fi
               echo "✓ $bin"
             done
-            echo "✓ KICS queries: $(ls /opt/iac-rules/assets/queries | wc -l) platforms"
+          '
+
+      - name: Smoke test — run each engine against a real, known-bad fixture
+        # SUP-14: existence + py_compile catch neither a broken/non-functional
+        # binary (wrong arch, missing shared lib, corrupt download) nor an
+        # empty KICS query tree, and prove nothing about whether the four
+        # engines actually produce findings. This step invokes each engine
+        # with the EXACT flags src/scanner.py itself uses (run_scan(),
+        # _run_syft(), _run_grype(), run_secrets_scan()) against fixtures each
+        # engine is guaranteed to flag, and fails the build if any of them
+        # comes back empty.
+        run: |
+          docker run --rm --entrypoint sh zagware-scanner:ci-test -c '
+            set -e
+            echo "--- version checks ---"
+            kics version
+            syft version
+            grype version
+            betterleaks version
+
+            QCOUNT=$(ls /opt/iac-rules/assets/queries | wc -l)
+            echo "KICS query platforms: $QCOUNT"
+            if [ "$QCOUNT" -lt 5 ]; then echo "ERROR: KICS query tree looks empty ($QCOUNT platform dirs)"; exit 1; fi
+
+            mkdir -p /tmp/work /tmp/out
+            cd /tmp/work
+
+            # Real KICS finding: SSH open to the world -- caught by every
+            # Terraform IaC scanner, including every KICS version in range.
+            printf "resource \"aws_security_group\" \"bad\" {\n  name = \"smoke-test\"\n  ingress {\n    from_port   = 22\n    to_port     = 22\n    protocol    = \"tcp\"\n    cidr_blocks = [\"0.0.0.0/0\"]\n  }\n}\n" > main.tf
+
+            # Real Grype finding: an old, CVE-laden lodash pin.
+            printf "{\"name\": \"smoke-test\", \"version\": \"1.0.0\", \"dependencies\": {\"lodash\": \"4.17.15\"}}\n" > package.json
+
+            # Real betterleaks finding: AWS docs own published example access
+            # key ID -- the standard placeholder secret-scanner fixtures use.
+            printf "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n" > .env
+
+            echo "--- KICS scan (expect >=1 finding) ---"
+            kics scan --path . --queries-path /opt/iac-rules/assets/queries \
+              --report-formats json --output-path /tmp/out --output-name kics \
+              --exclude-paths .git --disable-full-descriptions --no-progress --ci || true
+            KFOUND=$(python3 -c "import json; d=json.load(open(\"/tmp/out/kics.json\")); print(sum(len(q[\"files\"]) for q in d.get(\"queries\", [])))")
+            echo "KICS findings: $KFOUND"
+            if [ "$KFOUND" -lt 1 ]; then echo "ERROR: KICS found 0 findings against a fixture with an open-SSH security group"; exit 1; fi
+
+            echo "--- Syft (SBOM generation) ---"
+            syft scan dir:. -o syft-json=/tmp/out/sbom.json --quiet
+            PKGCOUNT=$(python3 -c "import json; print(len(json.load(open(\"/tmp/out/sbom.json\")).get(\"artifacts\", [])))")
+            echo "Syft packages: $PKGCOUNT"
+            if [ "$PKGCOUNT" -lt 1 ]; then echo "ERROR: Syft found 0 packages in a fixture with a package.json"; exit 1; fi
+
+            echo "--- Grype (vulnerability matching) ---"
+            grype sbom:/tmp/out/sbom.json -o json --quiet > /tmp/out/grype.json
+            VULNCOUNT=$(python3 -c "import json; print(len(json.load(open(\"/tmp/out/grype.json\")).get(\"matches\", [])))")
+            echo "Grype matches: $VULNCOUNT"
+            if [ "$VULNCOUNT" -lt 1 ]; then echo "ERROR: Grype found 0 vulnerabilities against a fixture pinning lodash 4.17.15"; exit 1; fi
+
+            echo "--- betterleaks (secret detection) ---"
+            betterleaks dir . --report-path /tmp/out/secrets.json --report-format json \
+              --exit-code 0 --no-color --no-banner
+            SECRETCOUNT=$(python3 -c "import json; d=json.load(open(\"/tmp/out/secrets.json\")); print(len(d) if d else 0)")
+            echo "betterleaks findings: $SECRETCOUNT"
+            if [ "$SECRETCOUNT" -lt 1 ]; then echo "ERROR: betterleaks found 0 secrets against a fixture with a known AWS example key ID"; exit 1; fi
+
+            echo "✓ All four engines executed and produced real findings against known-bad fixtures"
           '

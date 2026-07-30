@@ -11,3 +11,6 @@ LICENSE
 Dockerfile
 .dockerignore
 zagware-scan-results
+.venv
+tests
+requirements-test.txt
