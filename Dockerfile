@@ -128,7 +128,7 @@ COPY --chmod=755 src/scanner.py /usr/local/bin/zagware-scan
 # ── OCI labels — links package to repo; GHCR inherits repo visibility ─────────
 LABEL org.opencontainers.image.source="https://github.com/zagware/zagware-scanner"
 LABEL org.opencontainers.image.description="Zagware Security Scanner — IaC (KICS) + SCA (Grype) + Secrets (betterleaks) for CI pipelines"
-LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.licenses="Apache-2.0 AND MIT"
 
 ENV ZAGWARE_QUERIES_PATH=/opt/iac-rules/assets/queries
 # The non-root USER below cannot write __pycache__/ next to scanner.py in

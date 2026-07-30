@@ -1,0 +1,47 @@
+Zagware Scanner
+Copyright 2026 Zagware Ltd.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+The distributed Docker image additionally bundles the third-party components
+listed below, each under its own license. Versions and commit pins reflect
+what is currently declared in Dockerfile (the single source of truth --
+re-check there if this file and the Dockerfile ever disagree).
+
+--------------------------------------------------------------------------------
+
+KICS
+  Vendor:    Checkmarx
+  License:   Apache-2.0
+  Source:    https://github.com/Checkmarx/kics
+  Version:   2.1.20 (binary)
+  Query rules: vendored from Checkmarx/kics at commit e1f23cad9640f55b963f22a116b04906b8c16ac6
+               (the commit the v2.1.20 tag pointed to at build time)
+
+Syft
+  Vendor:    Anchore
+  License:   Apache-2.0
+  Source:    https://github.com/anchore/syft
+  Version:   v1.19.0
+  Role:      Generates the SBOM that Grype scans for known vulnerabilities.
+
+Grype
+  Vendor:    Anchore
+  License:   Apache-2.0
+  Source:    https://github.com/anchore/grype
+  Version:   v0.112.0
+
+betterleaks
+  Vendor:    betterleaks
+  License:   MIT
+  Source:    https://github.com/betterleaks/betterleaks
+  Version:   1.7.2
+
+--------------------------------------------------------------------------------
+
+The final runtime image is also built on a `debian:bookworm-slim` base image
+(pinned by digest in Dockerfile), which itself bundles ca-certificates, git,
+and python3 plus their own transitive dependencies under a variety of licenses
+(GPL-2.0, GPL-3.0, LGPL, PSF-2.0, and others). The full composition of the
+published image, including base-image packages, is enumerated in the SPDX
+SBOM attached to each release as an OCI attestation -- see "Supply chain
+security" in README.md for how to inspect it.

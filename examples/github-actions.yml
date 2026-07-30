@@ -9,18 +9,13 @@
 # Optional env vars (add under env: in the step):
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
 #   ZAGWARE_FAIL_ON_NEW     "true" to fail the job on any new finding
-#   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW (default: all)
+#   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW | INFO | TRACE (default: all)
 #   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
 #   ZAGWARE_OUTPUT_DIR      Directory for scan artifacts (default: zagware-scan-results)
 #
-# Artifacts saved to zagware-scan-results/ on every run (uploaded for 30 days):
-#   iac-base.json     KICS findings on base branch
-#   iac-head.json     KICS findings on PR branch
-#   sca-base.json     Grype findings on base branch (normalised)
-#   sca-head.json     Grype findings on PR branch
-#   sca-new.json      Net-new SCA findings introduced by this PR
-#   pr-comment.md     The rendered markdown comment posted to the PR
-#   summary.json      Metadata + per-phase timings (seconds)
+# Artifacts: ten files saved to zagware-scan-results/ on every run (uploaded
+# for 30 days) -- see README's "Scan artifacts" section for the full list
+# (iac-*.json, sca-*.json, secrets-*.json, pr-comment.md, summary.json).
 #
 # Interactive suppression: reviewers can comment `/zagware suppress <id> <reason>`
 # on a PR (copy the id shown in the "📋 Suppress findings" section of the scan
@@ -30,7 +25,9 @@
 # to .zagware/suppressions.yaml on the PR branch. Only PR authors/collaborators
 # (author_association OWNER/MEMBER/COLLABORATOR) can trigger a suppression.
 #
-# Image: ghcr.io/zagware/zagware-scanner
+# Image: ghcr.io/zagware/zagware-scanner:latest (see README's "Image tags and
+#        release channels" -- pin :stable, or better a @sha256:<digest>, once
+#        :stable is published; :latest has no cooling-off period or CVE gate)
 # Source: https://github.com/zagware/zagware-scanner
 # Verify: cosign verify ghcr.io/zagware/zagware-scanner:latest \
 #           --certificate-identity-regexp "^https://github.com/zagware/zagware-scanner/.+$" \

@@ -19,14 +19,16 @@
 # Optional variables:
 #   ZAGWARE_EXCLUDE_PATHS   Comma-separated paths to skip (default: .git)
 #   ZAGWARE_FAIL_ON_NEW     "true" to fail on any new finding
-#   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW (default: all)
+#   ZAGWARE_MIN_SEVERITY    CRITICAL | HIGH | MEDIUM | LOW | INFO | TRACE (default: all)
 #   ZAGWARE_SCA_ENABLED     "false" to disable Grype dependency scanning
 #
-# Artifacts saved to zagware-scan-results/ and published to the pipeline run:
-#   iac-base.json, iac-head.json, sca-base.json, sca-head.json,
-#   sca-new.json, pr-comment.md, summary.json (includes timings)
+# Artifacts: ten files saved to zagware-scan-results/ and published to the
+# pipeline run -- see README's "Scan artifacts" section for the full list
+# (iac-*.json, sca-*.json, secrets-*.json, pr-comment.md, summary.json).
 #
-# Image: ghcr.io/zagware/zagware-scanner
+# Image: ghcr.io/zagware/zagware-scanner:latest (see README's "Image tags and
+#        release channels" -- pin :stable, or better a @sha256:<digest>, once
+#        :stable is published; :latest has no cooling-off period or CVE gate)
 # Source: https://github.com/zagware/zagware-scanner
 
 trigger: none
@@ -39,6 +41,13 @@ pr:
 pool:
   vmImage: ubuntu-latest
 
+# With the Zagware platform: add these two lines to the docker run command
+# below (after -e TF_BUILD, before -v):
+#   -e ZAGWARE_PLATFORM_URL=$(ZAGWARE_PLATFORM_URL) \
+#   -e ZAGWARE_PLATFORM_TOKEN=$(ZAGWARE_PLATFORM_TOKEN) \
+# Both pipeline variables must then be defined -- Azure leaves an undefined
+# $(VAR) macro unexpanded as the literal string rather than empty, so adding
+# these lines without defining the variables sends a garbage URL/token.
 steps:
   - script: |
       docker run --rm \
@@ -53,8 +62,6 @@ steps:
         -e SYSTEM_PULLREQUEST_SOURCEBRANCH \
         -e SYSTEM_PULLREQUEST_PULLREQUESTID \
         -e TF_BUILD \
-        -e ZAGWARE_PLATFORM_URL=$(ZAGWARE_PLATFORM_URL) \
-        -e ZAGWARE_PLATFORM_TOKEN=$(ZAGWARE_PLATFORM_TOKEN) \
         -v "$(Build.SourcesDirectory)/zagware-scan-results:/zagware-scan-results" \
         -e ZAGWARE_OUTPUT_DIR=/zagware-scan-results \
         ghcr.io/zagware/zagware-scanner:latest

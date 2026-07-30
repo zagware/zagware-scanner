@@ -1,0 +1,41 @@
+# GitLab Ultimate — Pipeline Execution Policy for group-wide Zagware enforcement
+# ────────────────────────────────────────────────────────────────────────────
+# Injects the Zagware scanner into every project in a group without touching
+# each project's own .gitlab-ci.yml. Requires GitLab Ultimate.
+#
+# Two files are involved:
+#   1. This file — the policy itself, committed to a *security policy project*
+#      (Secure → Policies → create/link a security policy project, then edit
+#      its .gitlab/security-policies/policy.yml with this content).
+#   2. A CI template file — the actual scanner job, committed to a separate
+#      "CI template project" in the same group. Use examples/gitlab-ci.yml's
+#      `zagware-scanner:` job body as that file's content (referenced below
+#      as zagware-scanner.yml).
+#
+# Full schema reference:
+# https://docs.gitlab.com/user/application_security/policies/pipeline_execution_policies/
+
+---
+pipeline_execution_policy:
+  - name: Zagware security scan (group-enforced)
+    description: >-
+      Injects the Zagware IaC/SCA/Secrets scanner into every pipeline in this
+      group, sourced from a shared CI template so the version/config only
+      needs updating in one place.
+    enabled: true
+    # inject_policy: adds the scanner job alongside each project's own CI
+    # config (project pipelines keep running as-is). Use override_project_ci
+    # instead only if you want this policy to fully replace project pipelines.
+    pipeline_config_strategy: inject_policy
+    content:
+      include:
+        - project: your-group/zagware-ci-templates   # the CI template project (2) above
+          file: zagware-scanner.yml
+          ref: main                                  # optional — defaults to HEAD
+    # Scope to specific projects/groups; omit `policy_scope` entirely to
+    # apply to every project the security policy project is linked to.
+    policy_scope:
+      projects:
+        excluding: []
+    # skip_ci: unset (default) means pipelines with this policy enforced
+    # cannot be skipped with [skip ci] by anyone -- the scan always runs.

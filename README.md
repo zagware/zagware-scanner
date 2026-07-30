@@ -15,8 +15,9 @@ Three scan engines, one container:
 | Engine | What it scans | Detects |
 |---|---|---|
 | **[KICS](https://github.com/Checkmarx/kics)** (Checkmarx, Apache 2.0) | Infrastructure-as-code files (Terraform, Kubernetes, Dockerfile, CloudFormation…) | Misconfigurations, insecure defaults, open ports, missing encryption |
+| **[Syft](https://github.com/anchore/syft)** (Anchore, Apache 2.0) | Package manifests and lockfiles — generates the SBOM Grype scans | Software Bill of Materials (SPDX) |
 | **[Grype](https://github.com/anchore/grype)** (Anchore, Apache 2.0) | Package manifests and lockfiles (npm, pip, Go, Maven, Gem…) | CVEs, GHSA advisories — with CVSS, EPSS, and KEV catalog status |
-| **[betterleaks](https://github.com/betterleaks/betterleaks)** | Filesystem contents (working-tree state) | Leaked credentials — API keys, tokens, private keys, and other secret patterns |
+| **[betterleaks](https://github.com/betterleaks/betterleaks)** (betterleaks, MIT) | Filesystem contents (working-tree state) | Leaked credentials — API keys, tokens, private keys, and other secret patterns |
 
 ---
 
@@ -30,6 +31,33 @@ Three scan engines, one container:
 
 Scan results are optionally uploaded to the [Zagware platform](https://app.zagware.io) for
 historical tracking, trend charts, and suppression management.
+
+---
+
+## Image tags and release channels
+
+| Tag | Description |
+|---|---|
+| `:<version>` (e.g. `:2.2.0`) | Immutable per release. Pin by digest for the strongest guarantee. |
+| `:latest` | Newest release. Moves on every tag push. **Not** security-vetted. |
+| `:stable` | Promoted from `:latest` after a 14-day cooling period, a clean CVE scan, and a signature-verify check. **Not yet published** — no release has completed a full promotion cycle at time of writing. |
+| `:secure` | Identical digest to `:stable`, once `:stable` exists. |
+
+**Recommendation:** once `:stable` exists, pin it (or better, pin by digest — see
+[Pinning to a specific version](#pinning-to-a-specific-version)) for production CI. Until then, pin
+an exact `:<version>` tag for a reproducible build rather than tracking `:latest`, unless you
+specifically want new features immediately and are comfortable with `:latest`'s lack of a
+cooling-off period.
+
+### Promotion workflow
+
+1. A new version is tagged → image builds as `:<version>` and `:latest`
+2. After 14 days, the promotion workflow verifies the image's cosign signature and scans it for
+   CVEs with Grype
+3. If the signature is valid and no HIGH/CRITICAL CVEs are found → `:stable` and `:secure` are
+   re-tagged to the same digest
+4. If CVEs are found → promotion is blocked, a GitHub issue is opened, `:latest` stays
+5. A weekly audit workflow re-scans `:stable` for post-promotion CVE disclosures
 
 ---
 
@@ -86,7 +114,21 @@ jobs:
           ZAGWARE_HEAD_REF:       ${{ steps.pr.outputs.head_ref }}
           ZAGWARE_PLATFORM_URL:   ${{ secrets.ZAGWARE_PLATFORM_URL }}
           ZAGWARE_PLATFORM_TOKEN: ${{ secrets.ZAGWARE_PLATFORM_TOKEN }}
+
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zagware-scan-results-pr${{ github.event.pull_request.number || github.event.issue.number }}
+          path: zagware-scan-results/
+          retention-days: 30
+          if-no-files-found: warn
 ```
+
+> **Security-conscious consumers:** once `:stable` exists (see
+> [Image tags and release channels](#image-tags-and-release-channels)), pin it — or better, pin
+> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. The `:latest` shown
+> above has no cooling-off period or CVE gate.
 
 `GITHUB_TOKEN` is provided automatically by GitHub — no secrets to configure for the scanner itself.
 `ZAGWARE_PLATFORM_URL` and `ZAGWARE_PLATFORM_TOKEN` are optional; omit them to run the scanner
@@ -166,26 +208,42 @@ Add to `.gitlab-ci.yml`:
 
 ```yaml
 zagware-scanner:
+  stage: test
   image: ghcr.io/zagware/zagware-scanner:latest
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   variables:
-    ZAGWARE_PLATFORM_URL:   https://app.zagware.io
+    ZAGWARE_PLATFORM_URL:   $ZAGWARE_PLATFORM_URL
     ZAGWARE_PLATFORM_TOKEN: $ZAGWARE_PLATFORM_TOKEN
   script:
     - zagware-scan
+  artifacts:
+    name: zagware-scan-results-mr$CI_MERGE_REQUEST_IID
+    paths:
+      - zagware-scan-results/
+    expire_in: 30 days
+    when: always
   allow_failure: true
 ```
+
+> **Security-conscious consumers:** once `:stable` exists (see
+> [Image tags and release channels](#image-tags-and-release-channels)), pin it — or better, pin
+> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. The `:latest` shown
+> above has no cooling-off period or CVE gate.
 
 > **To block merges on new findings:** remove `allow_failure: true` or set `ZAGWARE_FAIL_ON_NEW: "true"`.
 
 #### Group-wide enforcement via Pipeline Execution Policy (GitLab Ultimate)
 
-Create a CI template project in your group with a `zagware-scanner.yml` file, then reference it
-from a Pipeline Execution Policy so every project in the group gets the scanner injected without
-touching individual CI files. Set `GITLAB_TOKEN` once at the group level.
+Two files are involved: (1) a **CI template project** in the group, holding a `zagware-scanner.yml`
+file with the same `zagware-scanner:` job body shown above; (2) a **policy** committed to your
+group's security policy project (`.gitlab/security-policies/policy.yml`) that references it via
+`content.include`, so every project in the group gets the scanner injected without touching
+individual `.gitlab-ci.yml` files. Set `GITLAB_TOKEN` once at the group level.
 
-See the [full policy setup guide](examples/gitlab-ci.yml) for the complete YAML.
+See [`examples/gitlab-pipeline-execution-policy.yml`](examples/gitlab-pipeline-execution-policy.yml)
+for the complete policy YAML (file (2) above); it references `examples/gitlab-ci.yml`'s job as
+file (1).
 
 ---
 
@@ -199,11 +257,18 @@ pipelines:
   pull-requests:
     '**':
       - step:
-          name: Zagware Security Scanner
+          name: Zagware Security Scanner (IaC + SCA)
           image: ghcr.io/zagware/zagware-scanner:latest
           script:
             - zagware-scan
+          artifacts:
+            - zagware-scan-results/**
 ```
+
+> **Security-conscious consumers:** once `:stable` exists (see
+> [Image tags and release channels](#image-tags-and-release-channels)), pin it — or better, pin
+> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. The `:latest` shown
+> above has no cooling-off period or CVE gate.
 
 ---
 
@@ -241,14 +306,36 @@ steps:
         -e SYSTEM_PULLREQUEST_SOURCEBRANCH \
         -e SYSTEM_PULLREQUEST_PULLREQUESTID \
         -e TF_BUILD \
-        -e ZAGWARE_PLATFORM_URL=https://app.zagware.io \
-        -e ZAGWARE_PLATFORM_TOKEN=$(ZAGWARE_PLATFORM_TOKEN) \
+        -v "$(Build.SourcesDirectory)/zagware-scan-results:/zagware-scan-results" \
+        -e ZAGWARE_OUTPUT_DIR=/zagware-scan-results \
         ghcr.io/zagware/zagware-scanner:latest
-    displayName: Zagware Security Scanner
+    displayName: Zagware Security Scanner (IaC + SCA)
     env:
       SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-    continueOnError: true
+    continueOnError: true   # remove to gate PRs on the scan result
+
+  - task: PublishBuildArtifacts@1
+    displayName: Publish scan artifacts
+    condition: always()
+    inputs:
+      pathToPublish: zagware-scan-results
+      artifactName: zagware-scan-results-pr$(System.PullRequest.PullRequestId)
 ```
+
+> **With the Zagware platform:** add these two `-e` flags to the `docker run` command above
+> (before the image reference) to enable dashboard upload:
+> ```
+> -e ZAGWARE_PLATFORM_URL=$(ZAGWARE_PLATFORM_URL) \
+> -e ZAGWARE_PLATFORM_TOKEN=$(ZAGWARE_PLATFORM_TOKEN) \
+> ```
+> Azure DevOps leaves an undefined `$(VAR)` macro **unexpanded as the literal string** rather
+> than empty — define both pipeline variables when you add these flags, or the scanner receives
+> a garbage URL/token and attempts (and fails) a platform upload on every run.
+
+> **Security-conscious consumers:** once `:stable` exists (see
+> [Image tags and release channels](#image-tags-and-release-channels)), pin it — or better, pin
+> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. The `:latest` shown
+> above has no cooling-off period or CVE gate.
 
 `BUILD_REPOSITORY_NAME` is required for the `repo_base_url` link in platform uploads — without it the
 scanner still works, but that link is omitted. `SYSTEM_TEAMPROJECT` and repository names containing
@@ -337,7 +424,7 @@ KICS auto-detects file types — no configuration needed.
 
 ---
 
-## Supported dependency ecosystems ([Grype](https://github.com/anchore/grype))
+## Supported dependency ecosystems ([Syft](https://github.com/anchore/syft) + [Grype](https://github.com/anchore/grype))
 
 | Ecosystem | Detected via |
 |---|---|
@@ -381,7 +468,7 @@ the credential is live). Set `ZAGWARE_SECRETS_ENABLED=false` to disable it.
 |---|---|---|
 | `ZAGWARE_PLATFORM_URL` | — | Base URL of the Zagware platform, e.g. `https://app.zagware.io`. No trailing slash. Required for dashboard upload. |
 | `ZAGWARE_PLATFORM_TOKEN` | — | API token (`gtp_…`) from **Settings → API Tokens**. Required for dashboard upload. |
-| `ZAGWARE_MIN_SEVERITY` | all | Minimum severity to report: `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO`. Findings below this level are excluded from both scan and PR comment. |
+| `ZAGWARE_MIN_SEVERITY` | all | Minimum severity to report: `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` `TRACE`. Findings below this level are excluded from both scan and PR comment. |
 | `ZAGWARE_FAIL_ON_NEW` | `false` | Exit 1 when new findings are found at or above `ZAGWARE_MIN_SEVERITY`. Blocks the merge when set to `true`. |
 | `ZAGWARE_EXCLUDE_PATHS` | `.git` | Comma-separated paths or globs to exclude from IaC scanning. |
 | `ZAGWARE_SCA_ENABLED` | `true` | Set `false` to skip Grype dependency scanning entirely. |
@@ -391,6 +478,30 @@ the credential is live). Set `ZAGWARE_SECRETS_ENABLED=false` to disable it.
 | `ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME` | `false` | Set `true` to send your org/repo name in clear instead of a one-way hash. |
 
 ---
+## Scan artifacts
+
+Every run writes ten files to `zagware-scan-results/` (or `ZAGWARE_OUTPUT_DIR` if set), whether
+or not the platform integration is configured:
+
+| File | Contents |
+|---|---|
+| `iac-base.json` | KICS findings on the base branch |
+| `iac-head.json` | KICS findings on the PR branch — `queries[].files[].similarity_id` for suppression ids |
+| `sca-base.json` | Grype findings on the base branch (normalised) |
+| `sca-head.json` | Grype findings on the PR branch |
+| `sca-new.json` | Net-new SCA findings introduced by this PR — `[].similarity_id` for suppression ids |
+| `secrets-base.json` | betterleaks findings on the base branch (rule id, file path, line, tags, validation status — **never** the secret value) |
+| `secrets-head.json` | betterleaks findings on the PR branch |
+| `secrets-new.json` | Net-new Secrets findings introduced by this PR — `[].similarity_id` for suppression ids |
+| `pr-comment.md` | The rendered markdown comment posted to the PR |
+| `summary.json` | Metadata (repo, branches, PR number, repo visibility) plus per-phase timings in seconds |
+
+Each of the four example CI files ([GitHub Actions](examples/github-actions.yml),
+[GitLab CI](examples/gitlab-ci.yml), [Bitbucket Pipelines](examples/bitbucket-pipelines.yml),
+[Azure DevOps](examples/azure-pipelines.yml)) uploads this directory as a pipeline artifact.
+
+---
+
 
 ## How findings are fingerprinted
 
@@ -444,7 +555,7 @@ Every release of `ghcr.io/zagware/zagware-scanner` is built with a verifiable su
 | **betterleaks binary** | SHA256 checksum hardcoded in the Dockerfile and verified at build time; cosign sigstore-bundle signature verified in CI before build |
 | **Our image** | Signed with cosign (keyless, GitHub OIDC → sigstore Rekor transparency log) |
 | **SBOM** | SPDX SBOM generated at build time and attached as an OCI attestation |
-| **Provenance** | SLSA Build Level 3 provenance attestation — links the image digest to this exact source commit and workflow run |
+| **Provenance** | SLSA v1.0 Build **Level 2** provenance attestation (`actions/attest-build-provenance`) — links the image digest to this source commit and workflow run; verifiable with `gh attestation verify` |
 
 ### Why this matters (TeamPCP context)
 
@@ -464,7 +575,9 @@ Our mitigations:
 ### Verify the image you're running
 
 ```bash
-# Verify the image signature (anchored identity to prevent substring matches)
+# Verify the image signature (anchored identity to prevent substring matches).
+# Substitute :stable/:secure or your pinned :<version> once you're using one --
+# :latest is shown here since it's the only channel published so far.
 cosign verify ghcr.io/zagware/zagware-scanner:latest \
   --certificate-identity-regexp "^https://github.com/zagware/zagware-scanner/.+$" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
@@ -575,11 +688,15 @@ Create or edit `.zagware/suppressions.yaml` in your repository:
   reason: "Accepted risk — mitigated by network policy"
 ```
 
-Find the full `similarity_id` in:
+The easiest source is the **📋 Suppress findings** section of the scan comment itself — it lists a
+copy-pasteable id for every current finding on every platform, not just GitHub (only the
+`/zagware suppress` PR-comment shortcut is GitHub-only; the ids themselves are always there).
+Failing that, find the full `similarity_id` in the scan artifacts (see [Scan artifacts](#scan-artifacts)):
 
-1. **Scan artifacts** — `zagware-scan-results/summary.json` (downloaded from the pipeline run)
-2. **Platform** — the findings detail view on `app.zagware.io`
-3. **Raw KICS JSON** — `zagware-scan-results/iac-head.json` → `queries[].files[].similarity_id`
+1. **IaC** — `iac-head.json` → `queries[].files[].similarity_id`
+2. **SCA** — `sca-new.json` → `[].similarity_id`
+3. **Secrets** — `secrets-new.json` → `[].similarity_id`
+4. **Platform** — the findings detail view on `app.zagware.io`
 
 For SCA findings, the `similarity_id` is `sha256(cve_id:package_name:package_version)`. For Secrets
 findings, the `similarity_id` is `sha256(betterleaks_fingerprint)`, where the fingerprint itself is
@@ -629,11 +746,18 @@ env:
 ```
 
 | `ZAGWARE_MIN_SEVERITY` | IaC findings shown | SCA findings shown |
----|---|---|
-| _(unset)_ | All (HIGH, MEDIUM, LOW, INFO) | All (CRITICAL, HIGH, MEDIUM, LOW, NEGLIGIBLE) |
-| `HIGH` | HIGH only | CRITICAL, HIGH |
-| `MEDIUM` | HIGH, MEDIUM | CRITICAL, HIGH, MEDIUM |
-| `LOW` | HIGH, MEDIUM, LOW | CRITICAL, HIGH, MEDIUM, LOW |
+|---|---|---|
+| _(unset)_ | All (CRITICAL, HIGH, MEDIUM, LOW, INFO, TRACE) | All (CRITICAL, HIGH, MEDIUM, LOW, NEGLIGIBLE, UNKNOWN) |
+| `CRITICAL` | CRITICAL only | CRITICAL, UNKNOWN |
+| `HIGH` | CRITICAL, HIGH | CRITICAL, HIGH, UNKNOWN |
+| `MEDIUM` | CRITICAL, HIGH, MEDIUM | CRITICAL, HIGH, MEDIUM, UNKNOWN |
+| `LOW` | CRITICAL, HIGH, MEDIUM, LOW | CRITICAL, HIGH, MEDIUM, LOW, NEGLIGIBLE, UNKNOWN |
+| `INFO` | CRITICAL, HIGH, MEDIUM, LOW, INFO | All (Grype has no INFO/TRACE tier — same as `LOW`) |
+| `TRACE` | All (CRITICAL, HIGH, MEDIUM, LOW, INFO, TRACE) | All (same as `LOW`/`INFO`) |
+
+`UNKNOWN` (a real Grype severity value, not just a missing-key default) is never excluded by
+any threshold — a CVE Grype couldn't classify is always shown, since hiding it could hide
+something critical.
 
 When `ZAGWARE_FAIL_ON_NEW=true`, the scanner exits 1 (breaking CI) if any **new** finding at or
 above the configured threshold is introduced by the PR. This applies to both IaC and SCA findings.
@@ -641,28 +765,6 @@ Existing findings on the base branch are ignored — only net-new findings gate 
 
 Secrets findings are unaffected by `ZAGWARE_MIN_SEVERITY` (betterleaks has no severity taxonomy) —
 see [`ZAGWARE_SECRETS_FAIL_ON_PUBLIC`](#configuration) for the equivalent gate on secrets.
-
----
-
-## Image tags and release channels
-
-| Tag | Description |
----|---|
-| `:<version>` (e.g. `:2.2.0`) | Immutable per release. Pin by digest for the strongest guarantee. |
-| `:latest` | Newest release. Moves on every tag push. **Not** security-vetted. |
-| `:stable` | Promoted from `:latest` after a 14-day cooling period + clean CVE scan. Moves only on promotion. |
-| `:secure` | Identical digest to `:stable`. Explicitly marks the security-audited image. |
-
-**Recommendation:** Pin `:stable` (or `:secure`) by digest for production CI. Use `:latest` for
-experimentation and getting the newest scanner features.
-
-### Promotion workflow
-
-1. A new version is tagged → image builds as `:<version>` and `:latest`
-2. After 14 days, the promotion workflow runs Grype + Trivy against the `:latest` digest
-3. If no HIGH/CRITICAL CVEs are found → `:stable` and `:secure` are re-tagged to the same digest
-4. If CVEs are found → promotion is blocked, a GitHub issue is opened, `:latest` stays
-5. A weekly audit workflow re-scans `:stable` for post-promotion CVE disclosures
 
 ---
 
@@ -729,6 +831,8 @@ Please open an issue before starting significant work so we can discuss approach
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE) for the full text.
+Apache License 2.0 — see [LICENSE](LICENSE) for the full text. Third-party components bundled in
+the Docker image (KICS, Syft, Grype, betterleaks, and the Debian base image) are listed with their
+own vendors, licenses, and pinned versions in [NOTICE](NOTICE).
 
 Copyright 2026 Zagware Ltd.
