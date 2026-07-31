@@ -104,7 +104,32 @@ _MAX_COMMENT   = 60_000
 _FAIL_ON_NEW   = _env_bool("ZAGWARE_FAIL_ON_NEW", False)
 _EXCLUDE_PATHS = os.environ.get("ZAGWARE_EXCLUDE_PATHS", ".git")
 _MIN_SEVERITY  = os.environ.get("ZAGWARE_MIN_SEVERITY", "").upper().strip()
-_OUTPUT_DIR    = os.environ.get("ZAGWARE_OUTPUT_DIR", "zagware-scan-results")
+
+
+def _safe_relative_path(name: str, raw: str, default: str) -> str:
+    """Reject an absolute or traversing value for an operator-supplied path.
+
+    ZAGWARE_OUTPUT_DIR and ZAGWARE_SUPPRESSIONS_FILE are both joined onto a
+    directory and then written to, with no containment check — an absolute
+    path or one containing `..` escaped the intended tree entirely. Falls back
+    to the documented default rather than failing the scan, since neither is
+    security-critical to the scan result itself. See SEC-14.
+    """
+    val = (raw or "").strip()
+    if not val:
+        return default
+    if os.path.isabs(val) or ".." in Path(val).parts:
+        logging.warning(
+            "%s=%r must be a relative path inside the working tree "
+            "(no leading '/' and no '..') — falling back to %r",
+            name, val, default,
+        )
+        return default
+    return val
+
+
+_OUTPUT_DIR    = _safe_relative_path(
+    "ZAGWARE_OUTPUT_DIR", os.environ.get("ZAGWARE_OUTPUT_DIR", ""), "zagware-scan-results")
 # Wall-clock budget for a single KICS invocation (per branch, so a full run
 # allows up to 2x this). Configurable because the failure it guards is
 # size-driven: a large monorepo can legitimately exceed the default, and
@@ -140,13 +165,22 @@ _SCA_MIN_RANK = {
     "CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "TRACE": 4,
     "UNKNOWN": -1,
 }
+# Pre-flight gate for whether SCA is worth running. Widened past the original
+# list because the gate -- not Syft -- was what excluded whole ecosystems: a
+# Kotlin-DSL Gradle project, a Go module without a vendored go.sum, or an
+# Elixir/Flutter/.NET repo got zero dependency scanning with zero indication,
+# even though Syft catalogues all of them. See QUAL-27.
 _SCA_MANIFESTS = [
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-    "go.sum", "Cargo.lock",
-    "requirements.txt", "Pipfile.lock", "poetry.lock",
-    "Gemfile.lock", "pom.xml", "build.gradle",
+    "go.sum", "go.mod", "Cargo.lock",
+    "requirements.txt", "Pipfile.lock", "poetry.lock", "uv.lock",
+    "Gemfile.lock", "pom.xml", "build.gradle", "build.gradle.kts",
     "composer.lock", "packages.lock.json",
+    "mix.lock", "Podfile.lock", "pubspec.lock",
 ]
+# Globbed separately -- .NET project files are named after the project, so
+# there is no fixed filename to match.
+_SCA_MANIFEST_GLOBS = ["*.csproj", "*.fsproj", "*.vbproj"]
 
 # ── Secrets (betterleaks) constants ────────────────────────────────────────────
 _SECRETS_ENABLED = _env_bool("ZAGWARE_SECRETS_ENABLED", True)
@@ -378,8 +412,12 @@ def track_scan_failed(platform_name: str, repo: str, stage: str) -> None:
 
 
 def track_suppression_applied(platform_name: str, repo: str, count: int) -> None:
+    # Bucketed like every other finding count. The exact number of
+    # suppressions is a per-repo security-posture detail; every other count in
+    # this module is coarsened before transmission and this one was the
+    # outlier. See SEC-13.
     distinct_id, props = _telemetry_identity(platform_name, repo)
-    props.update({"count": count, "_distinct_id": distinct_id})
+    props.update({"count_bucket": _bucket_count(count), "_distinct_id": distinct_id})
     _send_telemetry_event("suppression_applied", props)
 
 
@@ -668,7 +706,10 @@ class GitHub(Platform):
         while not existing_id:
             comments = _http("GET", f"{api}/issues/{pr}/comments?per_page=100&page={page}",
                              headers=self._headers())
-            assert isinstance(comments, list)
+            if not isinstance(comments, list):
+                raise RuntimeError(
+                    f"Unexpected {self.name()} API response shape: "
+                    f"{type(comments).__name__}: {str(comments)[:200]}")
             for c in comments:
                 if _COMMENT_MARKER in c.get("body", ""):
                     existing_id = c["id"]
@@ -722,7 +763,10 @@ class GitHub(Platform):
         try:
             owner, repo = self._repo.split("/", 1)
             data = _http("GET", f"https://api.github.com/repos/{owner}/{repo}", headers=self._headers())
-            assert isinstance(data, dict)
+            if not isinstance(data, dict):
+                raise RuntimeError(
+                    f"Unexpected {self.name()} API response shape: "
+                    f"{type(data).__name__}: {str(data)[:200]}")
             return "private" if data.get("private") else "public"
         except Exception as exc:
             log.warning("Could not determine repo visibility: %s", exc)
@@ -831,7 +875,10 @@ class GitLab(Platform):
         page = 1
         while not existing_id:
             notes = _http("GET", f"{api}?per_page=100&page={page}", headers=self._headers())
-            assert isinstance(notes, list)
+            if not isinstance(notes, list):
+                raise RuntimeError(
+                    f"Unexpected {self.name()} API response shape: "
+                    f"{type(notes).__name__}: {str(notes)[:200]}")
             for n in notes:
                 if _COMMENT_MARKER in n.get("body", ""):
                     existing_id = n["id"]
@@ -926,7 +973,10 @@ class Bitbucket(Platform):
         try:
             api = f"https://api.bitbucket.org/2.0/repositories/{self._workspace}/{self._slug}"
             data = _http("GET", api, headers=self._headers())
-            assert isinstance(data, dict)
+            if not isinstance(data, dict):
+                raise RuntimeError(
+                    f"Unexpected {self.name()} API response shape: "
+                    f"{type(data).__name__}: {str(data)[:200]}")
             return "private" if data.get("is_private") else "public"
         except Exception as exc:
             log.warning("Could not determine repo visibility: %s", exc)
@@ -964,7 +1014,10 @@ class Bitbucket(Platform):
         url = f"{api}?pagelen=100"
         while url and not existing:
             data = _http("GET", url, headers=self._headers())
-            assert isinstance(data, dict)
+            if not isinstance(data, dict):
+                raise RuntimeError(
+                    f"Unexpected {self.name()} API response shape: "
+                    f"{type(data).__name__}: {str(data)[:200]}")
             for c in data.get("values", []):
                 if _BB_COMMENT_MARKER in c.get("content", {}).get("raw", ""):
                     existing = c["id"]
@@ -1051,7 +1104,10 @@ class AzureDevOps(Platform):
         try:
             api = f"{self._org_url}/_apis/projects/{urllib.parse.quote(self._project, safe='')}?api-version=7.1"
             data = _http("GET", api, headers=self._headers())
-            assert isinstance(data, dict)
+            if not isinstance(data, dict):
+                raise RuntimeError(
+                    f"Unexpected {self.name()} API response shape: "
+                    f"{type(data).__name__}: {str(data)[:200]}")
             vis = (data.get("visibility") or "").strip().lower()
             return vis if vis in ("public", "private") else "unknown"
         except Exception as exc:
@@ -1079,7 +1135,10 @@ class AzureDevOps(Platform):
         ver = "?api-version=7.1"
 
         threads = _http("GET", f"{api}/threads{ver}", headers=self._headers())
-        assert isinstance(threads, dict)
+        if not isinstance(threads, dict):
+            raise RuntimeError(
+                f"Unexpected {self.name()} API response shape: "
+                f"{type(threads).__name__}: {str(threads)[:200]}")
 
         existing_thread: int | None = None
         existing_comment: int | None = None
@@ -1210,13 +1269,21 @@ def _split_credential(url: str) -> tuple[str, dict[str, str]]:
     }
 
 
-def _git(args: list[str], cwd: str | None = None, env: dict[str, str] | None = None) -> None:
+_GIT_TIMEOUT = 300  # seconds — _git was the only subprocess wrapper without one
+
+
+def _git(args: list[str], cwd: str | None = None, env: dict[str, str] | None = None,
+         timeout: int = _GIT_TIMEOUT) -> None:
+    """Run git, bounded. Every other subprocess in this module has a timeout;
+    _git did not, so an unresponsive remote during clone/fetch/push hung the
+    pipeline until the CI platform's own global job timeout. See SEC-12."""
     result = subprocess.run(
         ["git"] + args,
         cwd=cwd,
         capture_output=True,
         text=True,
         env={**os.environ, **env} if env else None,
+        timeout=timeout,
     )
     if result.returncode != 0:
         raise subprocess.CalledProcessError(
@@ -1227,8 +1294,10 @@ def _git(args: list[str], cwd: str | None = None, env: dict[str, str] | None = N
 def clone_branch(url: str, branch: str, dest: str) -> None:
     """Shallow-clone a single branch with a credential-free argv. See SEC-07."""
     clean, auth_env = _split_credential(url)
+    # `--` terminates option parsing: a ref taken from the environment must
+    # never be able to start with `-` and be read as a git flag. See SEC-16.
     _git(["clone", "--depth=1", "--quiet", "--no-tags",
-          "--branch", branch, clean, dest], env=auth_env)
+          "--branch", branch, "--", clean, dest], env=auth_env)
 
 
 def clone_and_checkout_sha(url: str, base_branch: str, ref: str, dest: str) -> None:
@@ -1244,9 +1313,9 @@ def clone_and_checkout_sha(url: str, base_branch: str, ref: str, dest: str) -> N
     the same out-of-band env is reapplied. See QUAL-13 and SEC-07."""
     clean, auth_env = _split_credential(url)
     _git(["clone", "--depth=1", "--quiet", "--no-tags",
-          "--branch", base_branch, clean, dest], env=auth_env)
-    _git(["fetch", "--depth=1", "origin", ref], cwd=dest, env=auth_env)
-    _git(["checkout", "--quiet", "FETCH_HEAD"], cwd=dest)
+          "--branch", base_branch, "--", clean, dest], env=auth_env)
+    _git(["fetch", "--depth=1", "origin", "--", ref], cwd=dest, env=auth_env)
+    _git(["checkout", "--quiet", "--detach", "FETCH_HEAD"], cwd=dest)
 
 
 # ── Scan ───────────────────────────────────────────────────────────────────────
@@ -1391,16 +1460,20 @@ def _exclude_globs() -> list[str]:
 def _has_sca_manifests(path: str) -> bool:
     """True when at least one dependency manifest exists outside the excluded
     paths. Previously rglob'd the whole tree including .git and any path the
-    operator excluded, so a vendored tree alone could switch SCA on. See
-    QUAL-10."""
+    operator excluded, so a vendored tree alone could switch SCA on (QUAL-10),
+    and matched only exact filenames so .NET projects never qualified
+    (QUAL-27)."""
     p = Path(path)
     excluded = [e for e in _scan_exclude_paths().split(",") if e]
-    for m in _SCA_MANIFESTS:
-        for hit in p.rglob(m):
-            rel = hit.relative_to(p).as_posix()
-            if any(rel == e or rel.startswith(e.rstrip("/") + "/") for e in excluded):
-                continue
-            return True
+
+    def _in_scope(hit: Path) -> bool:
+        rel = hit.relative_to(p).as_posix()
+        return not any(rel == e or rel.startswith(e.rstrip("/") + "/") for e in excluded)
+
+    for pattern in _SCA_MANIFESTS + _SCA_MANIFEST_GLOBS:
+        for hit in p.rglob(pattern):
+            if _in_scope(hit):
+                return True
     return False
 
 
@@ -1426,14 +1499,22 @@ def _run_syft(path: str, sbom_out: str) -> bool:
 
 def _run_grype(sbom_path: str, grype_out: str) -> bool:
     try:
+        # --file writes straight to disk. Capturing the whole report as a
+        # Python str and re-encoding it on write held roughly three copies of
+        # a report that scales with the dependency count of an
+        # attacker-supplied lockfile. See SEC-11.
         r = subprocess.run(
-            [_GRYPE_BIN, f"sbom:{sbom_path}", "-o", "json", "--quiet"],
+            [_GRYPE_BIN, f"sbom:{sbom_path}", "-o", "json", "--file", grype_out, "--quiet"],
             capture_output=True, text=True, timeout=180,
         )
         if r.returncode != 0:
             log.warning("Grype exited %d: %s", r.returncode, (r.stderr or r.stdout or "").strip()[:400])
-        # Accept stdout output even on non-zero exit — Grype may emit warnings
-        # as errors but still produce valid JSON with vulnerability matches.
+        # Accept the file even on non-zero exit — Grype may emit warnings as
+        # errors but still produce a valid report.
+        if Path(grype_out).exists() and Path(grype_out).stat().st_size > 0:
+            return True
+        # Older Grype builds ignore --file and still use stdout; fall back so a
+        # version bump cannot silently break SCA.
         if r.stdout:
             Path(grype_out).write_text(r.stdout)
             return True
@@ -1484,15 +1565,45 @@ def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
             pkg_ver  = artifact.get("version", "")
             if not vuln_id or not pkg_name:
                 continue
+            # `is not None`, not truthiness: a genuine baseScore of 0.0 is
+            # falsy, so the old `or` chain fell through to a key Grype does
+            # not emit and yielded None, dropping the score entirely. See
+            # QUAL-25.
             cvss = None
             for c in vuln.get("cvss", []):
-                b = c.get("metrics", {}).get("baseScore") or c.get("metrics", {}).get("base_score")
+                metrics = c.get("metrics", {})
+                b = metrics.get("baseScore")
+                if b is None:
+                    b = metrics.get("base_score")
                 if b is not None:
                     try:
                         cvss = float(b)
                     except (TypeError, ValueError):
                         pass
                     break
+            # For OS distro packages Grype puts CVSS and description on
+            # relatedVulnerabilities rather than the primary vulnerability, so
+            # the column was empty for exactly the ecosystem that produces the
+            # most rows. Prefer a CVE- entry when falling back. See QUAL-25.
+            if cvss is None:
+                related = sorted(
+                    match.get("relatedVulnerabilities") or [],
+                    key=lambda r: not str(r.get("id", "")).startswith("CVE-"),
+                )
+                for rel in related:
+                    for c in rel.get("cvss", []):
+                        metrics = c.get("metrics", {})
+                        b = metrics.get("baseScore")
+                        if b is None:
+                            b = metrics.get("base_score")
+                        if b is not None:
+                            try:
+                                cvss = float(b)
+                            except (TypeError, ValueError):
+                                pass
+                            break
+                    if cvss is not None:
+                        break
             epss_list = vuln.get("epss", [])
             epss = None
             if epss_list:
@@ -2029,7 +2140,10 @@ def _redact_kics_results(results: dict) -> dict:
 
 # ── Suppressions ──────────────────────────────────────────────────────────────
 
-_SUPPRESSIONS_PATH = os.environ.get("ZAGWARE_SUPPRESSIONS_FILE", ".zagware/suppressions.yaml")
+_SUPPRESSIONS_PATH = _safe_relative_path(
+    "ZAGWARE_SUPPRESSIONS_FILE",
+    os.environ.get("ZAGWARE_SUPPRESSIONS_FILE", ""),
+    ".zagware/suppressions.yaml")
 
 _MAX_SUPPRESSIONS_FILE_SIZE = 1024 * 1024  # 1 MiB — bounds the read regardless of
                                             # what a hostile symlink target points at
@@ -2474,7 +2588,11 @@ def render_sca_section(
                 vuln_id  = _cell(f.get("vulnerability_id", ""), 60)
                 cve_cell = f"[{vuln_id}]({vuln_url})" if vuln_url else vuln_id
                 fix = ", ".join(f["fix_versions"]) or f["fix_state"]
-                cvss = f"{f['cvss_score']:.1f}" if f.get("cvss_score") else "—"
+                # `if f.get(...)` treated a genuine CVSS of 0.0 as absent and
+                # rendered an em-dash, making an informational advisory look
+                # unscored. The parse layer preserves 0.0 (QUAL-25); this is the
+                # second place the same falsy test threw it away.
+                cvss = "—" if f.get("cvss_score") is None else f"{f['cvss_score']:.1f}"
                 kev  = "🔴 Yes" if f.get("kev_listed") else "No"
                 # package_name/version/type all come from a lockfile the PR
                 # controls, so they are sanitised like any other PR input.
@@ -2571,6 +2689,48 @@ def render_secrets_section(
         "then remove it from the code.",
     ]
     return "\n".join(L)
+
+
+def _truncate_comment(comment: str, limit: int = _MAX_COMMENT) -> str:
+    """Trim *comment* to *limit* at a line boundary, closing any open block.
+
+    The previous blind character slice landed mid-table-row (leaving a partial
+    `| \\`file.tf\\` | 42 |`) and, on the collapsible platforms, almost always
+    inside an open <details> — so the truncation note and the attribution
+    footer rendered *inside* the collapsed section where a reviewer never sees
+    them. The result read as corruption rather than truncation.
+
+    Whole lines are dropped from the end until the budget is met, any
+    unbalanced <details> is closed, and the note is appended AFTER the close so
+    it is always visible. The comment-identity marker is the first line and is
+    therefore never at risk (see QUAL-05). See QUAL-28.
+    """
+    if len(comment) <= limit:
+        return comment
+
+    note = "\n\n> ⚠️ _Comment truncated — run locally for full output._"
+    budget = limit - len(note)
+
+    _CLOSE = "</details>"
+    lines = comment.split("\n")
+    kept: list[str] = []
+    size = 0
+    depth = 0
+    for line in lines:
+        stripped = line.strip()
+        after = depth + (stripped == "<details>") - (stripped == _CLOSE)
+        # Room for this line AND for the closers its nesting would oblige us to
+        # append — otherwise the tags we add to balance the cut push the result
+        # back over the platform's hard limit and the post is rejected.
+        add = len(line) + (1 if kept else 0)
+        if size + add + max(0, after) * (len(_CLOSE) + 1) > budget:
+            break
+        kept.append(line)
+        size += add
+        depth = after
+
+    kept.extend([_CLOSE] * max(0, depth))
+    return "\n".join(kept) + note
 
 
 def render_suppression_hints(
@@ -2919,6 +3079,7 @@ def _write_artifacts(
     comment: str,
     base_results: dict,
     pr_results: dict,
+    novel_iac: list[dict],
     base_sca: list[dict] | None,
     head_sca: list[dict] | None,
     novel_sca: list[dict],
@@ -2933,28 +3094,35 @@ def _write_artifacts(
         d = Path(out_dir)
         d.mkdir(parents=True, exist_ok=True)
 
+        # Compact separators, no indent: these dumps scale with the dependency
+        # and finding count of an attacker-supplied tree, and indent=2 roughly
+        # doubled the serialised copy held in memory before the write. The
+        # files stay valid JSON and every documented jq path still works.
+        # See SEC-11.
+        _J = {"ensure_ascii": False, "separators": (",", ":")}
+
         # IaC findings (redacted KICS JSON — actual_value masked to prevent secret leakage)
         (d / "iac-base.json").write_text(
-            json.dumps(_redact_kics_results(base_results), indent=2, ensure_ascii=False), encoding="utf-8")
+            json.dumps(_redact_kics_results(base_results), **_J), encoding="utf-8")
         (d / "iac-head.json").write_text(
-            json.dumps(_redact_kics_results(pr_results),  indent=2, ensure_ascii=False), encoding="utf-8")
+            json.dumps(_redact_kics_results(pr_results), **_J), encoding="utf-8")
+        # iac-new.json was listed by no file and written by no code, while its
+        # SCA and Secrets counterparts both existed — so the one category whose
+        # ids the comment tells users to look up had no net-new artifact at
+        # all. See QUAL-22.
+        (d / "iac-new.json").write_text(
+            json.dumps(_redact_kics_results({"queries": novel_iac}), **_J), encoding="utf-8")
 
         # SCA findings (normalized Grype output)
-        (d / "sca-base.json").write_text(
-            json.dumps(base_sca or [], indent=2, ensure_ascii=False), encoding="utf-8")
-        (d / "sca-head.json").write_text(
-            json.dumps(head_sca or [], indent=2, ensure_ascii=False), encoding="utf-8")
-        (d / "sca-new.json").write_text(
-            json.dumps(novel_sca, indent=2, ensure_ascii=False), encoding="utf-8")
+        (d / "sca-base.json").write_text(json.dumps(base_sca or [], **_J), encoding="utf-8")
+        (d / "sca-head.json").write_text(json.dumps(head_sca or [], **_J), encoding="utf-8")
+        (d / "sca-new.json").write_text(json.dumps(novel_sca, **_J), encoding="utf-8")
 
         # Secrets findings (redaction unnecessary — run_secrets_scan() never carries
         # the raw secret value in the first place, only rule_id/file_path/line/tags)
-        (d / "secrets-base.json").write_text(
-            json.dumps(base_secrets or [], indent=2, ensure_ascii=False), encoding="utf-8")
-        (d / "secrets-head.json").write_text(
-            json.dumps(head_secrets or [], indent=2, ensure_ascii=False), encoding="utf-8")
-        (d / "secrets-new.json").write_text(
-            json.dumps(novel_secrets, indent=2, ensure_ascii=False), encoding="utf-8")
+        (d / "secrets-base.json").write_text(json.dumps(base_secrets or [], **_J), encoding="utf-8")
+        (d / "secrets-head.json").write_text(json.dumps(head_secrets or [], **_J), encoding="utf-8")
+        (d / "secrets-new.json").write_text(json.dumps(novel_secrets, **_J), encoding="utf-8")
 
         # Rendered PR comment (markdown)
         (d / "pr-comment.md").write_text(comment, encoding="utf-8")
@@ -3338,10 +3506,13 @@ def main() -> int:
         # _BB_COMMENT_MARKER as the FIRST line for non-collapsible platforms,
         # so it survives the truncation below. See QUAL-05.)
 
-        # Truncate the combined comment (IaC + SCA + Secrets) to platform limit
-        if len(comment) > _MAX_COMMENT:
-            note = "\n\n> ⚠️ _Comment truncated — run locally for full output._"
-            comment = comment[: _MAX_COMMENT - len(note)] + note
+        # Truncate at a LINE boundary, not mid-character-slice, and close any
+        # <details> the cut left open. A blind slice landed mid-table-row and
+        # usually inside a collapsed section, so the truncation note and the
+        # attribution footer rendered *inside* it where a reviewer never sees
+        # them -- the comment looked corrupted rather than truncated. The
+        # marker is the first line and is never dropped (QUAL-05). See QUAL-28.
+        comment = _truncate_comment(comment)
 
         # ── Save artifacts ────────────────────────────────────────────────────
         timings["total"] = time.perf_counter() - t_start
@@ -3363,7 +3534,7 @@ def main() -> int:
         }
         _write_artifacts(
             _OUTPUT_DIR, comment,
-            base_results, pr_results,
+            base_results, pr_results, novel,
             base_sca, head_sca, novel_sca,
             base_secrets, head_secrets, novel_secrets,
             timings, meta,
@@ -3411,9 +3582,10 @@ def main() -> int:
     # "unknown" visibility is treated the same as "public" (fail closed) unless the
     # operator explicitly opts out via ZAGWARE_ASSUME_PRIVATE — a transient API
     # error or missing permission must not silently disable this guarantee. See
-    # QUAL-02. (This elif is independent of the ZAGWARE_FAIL_ON_NEW warning above
-    # so both reasons are visible when a public/unknown repo also has new IaC/SCA
-    # findings — see QUAL-29.)
+    # QUAL-02. Both gates are reported independently below so an operator sees
+    # every reason at once, rather than fixing the credential and then hitting
+    # a second red build for IaC findings that were never mentioned — see
+    # QUAL-29.
     _, reason = _secrets_public_gate(repo_visibility, bool(novel_secrets))
     if reason == "public":
         exit_code = 1
@@ -3429,7 +3601,12 @@ def main() -> int:
 
     track_scan_completed(
         platform.name(), platform.repo(), timings.get("total", 0.0),
-        new_count, len(novel_sca), True, (base_sca is not None or head_sca is not None),
+        # iac_scanned was the literal True, making the telemetry field a
+        # constant. It is only meaningfully true once run_scan has returned
+        # results for both sides, which is what this expresses. See QUAL-22.
+        new_count, len(novel_sca),
+        (base_results is not None and pr_results is not None),
+        (base_sca is not None or head_sca is not None),
         bool(suppressed_ids), exit_code,
         secrets_new=len(novel_secrets), secrets_scanned=(base_secrets is not None or head_secrets is not None),
     )
