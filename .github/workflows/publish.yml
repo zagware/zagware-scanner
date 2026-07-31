@@ -1,7 +1,15 @@
 # Builds, signs, and pushes ghcr.io/zagware/zagware-scanner on every version tag.
-# Uses GITHUB_TOKEN (packages: write) for GHCR -- GH_PAT_PACKAGES was only
-# ever needed to create the package under the org namespace the first time;
-# the package exists now, so the built-in token suffices. See SUP-11.
+# GHCR login uses GH_PAT_PACKAGES (classic PAT, write:packages). Do NOT swap it
+# for GITHUB_TOKEN. That has now failed twice: b76e386 reverted it the first
+# time, and SUP-11 in the 2026-07-30 audit re-applied the same "the package
+# already exists, so the built-in token suffices" reasoning without being able
+# to test it -- this path only runs on a tag push. Run 30624766058 died at
+# `denied: permission_denied: write_package` with `packages: write` correctly
+# set on the job, because that permission governs the TOKEN, not the PACKAGE:
+# an org-owned GHCR package created by a PAT does not grant its repository
+# write access until someone adds the repo under the package's Actions-access
+# settings. Do that in the org UI and GITHUB_TOKEN becomes viable; until then
+# the PAT is load-bearing.
 #
 # Supply chain guarantees:
 #   1. Syft, Grype, and Betterleaks cosign signatures verified BEFORE the Docker build
@@ -215,7 +223,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GH_PAT_PACKAGES }}
 
       - name: Set image tag
         id: tag
