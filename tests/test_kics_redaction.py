@@ -15,6 +15,13 @@ from __future__ import annotations
 
 import scanner
 
+# Assembled at runtime, never written as a literal. This repository is a secret
+# scanner: an AWS-key-shaped string committed here trips GitHub push protection
+# on our own pushes, and would fire on every customer who clones us. The value
+# still matches the scanner's `AKIA[0-9A-Z]{16}` pattern, which is the point of
+# the fixture.
+AWS_KEY_SHAPED = "AKIA" + "Q" * 16
+
 
 class TestRedactValueCategoryMatching:
     def test_secret_management_category_is_fully_redacted(self):
@@ -44,7 +51,7 @@ class TestRedactValueCategoryMatching:
     def test_pattern_pass_still_catches_secret_shaped_values_in_any_category(self):
         """Defense in depth: even in a non-secret category, a value that
         matches one of the five secret-shaped regexes is still redacted."""
-        assert scanner._redact_value(("AKIA" + "Q" * 16), "Best Practices") == "***REDACTED***"
+        assert scanner._redact_value(AWS_KEY_SHAPED, "Best Practices") == "***REDACTED***"
         assert scanner._redact_value("password: hunter2", "Access Control") == "***REDACTED***"
 
     def test_non_secret_shaped_value_in_secret_management_is_still_redacted(self):
@@ -83,7 +90,7 @@ class TestRedactKicsResults:
 
     def test_expected_value_still_redacted_if_pattern_matches(self):
         redacted = scanner._redact_kics_results(
-            self._kics_result(category="Best Practices", expected=("AKIA" + "Q" * 16))
+            self._kics_result(category="Best Practices", expected=AWS_KEY_SHAPED)
         )
         assert redacted["queries"][0]["files"][0]["expected_value"] == "***REDACTED***"
 
