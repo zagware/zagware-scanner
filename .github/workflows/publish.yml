@@ -1,15 +1,18 @@
 # Builds, signs, and pushes ghcr.io/zagware/zagware-scanner on every version tag.
-# GHCR login uses GH_PAT_PACKAGES (classic PAT, write:packages). Do NOT swap it
-# for GITHUB_TOKEN. That has now failed twice: b76e386 reverted it the first
-# time, and SUP-11 in the 2026-07-30 audit re-applied the same "the package
-# already exists, so the built-in token suffices" reasoning without being able
-# to test it -- this path only runs on a tag push. Run 30624766058 died at
-# `denied: permission_denied: write_package` with `packages: write` correctly
-# set on the job, because that permission governs the TOKEN, not the PACKAGE:
-# an org-owned GHCR package created by a PAT does not grant its repository
-# write access until someone adds the repo under the package's Actions-access
-# settings. Do that in the org UI and GITHUB_TOKEN becomes viable; until then
-# the PAT is load-bearing.
+# GHCR login uses GITHUB_TOKEN. This works ONLY because the zagware-scanner
+# repository has been granted Write under the container package's
+# Actions-access settings (done 2026-07-31). That grant is the real
+# precondition, and it lives in org settings, not in this file -- if it is ever
+# revoked, pushes fail with `denied: permission_denied: write_package` even
+# though the job below correctly declares `packages: write`, because that
+# permission governs the TOKEN, not the PACKAGE.
+#
+# History, so nobody re-litigates this from first principles: GITHUB_TOKEN was
+# tried and reverted in b76e386 ("can't push to the org namespace"), then
+# re-applied by SUP-11 in the 2026-07-30 audit on the untested assumption that
+# an existing package was sufficient -- run 30624766058 disproved that. The
+# repo-level grant is what changed; the assumption was still wrong.
+# Fall back to secrets.GH_PAT_PACKAGES (classic PAT, write:packages) if needed.
 #
 # Supply chain guarantees:
 #   1. Syft, Grype, and Betterleaks cosign signatures verified BEFORE the Docker build
@@ -223,7 +226,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GH_PAT_PACKAGES }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set image tag
         id: tag

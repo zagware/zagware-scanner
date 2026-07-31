@@ -42,18 +42,17 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      # Re-tagging :latest -> :stable is a registry WRITE and needs the same
-      # PAT the publish workflow uses. This has never been exercised -- every
-      # scheduled run so far skipped on the cooling-period gate, so :stable
-      # does not yet exist -- but it would have failed with
-      # `denied: permission_denied: write_package` the first time it fired.
-      # See the header of publish.yml for why GITHUB_TOKEN cannot do this.
+      # Re-tagging :latest -> :stable is a registry WRITE, so it depends on the
+      # same repo-level Write grant on the container package that publish.yml
+      # documents. This path has still never actually run: every scheduled run
+      # so far skipped on the cooling-period gate, and :stable does not yet
+      # exist. The first real promotion is what proves it.
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GH_PAT_PACKAGES }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Resolve latest tag digest and age
         id: latest
