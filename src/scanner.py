@@ -2405,7 +2405,10 @@ def render_comment(
     sev_counts: dict[str, int] = {}
     for q in novel:
         s = q.get("severity", "UNKNOWN")
-        sev_counts[s] = sev_counts.get(s, 0) + len(q["files"])
+        # .get here too — the counting loops run before the render loop, so a
+        # partial KICS query crashed the comment before the row-level guard
+        # below could degrade it. See QUAL-23.
+        sev_counts[s] = sev_counts.get(s, 0) + len(q.get("files", []))
 
     # On GitHub/GitLab/Azure the marker is a hidden HTML comment; on Bitbucket
     # (which strips HTML comments) it is an invisible CommonMark link-reference
@@ -2460,7 +2463,7 @@ def render_comment(
             qs = [q for q in novel if q.get("severity", "UNKNOWN") == sev]
             if not qs:
                 continue
-            count = sum(len(q["files"]) for q in qs)
+            count = sum(len(q.get("files", [])) for q in qs)
             emoji = _SEVERITY_EMOJI.get(sev, "❓")
 
             # Section header — collapsible on GitHub/GitLab, plain heading on Bitbucket
@@ -2476,14 +2479,19 @@ def render_comment(
                 ref = (f" &nbsp;·&nbsp; [Reference]({q['query_url']})"
                        if q.get("query_url") else "")
                 L += [
-                    f"#### {q['query_name']}",
+                    # .get, not q["query_name"]: every other consumer of this
+                    # same data already uses .get, and a KICS report missing the
+                    # key took down the whole run with a KeyError rather than
+                    # degrading one row. Newlines would break the heading out of
+                    # its own block. See QUAL-23.
+                    f"#### {str(q.get('query_name', 'Unnamed query')).replace(chr(10), ' ')}",
                     f"> {q.get('description', '')}",
                     f"> `{q.get('category', '')}` &nbsp;·&nbsp; `{q.get('platform', '')}`{cwe}{ref}",
                     "",
                     "| File | Line | Resource | Issue | Expected | Actual |",
                     "|------|-----:|----------|-------|----------|--------|",
                 ]
-                for f in q["files"]:
+                for f in q.get("files", []):
                     # Every cell below is routed through _cell: file_name and
                     # resource_name come straight from the PR's own tree, and
                     # issue_type can embed resource-derived text. See SEC-06.

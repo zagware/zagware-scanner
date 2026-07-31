@@ -548,6 +548,8 @@ it is never silently misread as the opposite of what you intended.
 | `ZAGWARE_QUERIES_PATH` | `/opt/iac-rules/assets/queries` | Path to the KICS query rules tree inside the image. Only relevant for [self-hosted](#self-hosting) builds shipping a custom or additional rules bundle. |
 | `ZAGWARE_TELEMETRY` | _(on)_ | Set `off` to disable anonymous usage telemetry. See [Telemetry](#telemetry). |
 | `ZAGWARE_TELEMETRY_INCLUDE_REPO_NAME` | `false` | Set `true` to send your org/repo name in clear instead of a one-way hash. |
+| `ZAGWARE_ASSUME_PRIVATE` | `false` | Set `true` to treat a repository whose visibility cannot be determined as **private**. By default an undeterminable visibility is treated as public, so `ZAGWARE_SECRETS_FAIL_ON_PUBLIC` still fires — a missing API permission must not silently disable that gate. Set this only where visibility can never be resolved, e.g. air-gapped installs. |
+| `ZAGWARE_SUPPRESS_ALLOWED_ASSOCIATIONS` | `OWNER,MEMBER,COLLABORATOR` | Comma-separated GitHub author associations permitted to issue `/zagware suppress` commands. Comments from anyone else are ignored. Widening this lets outside contributors suppress findings on their own pull requests. |
 
 ### Platform inputs
 
@@ -573,6 +575,10 @@ from their own native CI variables instead.
 |---|---|---|
 | `ZAGWARE_DEBUG` | `false` | Set `true` for debug-level log output — the most useful first step when a scan behaves unexpectedly. |
 | `ZAGWARE_SCAN_TIMEOUT` | `600` | Seconds allowed for a single KICS invocation, per branch (so a full run allows up to 2×). Raise it for large monorepos — exceeding it is reported as an explicit scanner failure, not as "no findings". |
+| `ZAGWARE_SCANNER_BIN` | `/usr/local/bin/kics` | Path to the KICS binary. Override only in a [self-hosted](#self-hosting) build. |
+| `ZAGWARE_SYFT_BIN` | `/usr/bin/syft` | Path to the Syft binary (SBOM generation). Override only in a self-hosted build. |
+| `ZAGWARE_GRYPE_BIN` | `/usr/bin/grype` | Path to the Grype binary (dependency vulnerabilities). Override only in a self-hosted build. |
+| `ZAGWARE_SECRETS_BIN` | `/usr/local/bin/betterleaks` | Path to the betterleaks binary (secrets). Override only in a self-hosted build. |
 
 **Exit codes:** `0` = clean, `1` = a policy gate fired (`ZAGWARE_FAIL_ON_NEW`, public-repo
 secrets) or a scan failed, `2` = the scanner itself crashed. `2` is deliberately distinct so a
@@ -581,13 +587,14 @@ broken tool is never mistaken for a PR that legitimately has findings.
 ---
 ## Scan artifacts
 
-Every run writes ten files to `zagware-scan-results/` (or `ZAGWARE_OUTPUT_DIR` if set), whether
+Every run writes eleven files to `zagware-scan-results/` (or `ZAGWARE_OUTPUT_DIR` if set), whether
 or not the platform integration is configured:
 
 | File | Contents |
 |---|---|
 | `iac-base.json` | KICS findings on the base branch |
 | `iac-head.json` | KICS findings on the PR branch — `queries[].files[].similarity_id` for suppression ids |
+| `iac-new.json` | Net-new IaC findings introduced by this PR — `queries[].files[].similarity_id` for suppression ids |
 | `sca-base.json` | Grype findings on the base branch (normalised) |
 | `sca-head.json` | Grype findings on the PR branch |
 | `sca-new.json` | Net-new SCA findings introduced by this PR — `[].similarity_id` for suppression ids |

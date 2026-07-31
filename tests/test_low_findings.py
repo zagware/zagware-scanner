@@ -14,6 +14,7 @@ QUAL-29 both exit-gate reasons are reported, not just the first
 """
 
 import importlib
+import re
 import json
 import subprocess
 import sys
@@ -366,3 +367,56 @@ class TestBothExitReasonsAreReported:
         should_fail, reason = scanner._secrets_public_gate("unknown", True)
         assert should_fail is True
         assert reason == "unknown"
+
+
+# ── QUAL-23 ──────────────────────────────────────────────────────────────────
+
+class TestIacTableDegradesInsteadOfCrashing:
+    def test_partial_kics_query_does_not_raise(self):
+        """`q["query_name"]` and `q["files"]` were the last direct subscripts on
+        KICS-supplied data; every other consumer already used .get, so a report
+        missing either key took down the whole run with a KeyError."""
+        out = scanner.render_comment({"queries": []}, {"queries": []}, [{"severity": "HIGH"}], "main", "feat")
+        assert "Unnamed query" in out
+
+    def test_a_partial_query_still_renders_the_other_rows(self):
+        good = {"query_name": "Real finding", "severity": "HIGH",
+                "files": [{"file_name": "main.tf", "line": 3}]}
+        out = scanner.render_comment({"queries": []}, {"queries": []}, [{"severity": "HIGH"}, good], "main", "feat")
+        assert "Real finding" in out
+        assert "main.tf" in out
+
+    def test_a_newline_cannot_break_the_heading_out_of_its_block(self):
+        q = {"query_name": "evil\n## Injected heading", "severity": "HIGH", "files": []}
+        out = scanner.render_comment({"queries": []}, {"queries": []}, [q], "main", "feat")
+        assert "\n## Injected heading" not in out
+
+
+# ── DOC-22 ───────────────────────────────────────────────────────────────────
+
+class TestEnvVarsAreDocumented:
+    def test_every_zagware_var_the_scanner_reads_is_in_the_readme(self):
+        """Six vars were read by the scanner and absent from the Configuration
+        table, so the only way to discover them was to read the source."""
+        src = Path(scanner.__file__).read_text()
+        readme = (Path(scanner.__file__).resolve().parents[1] / "README.md").read_text()
+        read = set(re.findall(r'os\.environ(?:\.get)?[\(\[]\s*["\'](ZAGWARE_[A-Z_]+)["\']', src))
+        read |= set(re.findall(r'_env_(?:int|bool)\("(ZAGWARE_[A-Z_]+)"', src))
+        undocumented = sorted(v for v in read if f"`{v}`" not in readme)
+        assert not undocumented, f"undocumented env vars: {undocumented}"
+
+    def test_the_artifact_table_matches_what_is_written(self, tmp_path):
+        """The README promised ten files and listed nine; iac-new.json made it
+        eleven. Drift here is why the count is asserted, not just the names."""
+        readme = (Path(scanner.__file__).resolve().parents[1] / "README.md").read_text()
+        out = tmp_path / "out"
+        scanner._write_artifacts(
+            out_dir=str(out), comment="c",
+            base_results={"queries": []}, pr_results={"queries": []}, novel_iac=[],
+            base_sca=[], head_sca=[], novel_sca=[],
+            base_secrets=[], head_secrets=[], novel_secrets=[],
+            timings={}, meta={})
+        written = sorted(p.name for p in out.iterdir())
+        assert len(written) == 11
+        for name in written:
+            assert f"`{name}`" in readme, f"{name} is written but undocumented"
