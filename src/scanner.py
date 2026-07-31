@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -49,7 +50,11 @@ import hashlib
 # 3.0.1 fixes SCA being broken on GitHub Actions in 3.0.0: the non-root user
 # 3.0.0 introduced could not write the Grype DB cache under the HOME that the
 # Actions runtime injects. See CHANGELOG.md.
-__version__ = "3.0.1"
+#
+# 3.0.2 fixes the secrets scan, broken for everyone in 3.0.0 and 3.0.1: the
+# generated betterleaks allowlist put regexes in TOML basic strings, where
+# `\.` is an invalid escape, so betterleaks refused to start. See CHANGELOG.md.
+__version__ = "3.0.2"
 
 # Boolean-shaped env vars previously used five different, mutually incompatible
 # parsing conventions (.lower()=="true", .lower()!="false", bare truthiness, and
@@ -1719,6 +1724,19 @@ def new_sca_findings(
 
 # ── Secrets (betterleaks) ────────────────────────────────────────────────────
 
+def _toml_string(value: str) -> str:
+    """Serialise *value* as a TOML string, preferring a literal.
+
+    Literal ('single-quoted') strings process no escapes, which is what a
+    regex wants -- `^\\.git/` survives verbatim. A literal cannot contain a
+    single quote and has no escape for one, so a value containing `'` falls
+    back to a basic string with the two characters TOML requires escaping.
+    """
+    if "'" not in value:
+        return f"'{value}'"
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _write_betterleaks_config(tmp_dir: str, label: str) -> str | None:
     """Write a betterleaks config that allowlists the excluded paths.
 
@@ -1727,11 +1745,22 @@ def _write_betterleaks_config(tmp_dir: str, label: str) -> str | None:
     keeps every built-in rule -- this only ADDS an allowlist, it never
     narrows detection. Paths are anchored regexes, so an entry like `vendor`
     excludes `vendor/...` and not `my-vendor-notes.txt`. See QUAL-10.
+
+    The regexes go into TOML *literal* strings (single-quoted). A basic
+    ("double-quoted") string processes backslash escapes, and TOML only
+    recognises a fixed set of them -- so `re.escape('.git')` -> `\\.git`
+    produced `"^\\.git/"`, which is not merely ugly but invalid:
+
+        FTL unable to load config, err: toml: invalid escaped character U+002E
+
+    betterleaks then exited 1 without writing a report and the whole secrets
+    scan failed. `.git` is always in the exclude list, so this fired for every
+    user on every run, not just those who set ZAGWARE_EXCLUDE_PATHS.
     """
     globs = [e.strip().rstrip("/") for e in _scan_exclude_paths().split(",") if e.strip()]
     if not globs:
         return None
-    patterns = ",\n  ".join(f'"^{_re.escape(g)}/"' for g in globs)
+    patterns = ",\n  ".join(_toml_string(f"^{_re.escape(g)}/") for g in globs)
     cfg = (
         'title = "zagware-generated"\n\n'
         "[extend]\n"
@@ -1740,6 +1769,18 @@ def _write_betterleaks_config(tmp_dir: str, label: str) -> str | None:
         'description = "ZAGWARE_EXCLUDE_PATHS"\n'
         f"paths = [\n  {patterns}\n]\n"
     )
+    # Parse what we just generated before handing it to a tool whose console
+    # output we deliberately withhold (SEC-08). Without this check a malformed
+    # config is indistinguishable, from the outside, from a scanner crash.
+    # Degrading to an unscoped scan is the safe direction: it over-reports
+    # rather than silently skipping paths.
+    try:
+        tomllib.loads(cfg)
+    except tomllib.TOMLDecodeError as exc:
+        log.warning("Generated betterleaks exclude config is not valid TOML (%s) — "
+                    "scanning the whole tree; ZAGWARE_EXCLUDE_PATHS will not apply "
+                    "to the secrets scan", exc)
+        return None
     path = f"{tmp_dir}/betterleaks_{label}.toml"
     try:
         Path(path).write_text(cfg, encoding="utf-8")
@@ -3675,6 +3716,133 @@ def main() -> int:
 #       telemetry and no way to distinguish the two.
 _EXIT_CRASH = 2
 
+def run_local() -> int:
+    """Local working-tree scan: no CI platform, no clone, no diff, no PR comment.
+
+    Scans ZAGWARE_LOCAL_PATH (default /scan) and emits the *full* set of findings
+    (not a base-vs-head diff) for the VS Code extension — or any local consumer — to
+    render. Reuses the exact scan + normalization + redaction paths used in CI, so
+    local results match what a PR run would report. Diffing and suppression are left
+    to the consumer, which lets an interactive UI toggle them.
+
+    Output contract: a single JSON document is written to **stdout**. All logging
+    goes to stderr (see logging.basicConfig), so stdout stays clean and parseable.
+    This deliberately avoids an output bind mount — writing artifacts to a
+    gRPC-FUSE/virtiofs mount mid-scan proved flaky under the memory pressure of a
+    full KICS run. When ZAGWARE_LOCAL_OUTPUT is set, the split iac.json / sca.json /
+    secrets.json / local-summary.json files are ALSO written there, best-effort.
+
+    Neither the IaC (redacted) nor SCA nor Secrets payloads carry raw secret values,
+    so emitting them on stdout is safe.
+
+    Gated by ZAGWARE_LOCAL_SCAN=1 in _run_cli(); returns 0 on success, 1 on a fatal
+    setup error (bad path). Individual engine failures are recorded per-engine in the
+    result's `engines` map rather than aborting the whole scan — a broken Grype DB
+    must not hide a real IaC misconfiguration.
+    """
+    scan_path = os.environ.get("ZAGWARE_LOCAL_PATH", "/scan")
+    if not os.path.isdir(scan_path):
+        log.error("ZAGWARE_LOCAL_PATH %r is not a directory", scan_path)
+        return 1
+
+    log.info("Zagware local scan starting — path=%s", scan_path)
+    t_start = time.perf_counter()
+    timings: dict[str, float] = {}
+    engines: dict[str, str] = {}
+
+    iac_queries: list[dict] = []
+    sca_findings: list[dict] = []
+    secrets_findings: list[dict] = []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # ── IaC (KICS) ───────────────────────────────────────────────────────
+        if _env_bool("ZAGWARE_IAC_ENABLED", True):
+            t0 = time.perf_counter()
+            try:
+                iac_queries = _redact_kics_results(
+                    run_scan(scan_path, f"{tmp}/iac.json")
+                ).get("queries", [])
+                engines["iac"] = "ok"
+            except RuntimeError as exc:
+                log.error("Local IaC scan failed: %s", exc)
+                engines["iac"] = f"error: {exc}"
+            timings["iac"] = time.perf_counter() - t0
+        else:
+            engines["iac"] = "disabled"
+
+        # ── SCA (Syft + Grype) ───────────────────────────────────────────────
+        if _SCA_ENABLED:
+            t0 = time.perf_counter()
+            try:
+                sca_findings = run_sca_scan(scan_path, tmp, "local") or []
+                engines["sca"] = "ok"
+            except Exception as exc:  # noqa: BLE001 -- isolate engine failure
+                log.error("Local SCA scan failed: %s", exc)
+                engines["sca"] = f"error: {exc}"
+            timings["sca"] = time.perf_counter() - t0
+        else:
+            engines["sca"] = "disabled"
+
+        # ── Secrets (betterleaks) ────────────────────────────────────────────
+        if _SECRETS_ENABLED:
+            t0 = time.perf_counter()
+            try:
+                secrets_findings = run_secrets_scan(scan_path, tmp, "local") or []
+                engines["secrets"] = "ok"
+            except Exception as exc:  # noqa: BLE001 -- isolate engine failure
+                log.error("Local secrets scan failed: %s", exc)
+                engines["secrets"] = f"error: {exc}"
+            timings["secrets"] = time.perf_counter() - t0
+        else:
+            engines["secrets"] = "disabled"
+
+    result: dict = {
+        "schema": 1,
+        "mode": "local",
+        "scan_path": scan_path,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "engines": engines,
+        "timings": {k: round(v, 3) for k, v in timings.items()},
+        "counts": {
+            "iac": count_findings(iac_queries),
+            "sca": len(sca_findings),
+            "secrets": len(secrets_findings),
+        },
+        "duration_s": round(time.perf_counter() - t_start, 2),
+        "findings": {
+            "iac": iac_queries,
+            "sca": sca_findings,
+            "secrets": secrets_findings,
+        },
+    }
+
+    # Primary contract: the complete result as one JSON document on stdout.
+    sys.stdout.write(json.dumps(result, ensure_ascii=False))
+    sys.stdout.flush()
+
+    # Best-effort split artifacts when a directory is explicitly requested.
+    out_dir = os.environ.get("ZAGWARE_LOCAL_OUTPUT", "")
+    if out_dir:
+        _J = {"indent": 2, "ensure_ascii": False}
+        try:
+            d = Path(out_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "iac.json").write_text(json.dumps({"queries": iac_queries}, **_J), encoding="utf-8")
+            (d / "sca.json").write_text(json.dumps(sca_findings, **_J), encoding="utf-8")
+            (d / "secrets.json").write_text(json.dumps(secrets_findings, **_J), encoding="utf-8")
+            summary = {k: v for k, v in result.items() if k != "findings"}
+            (d / "local-summary.json").write_text(json.dumps(summary, **_J), encoding="utf-8")
+        except OSError as exc:
+            log.warning("Could not write local artifacts to %s: %s — stdout still carries the full result", out_dir, exc)
+
+    log.info(
+        "Local scan complete in %.1fs — IaC=%d SCA=%d Secrets=%d",
+        result["duration_s"], result["counts"]["iac"],
+        result["counts"]["sca"], result["counts"]["secrets"],
+    )
+    return 0
+
+
 def _run_cli() -> int:
     """Process entrypoint wrapper. Converts an unhandled exception into
     _EXIT_CRASH *and* still flushes telemetry, instead of dying on the
@@ -3682,7 +3850,7 @@ def _run_cli() -> int:
     rather than inline under `if __name__ == "__main__"` so the backstop
     itself is directly testable. See QUAL-04."""
     try:
-        exit_code = main()
+        exit_code = run_local() if _env_bool("ZAGWARE_LOCAL_SCAN", False) else main()
     except Exception as exc:  # noqa: BLE001 -- deliberate top-level backstop
         # log.exception keeps the traceback available for debugging; the
         # difference is that the process now exits through the flush below.

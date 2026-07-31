@@ -530,3 +530,67 @@ class TestKicsSeverityExitCodes:
         with caplog.at_level("WARNING"):
             scanner.run_scan(str(tmp_path), str(out))
         assert f"Unexpected KICS exit code {code}" in caplog.text
+
+
+class TestBetterleaksConfigIsValidToml:
+    """The generated config used TOML basic strings for regexes, so
+    re.escape('.git') -> '\\.git' produced `"^\\.git/"`. TOML only recognises a
+    fixed set of escapes, so betterleaks refused to start:
+
+        FTL unable to load config, err: toml: invalid escaped character U+002E
+
+    It exited 1 without writing a report and the whole secrets scan failed.
+    `.git` is always in the exclude list, so this fired for every user on every
+    run -- SCA failing first was the only reason it stayed hidden.
+    """
+
+    def test_default_config_is_parseable(self, tmp_path):
+        """The default path: no ZAGWARE_EXCLUDE_PATHS set, `.git` still added."""
+        import tomllib
+        cfg = scanner._write_betterleaks_config(str(tmp_path), "base")
+        assert cfg is not None
+        tomllib.loads(Path(cfg).read_text())
+
+    @pytest.mark.parametrize("excludes", [
+        ".git", "vendor,test/fixtures", "a.b,c-d,e_f", "path/with.dots",
+        "weird name", "back\\slash",
+    ])
+    def test_hostile_exclude_paths_still_produce_valid_toml(
+            self, tmp_path, monkeypatch, excludes):
+        """Every value here reaches re.escape and then TOML. An operator
+        setting ZAGWARE_EXCLUDE_PATHS must not be able to break the scan."""
+        import tomllib
+        monkeypatch.setattr(scanner, "_EXCLUDE_PATHS", excludes)
+        cfg = scanner._write_betterleaks_config(str(tmp_path), "base")
+        parsed = tomllib.loads(Path(cfg).read_text())
+        assert parsed["extend"]["useDefault"] is True
+        assert parsed["allowlists"][0]["paths"]
+
+    def test_regex_survives_the_round_trip_unescaped(self, tmp_path):
+        """A literal string must hand betterleaks the regex verbatim -- if the
+        backslash were consumed, `.` would match any character and the
+        allowlist would silently over-exclude."""
+        import tomllib
+        cfg = scanner._write_betterleaks_config(str(tmp_path), "base")
+        paths = tomllib.loads(Path(cfg).read_text())["allowlists"][0]["paths"]
+        assert any(p == r"^\.git/" for p in paths), paths
+
+    def test_apostrophe_falls_back_to_a_basic_string(self):
+        """TOML literals cannot contain a single quote and offer no escape."""
+        import tomllib
+        out = scanner._toml_string("it's")
+        assert tomllib.loads(f"v = {out}")["v"] == "it's"
+
+    def test_backslash_survives_the_basic_string_fallback(self):
+        import tomllib
+        out = scanner._toml_string("it's\\a\\path")
+        assert tomllib.loads(f"v = {out}")["v"] == "it's\\a\\path"
+
+    def test_unparseable_config_degrades_instead_of_killing_the_scan(
+            self, tmp_path, monkeypatch, caplog):
+        """Over-scanning is the safe direction; a broken exclude list must not
+        take the secrets scan down with it."""
+        monkeypatch.setattr(scanner, "_toml_string", lambda v: '"\\.broken"')
+        with caplog.at_level("WARNING"):
+            assert scanner._write_betterleaks_config(str(tmp_path), "base") is None
+        assert "not valid TOML" in caplog.text

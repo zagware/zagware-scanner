@@ -141,7 +141,12 @@ class TestUnitTestSuiteIsWiredIntoCi:
         script = venv_step + "\n" + pytest_step + "\n"
         proc = subprocess.run(
             ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
-            cwd=repo_copy, capture_output=True, text=True, timeout=120,
+            # The nested run is a venv build, a pip install, and the ENTIRE
+            # suite. That suite is now ~575 tests and ~2 minutes on its own, so
+            # the original 120s budget started failing on suite growth rather
+            # than on any real defect. Generous on purpose: this guards that the
+            # shipped CI commands work, and a slow runner is not a failure.
+            cwd=repo_copy, capture_output=True, text=True, timeout=600,
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert " passed" in proc.stdout

@@ -569,6 +569,25 @@ from their own native CI variables instead.
 |---|---|---|
 | `BITBUCKET_GIT_USER` | Optional | Git username paired with `BITBUCKET_API_TOKEN` in the clone URL. Defaults to `<workspace>-admin` — a workspace convention, not a guarantee. Set it if cloning fails with a git authentication error. |
 
+### Local scanning
+
+A working-tree scan with no CI platform, no clone, no diff, and no PR comment —
+it reports the *full* set of findings rather than only what a pull request adds.
+Intended for the VS Code extension, but usable by any local consumer. Results
+come from the same scan, normalisation, and redaction paths as a CI run, so they
+match what a PR would report. Diffing and suppression are left to the consumer.
+
+Unlike a CI run, one engine failing does not abort the scan; each engine's
+outcome is recorded in `local-summary.json`, so a broken Grype database cannot
+hide a real IaC misconfiguration.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ZAGWARE_LOCAL_SCAN` | `false` | Set `true` to run a local scan instead of the CI pull-request flow. |
+| `ZAGWARE_LOCAL_PATH` | `/scan` | Directory to scan. |
+| `ZAGWARE_LOCAL_OUTPUT` | `/out` | Directory for the local report. May be absolute — unlike `ZAGWARE_OUTPUT_DIR` this is operator-supplied, with no pull-request content able to redirect it. |
+| `ZAGWARE_IAC_ENABLED` | `true` | Set `false` to skip KICS IaC scanning in a local scan. Local-mode only — the CI flow always runs IaC. Pairs with `ZAGWARE_SCA_ENABLED` and `ZAGWARE_SECRETS_ENABLED`, which apply to both modes. |
+
 ### Debugging & advanced
 
 | Variable | Default | Description |

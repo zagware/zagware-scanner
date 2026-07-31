@@ -142,10 +142,18 @@ class TestExcludePathsReachEveryScanner:
         mod = reload_scanner(ZAGWARE_EXCLUDE_PATHS="vendor")
         path = mod._write_betterleaks_config(str(tmp_path), "base")
         assert path
-        cfg = (tmp_path / "betterleaks_base.toml").read_text()
-        assert "useDefault = true" in cfg, "must ADD an allowlist, never narrow detection"
-        assert '"^vendor/"' in cfg
-        assert '"^\\.git/"' in cfg or r'"^\.git/"' in cfg
+        # Parse it, don't grep it. The previous form asserted the raw substring
+        # `"^vendor/"`, which pinned the BASIC-string quoting that made the
+        # config invalid TOML -- betterleaks refused to start and the secrets
+        # scan failed for every user. A test that encodes the defect cannot
+        # catch it. What matters is the regex betterleaks actually receives.
+        import tomllib
+        cfg = tomllib.loads((tmp_path / "betterleaks_base.toml").read_text())
+        assert cfg["extend"]["useDefault"] is True, \
+            "must ADD an allowlist, never narrow detection"
+        paths = cfg["allowlists"][0]["paths"]
+        assert r"^vendor/" in paths
+        assert r"^\.git/" in paths
 
     def test_betterleaks_config_is_passed_to_the_binary(self, reload_scanner, monkeypatch, tmp_path):
         mod = reload_scanner(ZAGWARE_EXCLUDE_PATHS="vendor")

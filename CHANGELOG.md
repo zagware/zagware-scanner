@@ -8,6 +8,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Versions are published as container tags — see the
 [pinning guidance](README.md#pinning-to-a-specific-version) for which tag to depend on.
 
+## [3.0.2] — 2026-07-31
+
+Fixes secrets scanning, which was broken for every user in 3.0.0 and 3.0.1.
+
+### Fixed
+
+- **The secrets scan failed on every run.** betterleaks exited 1 without
+  writing a report, and the scan aborted with "could not read betterleaks
+  output". The generated allowlist config put its path regexes in TOML *basic*
+  strings, so `re.escape('.git')` produced `"^\.git/"` — and TOML only
+  recognises a fixed set of backslash escapes, making `\.` invalid:
+
+      FTL unable to load config, err: toml: invalid escaped character U+002E
+
+  Regexes now go into TOML *literal* strings, which process no escapes. Because
+  `.git` is always appended to the exclude list, this affected everyone, not
+  only those setting `ZAGWARE_EXCLUDE_PATHS`. It stayed hidden until 3.0.1
+  because the SCA failure aborted the scan first.
+- The generated config is now parsed before it is handed to betterleaks. If it
+  is ever malformed again the scan **degrades to an unscoped scan** — which
+  over-reports rather than silently skipping paths — instead of failing
+  outright. This matters because betterleaks' console output is deliberately
+  withheld (SEC-08), so a config error is otherwise indistinguishable from a
+  crash.
+- `ZAGWARE_EXCLUDE_PATHS` values containing dots, spaces, backslashes, or
+  apostrophes can no longer produce an invalid config.
+
+### Added
+
+- Local working-tree scan mode for the VS Code extension —
+  `ZAGWARE_LOCAL_SCAN`, `ZAGWARE_LOCAL_PATH`, `ZAGWARE_LOCAL_OUTPUT`, now
+  documented under **Configuration → Local scanning**. Off by default; the CI
+  pull-request flow is unchanged.
+
 ## [3.0.1] — 2026-07-31
 
 Fixes SCA being broken on GitHub Actions in 3.0.0. Anyone on 3.0.0 or `latest`
@@ -285,6 +319,7 @@ remediation, not new features.
 ### Added
 - Grype SCA scanning alongside KICS IaC scanning, unified into a single scanner.
 
+[3.0.2]: https://github.com/zagware/zagware-scanner/releases/tag/v3.0.2
 [3.0.1]: https://github.com/zagware/zagware-scanner/releases/tag/v3.0.1
 [3.0.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.0.0
 [2.8.2]: https://github.com/zagware/zagware-scanner/releases/tag/v2.8.2
