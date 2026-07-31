@@ -8,6 +8,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Versions are published as container tags — see the
 [pinning guidance](README.md#pinning-to-a-specific-version) for which tag to depend on.
 
+## [3.0.1] — 2026-07-31
+
+Fixes SCA being broken on GitHub Actions in 3.0.0. Anyone on 3.0.0 or `latest`
+should upgrade; there is no workaround short of disabling SCA.
+
+### Fixed
+
+- **SCA failed on every GitHub Actions run.** Grype exited 1 within a second of
+  starting, and the scan aborted with "Grype failed — this is NOT 'no
+  findings'". Syft and Grype resolve their cache from `$XDG_CACHE_HOME`,
+  falling back to `$HOME/.cache`; the Actions docker-action runtime overrides
+  `HOME` to a runner-owned `/github/home` that the non-root user introduced in
+  3.0.0 (SUP-06) cannot write, so Grype could not create its vulnerability
+  database. The cache is now pinned to a path that is always writable,
+  independent of whatever `HOME` a caller injects. Root cause was reproduced
+  against the published 3.0.0 image and the fix verified under the same
+  conditions.
+- **The failure was undiagnosable.** `--quiet` suppressed 100% of Grype's
+  output — the DB error wrote literally zero bytes to stdout and stderr — so
+  the log read `Grype exited 1: ` with nothing after the colon. Both Syft and
+  Grype now run unsilenced (output is captured, not printed; measured cost on a
+  clean run is ~105 bytes), and the reported detail is the *tail* of that
+  output, where the fatal error is, rather than the head, which held only a
+  schema warning.
+- **`Unexpected KICS exit code 60` on any repository with a CRITICAL finding.**
+  KICS returns the exit code of the highest severity it found. The accepted set
+  was `(0, 30, 40, 50)` under a stale comment predating CRITICAL getting its
+  own code. Verified against the bundled binary — INFO=20, LOW=30, MEDIUM=40,
+  HIGH=50, CRITICAL=60 — and widened accordingly. Genuine engine errors (1,
+  126, 130) still warn.
+
 ## [3.0.0] — 2026-07-30
 
 Remediation of a full security and quality audit: **90 findings** (2 critical, 18 high,
@@ -254,6 +285,7 @@ remediation, not new features.
 ### Added
 - Grype SCA scanning alongside KICS IaC scanning, unified into a single scanner.
 
+[3.0.1]: https://github.com/zagware/zagware-scanner/releases/tag/v3.0.1
 [3.0.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.0.0
 [2.8.2]: https://github.com/zagware/zagware-scanner/releases/tag/v2.8.2
 [2.8.1]: https://github.com/zagware/zagware-scanner/releases/tag/v2.8.1

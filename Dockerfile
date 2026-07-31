@@ -138,5 +138,21 @@ ENV ZAGWARE_QUERIES_PATH=/opt/iac-rules/assets/queries
 # entrypoint" step, which explicitly calls py_compile.compile().
 ENV PYTHONPYCACHEPREFIX=/tmp/pycache
 
+# Syft and Grype resolve their cache from $XDG_CACHE_HOME, falling back to
+# $HOME/.cache. HOME is set above, but a caller can override it -- the GitHub
+# Actions docker-action runtime does exactly that, passing `-e HOME` and
+# bind-mounting its own /github/home, which is owned by the runner user (uid
+# 1001) and therefore NOT writable by this image's uid 1000. Grype then could
+# not create its vulnerability DB and exited 1 within a second:
+#
+#   error updating db: unable to create db root dir /github/home/.cache/grype/db
+#   ERROR failed to load vulnerability db: database does not exist
+#
+# This was invisible before SUP-06 introduced the non-root USER, because root
+# could write the overridden HOME. Pinning the cache to a path that is always
+# writable makes SCA independent of whatever HOME the caller injects.
+ENV XDG_CACHE_HOME=/tmp/.cache
+RUN mkdir -p /tmp/.cache && chown zagware:zagware /tmp/.cache && chmod 700 /tmp/.cache
+
 USER zagware
 ENTRYPOINT ["python3", "/usr/local/bin/zagware-scan"]

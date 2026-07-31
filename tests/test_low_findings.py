@@ -420,3 +420,113 @@ class TestEnvVarsAreDocumented:
         assert len(written) == 11
         for name in written:
             assert f"`{name}`" in readme, f"{name} is written but undocumented"
+
+
+# ── SCA cache independence (field failure, terragoat2024 run 30633800266) ────
+
+class TestScaToolsDoNotDependOnHome:
+    """Grype exited 1 within a second on every PR in a customer pipeline.
+
+    The GitHub Actions docker-action runtime passes `-e HOME` and bind-mounts
+    its own /github/home, owned by the runner user. Once SUP-06 made this image
+    run as a non-root uid, Grype could no longer create
+    $HOME/.cache/grype/db and failed before scanning anything. `--quiet` then
+    suppressed 100% of its output, so the log line was "Grype exited 1: " with
+    nothing after the colon.
+    """
+
+    def _dockerfile(self):
+        return (Path(scanner.__file__).resolve().parents[1] / "Dockerfile").read_text()
+
+    def test_cache_dir_is_pinned_off_home(self):
+        """XDG_CACHE_HOME is what both Syft and Grype consult before $HOME."""
+        assert "ENV XDG_CACHE_HOME=" in self._dockerfile()
+
+    def test_pinned_cache_dir_is_not_under_home(self):
+        """Pinning it back under $HOME would reintroduce the exact failure."""
+        line = next(l for l in self._dockerfile().splitlines()
+                    if l.startswith("ENV XDG_CACHE_HOME="))
+        path = line.split("=", 1)[1].strip()
+        assert "$HOME" not in path and not path.startswith("/home/"), path
+
+    def _argv(self, monkeypatch, fn, *args):
+        """Capture the argv actually handed to subprocess.run."""
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(scanner.subprocess, "run", fake_run)
+        fn(*args)
+        return seen["cmd"]
+
+    def test_grype_is_not_silenced(self, monkeypatch, tmp_path):
+        """--quiet cost the entire diagnosis: zero bytes on stdout AND stderr,
+        measured against the published 3.0.0 image. Asserted on the real argv,
+        not the source text -- a source grep also matches the comment
+        explaining why the flag is gone."""
+        cmd = self._argv(monkeypatch, scanner._run_grype,
+                         str(tmp_path / "sbom.json"), str(tmp_path / "out.json"))
+        assert "--quiet" not in cmd
+        assert "--file" in cmd          # SEC-11: still writes straight to disk
+
+    def test_syft_is_not_silenced(self, monkeypatch, tmp_path):
+        cmd = self._argv(monkeypatch, scanner._run_syft,
+                         str(tmp_path), str(tmp_path / "sbom.json"))
+        assert "--quiet" not in cmd
+        assert "--exclude" in cmd       # QUAL-10: exclusions still applied
+
+
+class TestToolErrorIsNeverBlank:
+    def test_silent_failure_still_says_something(self):
+        """"exited 1: " with an empty tail is what made this undiagnosable."""
+        r = subprocess.CompletedProcess([], 1, "", "")
+        assert scanner._tool_error(r) == "no output on stdout or stderr"
+
+    def test_reports_the_tail_not_the_head(self):
+        """Both tools stream warnings first and the fatal error last, so a
+        leading slice reports a schema warning and drops the real cause."""
+        noise = "WARN schema version mismatch\n" * 200
+        r = subprocess.CompletedProcess([], 1, "", noise + "ERROR failed to load vulnerability db")
+        out = scanner._tool_error(r)
+        assert "ERROR failed to load vulnerability db" in out
+        assert len(out) <= 400
+
+    def test_falls_back_to_stdout_when_stderr_is_empty(self):
+        r = subprocess.CompletedProcess([], 1, "something on stdout", "")
+        assert "something on stdout" in scanner._tool_error(r)
+
+
+class TestKicsSeverityExitCodes:
+    """Verified against the bundled KICS by scanning one repo five times with a
+    different --fail-on each run: INFO=20 LOW=30 MEDIUM=40 HIGH=50 CRITICAL=60.
+    """
+
+    def _run(self, monkeypatch, tmp_path, code):
+        out = tmp_path / "kics.json"
+        out.write_text('{"queries": []}')
+        monkeypatch.setattr(scanner.subprocess, "run",
+                            lambda *a, **k: subprocess.CompletedProcess([], code, "", ""))
+        return out
+
+    @pytest.mark.parametrize("code,severity", [
+        (0,  "no findings"), (20, "INFO"), (30, "LOW"),
+        (40, "MEDIUM"), (50, "HIGH"), (60, "CRITICAL"),
+    ])
+    def test_severity_codes_are_not_warned_about(
+            self, monkeypatch, tmp_path, caplog, code, severity):
+        """60 (CRITICAL) and 20 (INFO) used to trip 'Unexpected KICS exit code'
+        — 60 fires on exactly the repos that matter most."""
+        out = self._run(monkeypatch, tmp_path, code)
+        with caplog.at_level("WARNING"):
+            scanner.run_scan(str(tmp_path), str(out))
+        assert "Unexpected KICS exit code" not in caplog.text, severity
+
+    @pytest.mark.parametrize("code", [1, 126, 130])
+    def test_real_engine_errors_still_warn(self, monkeypatch, tmp_path, caplog, code):
+        """Widening the set must not silence a genuine engine failure."""
+        out = self._run(monkeypatch, tmp_path, code)
+        with caplog.at_level("WARNING"):
+            scanner.run_scan(str(tmp_path), str(out))
+        assert f"Unexpected KICS exit code {code}" in caplog.text

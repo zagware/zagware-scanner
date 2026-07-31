@@ -44,8 +44,15 @@ class TestNoLongLivedPATRemains:
     def test_workflow_never_references_gh_pat_packages(self, workflow):
         """Checks for functional usage (secrets.GH_PAT_PACKAGES), not mere
         mentions of the retired name in an explanatory comment."""
-        text = (REPO_ROOT / workflow).read_text()
-        assert "secrets.GH_PAT_PACKAGES" not in text, (
+        # The assertion previously grepped the raw file, so it also fired on a
+        # comment -- contradicting the docstring above. Documenting the retired
+        # PAT as the fallback is deliberate (see publish.yml's header); using it
+        # is what must not come back.
+        live = "\n".join(
+            line for line in (REPO_ROOT / workflow).read_text().splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "secrets.GH_PAT_PACKAGES" not in live, (
             f"{workflow} still references the retired long-lived PAT -- see SUP-11"
         )
 

@@ -45,7 +45,11 @@ import hashlib
 # render three outcomes where they previously collapsed into one. 2.9.0 and
 # 2.10.0 were set in source during the audit but never tagged or published, so
 # this is the first release since 2.8.2. See CHANGELOG.md.
-__version__ = "3.0.0"
+#
+# 3.0.1 fixes SCA being broken on GitHub Actions in 3.0.0: the non-root user
+# 3.0.0 introduced could not write the Grype DB cache under the HOME that the
+# Actions runtime injects. See CHANGELOG.md.
+__version__ = "3.0.1"
 
 # Boolean-shaped env vars previously used five different, mutually incompatible
 # parsing conventions (.lower()=="true", .lower()!="false", bare truthiness, and
@@ -1384,10 +1388,21 @@ def run_scan(path: str, output_json: str) -> dict:
             f"it is a scanner failure. Check the image, or _ZAGWARE_SCANNER_BIN if overridden."
         ) from exc
 
-    # KICS exit codes: 0=no findings, 30=LOW/INFO, 40=MEDIUM, 50=HIGH/CRITICAL.
-    # All of these are valid — the output file is the source of truth, not the
-    # exit code. Only fail if we can't read valid JSON output.
-    if result.returncode not in (0, 30, 40, 50):
+    # KICS returns the exit code of the HIGHEST severity it found, verified
+    # against the bundled binary by scanning one repo five times with a
+    # different --fail-on each run:
+    #
+    #   0 = no findings   20 = INFO   30 = LOW   40 = MEDIUM   50 = HIGH   60 = CRITICAL
+    #
+    # The old set here was (0, 30, 40, 50) with a comment claiming
+    # "30=LOW/INFO, 40=MEDIUM, 50=HIGH/CRITICAL" -- a mapping from before KICS
+    # split CRITICAL out into its own code. The effect was a scary
+    # "Unexpected KICS exit code 60" on every repository containing a CRITICAL
+    # finding, i.e. precisely the runs that matter most, plus 20 for an
+    # INFO-only repo. All of these are normal completions; the output file is
+    # the source of truth. Anything outside this set (1, 126, 130, ...) is a
+    # genuine engine error and stays worth warning about.
+    if result.returncode not in (0, 20, 30, 40, 50, 60):
         log.warning("Unexpected KICS exit code %d", result.returncode)
         if result.stderr:
             log.debug("stderr: %s", result.stderr[:800])
@@ -1483,6 +1498,19 @@ def _has_sca_manifests(path: str) -> bool:
     return False
 
 
+def _tool_error(r: subprocess.CompletedProcess) -> str:
+    """Best available explanation for a failed Syft/Grype run.
+
+    Takes the TAIL, not the head: both tools stream progress and warnings
+    first and the fatal error last, so a leading slice reports a schema
+    warning while the actual cause scrolls off. Falls back to an explicit
+    phrase rather than an empty string -- "exited 1: " with nothing after it
+    is what made a real DB-cache failure undiagnosable in the field.
+    """
+    text = ((r.stderr or "") + (r.stdout or "")).strip()
+    return text[-400:] if text else "no output on stdout or stderr"
+
+
 def _run_syft(path: str, sbom_out: str) -> bool:
     cmd = [_SYFT_BIN, "scan", f"dir:{path}", "-o", f"syft-json={sbom_out}"]
     # One --exclude per excluded path. `.git` is always among them
@@ -1491,11 +1519,14 @@ def _run_syft(path: str, sbom_out: str) -> bool:
     # SCA instead of applying to KICS alone. See QUAL-10 and SEC-07.
     for glob in _exclude_globs():
         cmd += ["--exclude", glob]
-    cmd.append("--quiet")
+    # No --quiet. Output is captured, not inherited, so nothing reaches the job
+    # log unless we choose to log it -- but --quiet also suppressed the reason
+    # for a failure, which turned a real Grype outage into a blank
+    # "exited 1: " line. Measured cost on a clean run: ~105 bytes of stderr.
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if r.returncode != 0:
-            log.warning("Syft exited %d: %s", r.returncode, (r.stderr or r.stdout or "").strip()[:400])
+            log.warning("Syft exited %d: %s", r.returncode, _tool_error(r))
         # Accept output even on non-zero exit (Syft may emit warnings as errors)
         return Path(sbom_out).exists() and Path(sbom_out).stat().st_size > 0
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
@@ -1509,12 +1540,17 @@ def _run_grype(sbom_path: str, grype_out: str) -> bool:
         # Python str and re-encoding it on write held roughly three copies of
         # a report that scales with the dependency count of an
         # attacker-supplied lockfile. See SEC-11.
+        # No --quiet: it suppressed 100% of Grype's output. A DB-cache failure
+        # exited 1 having written literally zero bytes to stdout and stderr, so
+        # the log line read "Grype exited 1: " and gave an operator nothing to
+        # go on. Without it the same failure prints the actual cause. See the
+        # XDG_CACHE_HOME note in the Dockerfile.
         r = subprocess.run(
-            [_GRYPE_BIN, f"sbom:{sbom_path}", "-o", "json", "--file", grype_out, "--quiet"],
+            [_GRYPE_BIN, f"sbom:{sbom_path}", "-o", "json", "--file", grype_out],
             capture_output=True, text=True, timeout=180,
         )
         if r.returncode != 0:
-            log.warning("Grype exited %d: %s", r.returncode, (r.stderr or r.stdout or "").strip()[:400])
+            log.warning("Grype exited %d: %s", r.returncode, _tool_error(r))
         # Accept the file even on non-zero exit — Grype may emit warnings as
         # errors but still produce a valid report.
         if Path(grype_out).exists() and Path(grype_out).stat().st_size > 0:
