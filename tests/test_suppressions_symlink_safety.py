@@ -112,12 +112,15 @@ class TestApplySuppressionCommandsRefusesSymlinkWrite:
         decoy.write_text("do not touch me")
         os.symlink(decoy, repo / ".zagware" / "suppressions.yaml")
 
-        pushed = scanner.apply_suppression_commands(
+        outcome, detail = scanner.apply_suppression_commands(
             str(repo), "https://example.invalid/repo.git", "feature-branch",
             [("deadbeef01", "accepted risk", "attacker", "2026-01-01T00:00:00Z")],
         )
 
-        assert pushed is False
+        # "failed" (not "nothing_todo"): a refused write must be reported as a
+        # failure the user can see, not silently swallowed. See QUAL-18.
+        assert outcome == "failed"
+        assert "symlink" in detail
         assert decoy.read_text() == "do not touch me"  # untouched
         assert os.path.islink(repo / ".zagware" / "suppressions.yaml")  # untouched
 
@@ -127,12 +130,13 @@ class TestApplySuppressionCommandsRefusesSymlinkWrite:
         outside.mkdir()
         os.symlink(outside, repo / ".zagware", target_is_directory=True)
 
-        pushed = scanner.apply_suppression_commands(
+        outcome, detail = scanner.apply_suppression_commands(
             str(repo), "https://example.invalid/repo.git", "feature-branch",
             [("deadbeef01", "accepted risk", "attacker", "2026-01-01T00:00:00Z")],
         )
 
-        assert pushed is False
+        assert outcome == "failed"
+        assert detail
         assert list(outside.iterdir()) == []  # nothing was created through the symlink
 
     def test_writes_normally_when_no_symlink_is_involved(self, tmp_path, monkeypatch):
@@ -144,12 +148,13 @@ class TestApplySuppressionCommandsRefusesSymlinkWrite:
         calls = []
         monkeypatch.setattr(scanner, "_git", lambda args, cwd=None, env=None: calls.append(args))
 
-        pushed = scanner.apply_suppression_commands(
+        outcome, detail = scanner.apply_suppression_commands(
             str(repo), "https://example.invalid/repo.git", "feature-branch",
             [("deadbeef01", "accepted risk", "maintainer", "2026-01-01T00:00:00Z")],
         )
 
-        assert pushed is True
+        assert outcome == "applied"
+        assert detail == ""
         content = (repo / ".zagware" / "suppressions.yaml").read_text()
         assert "deadbeef01" in content
         assert any(a[:1] == ["push"] for a in calls)

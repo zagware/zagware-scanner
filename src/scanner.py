@@ -543,6 +543,36 @@ class Platform(ABC):
         Default: empty (platform-specific override needed)."""
         return []
 
+    def is_pr_pipeline(self) -> bool:
+        """True when this run has a pull/merge-request context.
+
+        The scanner diffs a PR against its base branch; without that context
+        there is nothing to diff. Each platform previously failed differently
+        on a push/branch/scheduled pipeline: GitHub produced
+        `git clone --branch ""` (GITHUB_BASE_REF is defined-but-empty),
+        GitLab and Bitbucket raised an unhandled KeyError before any try
+        block, and Azure silently substituted the literal "main" — which on a
+        repo whose default branch IS main produced a green build that diffed
+        main against itself and reported "0 new findings" forever. One check,
+        one message, checked BEFORE any clone_url()/base_branch() call.
+        See QUAL-09.
+        """
+        return self.pr_number() is not None
+
+    def base_sha(self) -> str:
+        """Commit SHA of the base branch, or "" if unavailable.
+
+        Uploaded to the platform so a scan can be correlated with a commit:
+        dedup of re-runs, "which commit introduced this finding", and linkage
+        between the IaC/SCA/Secrets records for one push. The payload field
+        already existed and was always null. See QUAL-16."""
+        return ""
+
+    def head_sha(self) -> str:
+        """Commit SHA of the PR head, or "" if unavailable. See QUAL-16."""
+        return ""
+
+
 
 class GitHub(Platform):
     """
@@ -578,9 +608,25 @@ class GitHub(Platform):
         return os.environ.get("ZAGWARE_BASE_REF") or os.environ["GITHUB_BASE_REF"]
 
     def head_branch(self) -> str:
-        return (os.environ.get("ZAGWARE_HEAD_REF")
-                or os.environ.get("GITHUB_HEAD_REF")
-                or os.environ["GITHUB_SHA"])
+        """Ref to check out for the PR head.
+
+        Prefers `refs/pull/<n>/head`, which GitHub maintains inside the BASE
+        repository for every PR including forks. GITHUB_HEAD_REF is the branch
+        name in the *contributor's fork*, a ref that does not exist in the base
+        repo, and clone_url() always points at the base repo — so every
+        fork-originated PR previously failed with "Clone failed for PR
+        branch/SHA" and no comment at all, on exactly the population (public
+        repos taking outside contributions) that most needs the secrets gate.
+        ZAGWARE_HEAD_REF still wins when set, for issue_comment-triggered
+        runs. See QUAL-13.
+        """
+        override = os.environ.get("ZAGWARE_HEAD_REF")
+        if override:
+            return override
+        pr = os.environ.get("PR_NUMBER", "").strip()
+        if pr.isdigit():
+            return f"refs/pull/{pr}/head"
+        return os.environ.get("GITHUB_HEAD_REF") or os.environ["GITHUB_SHA"]
 
     def base_label(self) -> str:
         return os.environ.get("ZAGWARE_BASE_REF") or os.environ.get("GITHUB_BASE_REF", "base")
@@ -594,6 +640,15 @@ class GitHub(Platform):
     def pr_number(self) -> int | None:
         val = os.environ.get("PR_NUMBER", "").strip()
         return int(val) if val else None
+
+    def base_sha(self) -> str:
+        # On a pull_request event GITHUB_SHA is the ephemeral merge commit, not
+        # the base tip, so it is not a base_sha. GitHub exposes no base-tip env
+        # var; "" keeps the field honestly null rather than wrong. See QUAL-16.
+        return ""
+
+    def head_sha(self) -> str:
+        return os.environ.get("GITHUB_SHA", "")
 
     def _headers(self) -> dict:
         return {
@@ -753,6 +808,13 @@ class GitLab(Platform):
         val = os.environ.get("CI_MERGE_REQUEST_IID", "").strip()
         return int(val) if val else None
 
+    def base_sha(self) -> str:
+        return os.environ.get("CI_MERGE_REQUEST_TARGET_BRANCH_SHA", "")
+
+    def head_sha(self) -> str:
+        return (os.environ.get("CI_MERGE_REQUEST_SOURCE_BRANCH_SHA")
+                or os.environ.get("CI_COMMIT_SHA", ""))
+
     def _headers(self) -> dict:
         # PRIVATE-TOKEN header works for both PATs and project/group access tokens.
         return {"PRIVATE-TOKEN": self._api_token}
@@ -874,6 +936,14 @@ class Bitbucket(Platform):
         val = os.environ.get("BITBUCKET_PR_ID", "").strip()
         return int(val) if val else None
 
+    def base_sha(self) -> str:
+        # Bitbucket exposes no base-tip variable; "" keeps the field honestly
+        # null rather than wrong. See QUAL-16.
+        return ""
+
+    def head_sha(self) -> str:
+        return os.environ.get("BITBUCKET_COMMIT", "")
+
     def _headers(self) -> dict:
         # Atlassian API tokens require HTTP Basic auth: email:token
         creds = base64.b64encode(f"{self._email}:{self._api_token}".encode()).decode()
@@ -953,8 +1023,12 @@ class AzureDevOps(Platform):
         return uri
 
     def base_branch(self) -> str:
-        return (os.environ.get("SYSTEM_PULLREQUEST_TARGETBRANCH", "main")
-                .replace("refs/heads/", ""))
+        # No "main" fallback: substituting a hardcoded default here produced a
+        # scan of main against the current SHA, which on a repo whose default
+        # branch IS main is a permanently green build diffing main against
+        # itself. main() now refuses non-PR pipelines outright, so this is
+        # only ever reached with a real target branch. See QUAL-09.
+        return os.environ["SYSTEM_PULLREQUEST_TARGETBRANCH"].replace("refs/heads/", "")
 
     def head_branch(self) -> str:
         return (os.environ.get("SYSTEM_PULLREQUEST_SOURCEBRANCH", "")
@@ -987,6 +1061,12 @@ class AzureDevOps(Platform):
     def pr_number(self) -> int | None:
         val = os.environ.get("SYSTEM_PULLREQUEST_PULLREQUESTID", "").strip()
         return int(val) if val else None
+
+    def base_sha(self) -> str:
+        return ""
+
+    def head_sha(self) -> str:
+        return os.environ.get("BUILD_SOURCEVERSION", "")
 
     def _headers(self) -> dict:
         creds = base64.b64encode(f":{self._token}".encode()).decode()
@@ -1151,16 +1231,22 @@ def clone_branch(url: str, branch: str, dest: str) -> None:
           "--branch", branch, clean, dest], env=auth_env)
 
 
-def clone_and_checkout_sha(url: str, base_branch: str, sha: str, dest: str) -> None:
-    """Clone base branch then fetch and checkout a specific SHA.
+def clone_and_checkout_sha(url: str, base_branch: str, ref: str, dest: str) -> None:
+    """Clone the base branch, then fetch and check out an arbitrary *ref*.
 
-    The fetch needs the credential too, and origin is now clean, so the same
-    out-of-band env is reapplied rather than re-embedding it in the URL."""
+    *ref* may be a bare SHA or a full ref path such as `refs/pull/7/head`.
+    The checkout targets FETCH_HEAD rather than *ref* itself: `git fetch
+    origin refs/pull/7/head` populates FETCH_HEAD but creates no local ref of
+    that name, so `git checkout refs/pull/7/head` fails with "pathspec did not
+    match" (verified against real git). FETCH_HEAD is correct for both shapes.
+
+    The fetch needs the credential too, and origin is credential-free now, so
+    the same out-of-band env is reapplied. See QUAL-13 and SEC-07."""
     clean, auth_env = _split_credential(url)
     _git(["clone", "--depth=1", "--quiet", "--no-tags",
           "--branch", base_branch, clean, dest], env=auth_env)
-    _git(["fetch", "--depth=1", "origin", sha], cwd=dest, env=auth_env)
-    _git(["checkout", sha], cwd=dest)
+    _git(["fetch", "--depth=1", "origin", ref], cwd=dest, env=auth_env)
+    _git(["checkout", "--quiet", "FETCH_HEAD"], cwd=dest)
 
 
 # ── Scan ───────────────────────────────────────────────────────────────────────
@@ -1282,26 +1368,53 @@ def _sca_sim_id(vuln_id: str, pkg_name: str, pkg_version: str) -> str:
     return hashlib.sha256(f"{vuln_id}:{pkg_name}:{pkg_version}".encode()).hexdigest()
 
 
+def _exclude_globs() -> list[str]:
+    """Excluded paths as Syft-style globs, relative to the scan root.
+
+    ZAGWARE_EXCLUDE_PATHS was threaded into exactly ONE command line (KICS),
+    so an operator who scoped the scan with
+    ZAGWARE_EXCLUDE_PATHS=".git,node_modules,vendor,test/fixtures" -- the
+    documented mechanism -- still got every CVE from vendored trees and every
+    secret from test fixtures. Test-fixture credentials are the classic
+    secrets false positive, and with ZAGWARE_SECRETS_FAIL_ON_PUBLIC on a
+    public repo they broke the build with no way to scope them out short of
+    suppressing each fingerprint. See QUAL-10.
+    """
+    globs: list[str] = []
+    for e in _scan_exclude_paths().split(","):
+        e = e.strip().rstrip("/")
+        if e:
+            globs.append(f"./{e}/**" if "*" not in e else e)
+    return globs
+
+
 def _has_sca_manifests(path: str) -> bool:
+    """True when at least one dependency manifest exists outside the excluded
+    paths. Previously rglob'd the whole tree including .git and any path the
+    operator excluded, so a vendored tree alone could switch SCA on. See
+    QUAL-10."""
     p = Path(path)
+    excluded = [e for e in _scan_exclude_paths().split(",") if e]
     for m in _SCA_MANIFESTS:
-        if next(p.rglob(m), None):
+        for hit in p.rglob(m):
+            rel = hit.relative_to(p).as_posix()
+            if any(rel == e or rel.startswith(e.rstrip("/") + "/") for e in excluded):
+                continue
             return True
     return False
 
 
 def _run_syft(path: str, sbom_out: str) -> bool:
+    cmd = [_SYFT_BIN, "scan", f"dir:{path}", "-o", f"syft-json={sbom_out}"]
+    # One --exclude per excluded path. `.git` is always among them
+    # (_scan_exclude_paths), so the clone's own object store is never
+    # catalogued, and an operator's ZAGWARE_EXCLUDE_PATHS now actually scopes
+    # SCA instead of applying to KICS alone. See QUAL-10 and SEC-07.
+    for glob in _exclude_globs():
+        cmd += ["--exclude", glob]
+    cmd.append("--quiet")
     try:
-        r = subprocess.run(
-            [_SYFT_BIN, "scan", f"dir:{path}", "-o", f"syft-json={sbom_out}",
-             # Never catalogue the clone's own .git store. Measured: betterleaks
-             # already skips .git in dir mode, and Syft finds no manifests
-             # there in practice, but neither is a guarantee worth relying on
-             # for a directory that holds the packed object store. See SEC-07.
-             "--exclude", "./.git/**",
-             "--quiet"],
-            capture_output=True, text=True, timeout=180,
-        )
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if r.returncode != 0:
             log.warning("Syft exited %d: %s", r.returncode, (r.stderr or r.stdout or "").strip()[:400])
         # Accept output even on non-zero exit (Syft may emit warnings as errors)
@@ -1453,6 +1566,39 @@ def new_sca_findings(
 
 # ── Secrets (betterleaks) ────────────────────────────────────────────────────
 
+def _write_betterleaks_config(tmp_dir: str, label: str) -> str | None:
+    """Write a betterleaks config that allowlists the excluded paths.
+
+    Returns the config path, or None when there is nothing to exclude (in
+    which case betterleaks runs on its stock defaults). `extend.useDefault`
+    keeps every built-in rule -- this only ADDS an allowlist, it never
+    narrows detection. Paths are anchored regexes, so an entry like `vendor`
+    excludes `vendor/...` and not `my-vendor-notes.txt`. See QUAL-10.
+    """
+    globs = [e.strip().rstrip("/") for e in _scan_exclude_paths().split(",") if e.strip()]
+    if not globs:
+        return None
+    patterns = ",\n  ".join(f'"^{_re.escape(g)}/"' for g in globs)
+    cfg = (
+        'title = "zagware-generated"\n\n'
+        "[extend]\n"
+        "useDefault = true\n\n"
+        "[[allowlists]]\n"
+        'description = "ZAGWARE_EXCLUDE_PATHS"\n'
+        f"paths = [\n  {patterns}\n]\n"
+    )
+    path = f"{tmp_dir}/betterleaks_{label}.toml"
+    try:
+        Path(path).write_text(cfg, encoding="utf-8")
+    except OSError as exc:
+        # Non-fatal: scanning the whole tree is worse than scoping it, but far
+        # better than not scanning at all.
+        log.warning("Could not write betterleaks exclude config (%s) — "
+                    "ZAGWARE_EXCLUDE_PATHS will not apply to the secrets scan", exc)
+        return None
+    return path
+
+
 def run_secrets_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
     """Run betterleaks against the current working-tree state of *path*.
 
@@ -1497,6 +1643,15 @@ def run_secrets_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
         # into the CI job log. See SEC-08.
         "--redact",
     ]
+    # betterleaks has no --exclude flag; path scoping goes through an allowlist
+    # in its config (verified against the real bundled 1.7.2 binary: a fixture
+    # under an excluded path drops out of the report). Without this,
+    # ZAGWARE_EXCLUDE_PATHS applied to KICS only, so test-fixture credentials
+    # -- the classic secrets false positive -- could not be scoped out at all
+    # short of suppressing each fingerprint by hand. See QUAL-10.
+    cfg_path = _write_betterleaks_config(tmp_dir, label)
+    if cfg_path:
+        cmd += ["--config", cfg_path]
     log.info("Secrets: running betterleaks on %s...", label)
     try:
         # cwd=path + "." (not the absolute path) so the Fingerprint's embedded
@@ -1650,12 +1805,20 @@ def parse_suppression_commands(comments: list[dict]) -> list[tuple[str, str, str
 
 def resolve_suppression_id(
     prefix: str, novel: list[dict], novel_sca: list[dict], novel_secrets: list[dict] | None = None,
-) -> str | None:
+) -> tuple[str, str | None, int]:
     """Resolve a (possibly truncated) similarity_id prefix against current novel findings.
 
-    Returns the full similarity_id if exactly one unambiguous match exists, else None.
-    Exact matches always qualify; prefix matches require at least 6 hex characters
-    to avoid over-matching on garbage input.
+    Returns (outcome, full_id, match_count):
+      ("resolved",  <full id>, 1)  exactly one unambiguous match
+      ("not_found", None,      0)  nothing matched
+      ("ambiguous", None,      n)  the prefix matches n>1 findings
+
+    It previously returned None for both not-found and ambiguous, so anyone
+    hitting a real prefix collision was sent to debug a nonexistent typo. See
+    QUAL-17.
+
+    Exact matches always qualify; prefix matches require at least 6 hex
+    characters to avoid over-matching on garbage input.
     """
     candidates: set[str] = set()
     is_prefix_ok = len(prefix) >= 6
@@ -1673,25 +1836,40 @@ def resolve_suppression_id(
         if sid == prefix or (is_prefix_ok and sid.startswith(prefix)):
             candidates.add(sid)
     if len(candidates) == 1:
-        return next(iter(candidates))
-    return None
+        return "resolved", next(iter(candidates)), 1
+    if not candidates:
+        return "not_found", None, 0
+    return "ambiguous", None, len(candidates)
 
 
 def apply_suppression_commands(
     pr_dir: str, clone_url: str, head_branch: str,
     commands: list[tuple[str, str, str, str]],
-) -> bool:
+) -> tuple[str, str]:
     """Write new suppressions to .zagware/suppressions.yaml and push to PR branch.
 
     Each entry records suppressed_by/suppressed_at (the PR commenter and comment
     timestamp) alongside id/reason, so the platform-side suppression audit trail
-    (see collect_suppression_records()) can attribute it exactly without falling
-    back to git blame.
+    (see collect_suppression_records()) can attribute it exactly.
 
-    Returns True if a commit was made, False if no new suppressions to add.
+    Returns (outcome, detail):
+      ("applied",      "")        committed and pushed
+      ("nothing_todo", "")        every command was already in the file
+      ("failed",       <reason>)  the write or push was rejected
+
+    This used to return a bool, and False meant BOTH "already present" and
+    "push rejected". main() read False as nothing-to-do, so when
+    `contents: write` was absent or branch protection rejected the bot push --
+    both common -- the user commented /zagware suppress, the build re-ran, and
+    the comment came back byte-identical with the finding still listed and the
+    build still red. The only clue was one ERROR line in the job log, and
+    since the file was never committed the suppression would never apply on
+    any future run either. Callers surface "failed" in the PR comment, which
+    is the only surface the requesting user is actually looking at.
+    See QUAL-18.
     """
     if not commands:
-        return False
+        return "nothing_todo", ""
 
     base = Path(pr_dir).resolve()
     supp_path = base / _SUPPRESSIONS_PATH
@@ -1703,16 +1881,18 @@ def apply_suppression_commands(
     # symlinked .zagware/ directory would otherwise have mkdir(parents=True)
     # silently create paths through it. See SEC-04.
     if supp_path.is_symlink():
-        log.error("Refusing to write %s — it is a symlink, not a regular file", _SUPPRESSIONS_PATH)
-        return False
+        msg = f"{_SUPPRESSIONS_PATH} is a symlink, not a regular file"
+        log.error("Refusing to write %s — %s", _SUPPRESSIONS_PATH, msg)
+        return "failed", msg
     try:
         resolved_target = supp_path.resolve()
     except OSError as exc:
         log.error("Refusing to write %s: %s", _SUPPRESSIONS_PATH, exc)
-        return False
+        return "failed", str(exc)
     if not resolved_target.is_relative_to(base):
-        log.error("Refusing to write %s — it resolves outside the scanned repository", _SUPPRESSIONS_PATH)
-        return False
+        msg = f"{_SUPPRESSIONS_PATH} resolves outside the scanned repository"
+        log.error("Refusing to write %s — %s", _SUPPRESSIONS_PATH, msg)
+        return "failed", msg
 
     supp_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1722,7 +1902,7 @@ def apply_suppression_commands(
                    for sid, reason, author, created_at in commands if sid not in existing]
     if not new_entries:
         log.info("All suppression commands already in file — nothing to add")
-        return False
+        return "nothing_todo", ""
 
     # Build YAML entries
     yaml_lines: list[str] = []
@@ -1746,7 +1926,7 @@ def apply_suppression_commands(
             f.write(new_text)
     except OSError as exc:
         log.error("Refusing to write %s: %s", _SUPPRESSIONS_PATH, exc)
-        return False
+        return "failed", str(exc)
 
     # Git commit and push. origin is now a credential-free URL (see SEC-07), so
     # the push needs the credential supplied out-of-band the same way the clone
@@ -1760,10 +1940,11 @@ def apply_suppression_commands(
         _git(["commit", "-m", f"suppress: {len(new_entries)} finding(s) via PR comment"], cwd=pr_dir)
         _git(["push", "origin", head_branch], cwd=pr_dir, env=auth_env)
         log.info("Pushed %d suppression(s) to %s — pipeline will re-run", len(new_entries), head_branch)
-        return True
+        return "applied", ""
     except subprocess.CalledProcessError as exc:
-        log.error("Failed to push suppressions: %s", exc.stderr or str(exc))
-        return False
+        detail = (exc.stderr or str(exc)).strip()
+        log.error("Failed to push suppressions: %s", detail)
+        return "failed", detail
 
 # ── Comment rendering ──────────────────────────────────────────────────────────
 
@@ -1928,8 +2109,38 @@ def _unescape_suppression_reason(s: str) -> str:
     return "".join(out)
 
 
+def _strip_inline_comment(val: str) -> str:
+    """Drop a trailing `# comment` from a scalar, respecting quotes.
+
+    `- id: abc123  # false positive` previously yielded the id
+    `abc123  # false positive`, which then matched nothing. Only a `#` that is
+    OUTSIDE any quote and preceded by whitespace starts a comment, so a
+    legitimate `reason: "fails on #4 in prod"` survives intact. See QUAL-15.
+    """
+    in_single = in_double = False
+    for i, ch in enumerate(val):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            if i == 0 or val[i - 1].isspace():
+                return val[:i].rstrip()
+    return val
+
+
 def _parse_suppressions_file(scan_dir: str) -> dict[str, dict]:
     """Parse .zagware/suppressions.yaml into {similarity_id: {reason, added_by, added_at}}.
+
+    A deliberately small line-oriented parser, not full YAML: the scanner is
+    stdlib-only by design so the runtime image needs no pip step (see the
+    README's Self-hosting section), and PyYAML would break that. The trade-off
+    is that it must FAIL LOUDLY rather than silently half-parse — a
+    yaml-lint-clean file that this parser only partly understood used to leave
+    the finding unsuppressed, the build red, and a plausible-looking
+    "Loaded N suppression(s)" in the log with nothing indicating which entries
+    were dropped. Every discard is now logged with its line number, and the
+    parsed/total counts are reported so a mismatch is visible. See QUAL-15.
 
     added_by/added_at come from the suppressed_by/suppressed_at fields written by
     apply_suppression_commands() for entries added via /zagware suppress PR comments.
@@ -1944,42 +2155,78 @@ def _parse_suppressions_file(scan_dir: str) -> dict[str, dict]:
 
     records: dict[str, dict] = {}
     current: dict = {}
+    current_line = 0
+    blocks_seen = 0
 
     def _flush() -> None:
+        nonlocal blocks_seen
+        if not current:
+            return
+        blocks_seen += 1
         sid = current.get("id")
-        if sid:
-            records[sid] = {
-                "reason":   current.get("reason", ""),
-                "added_by": current.get("suppressed_by"),
-                "added_at": current.get("suppressed_at"),
-                "expires":  current.get("expires"),
-            }
+        if not sid:
+            log.warning(
+                "Ignoring suppression entry starting at %s line %d: no 'id' field "
+                "(keys present: %s)",
+                _SUPPRESSIONS_PATH, current_line, ", ".join(sorted(current)) or "none",
+            )
+            return
+        records[sid] = {
+            "reason":   current.get("reason", ""),
+            "added_by": current.get("suppressed_by"),
+            "added_at": current.get("suppressed_at"),
+            "expires":  current.get("expires"),
+        }
 
-    for line in text.splitlines():
+    for lineno, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if stripped.startswith("- "):
+        if stripped.startswith("- ") or stripped == "-":
+            # `-` alone on its own line is valid YAML for a list item whose
+            # keys follow on subsequent lines; it previously failed the
+            # startswith("- ") test, so those keys silently merged into the
+            # PREVIOUS record. See QUAL-15.
             _flush()
             current = {}
-            stripped = stripped[2:]
-        if ":" in stripped:
-            key, _, val = stripped.partition(":")
-            key = key.strip()
-            val = val.strip()
-            # Strip exactly one matching outer quote pair -- not
-            # .strip('"').strip("'"), which removes *every* leading/trailing
-            # occurrence and mangles a reason like `"he said \"hi\""` into
-            # `he said \"hi\` with a dangling backslash. Only a double-quoted
-            # value gets unescaped (single-quoted values carry no escapes).
-            if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
-                val = _unescape_suppression_reason(val[1:-1])
-            elif len(val) >= 2 and val[0] == "'" and val[-1] == "'":
-                val = val[1:-1]
-            if key == "similarity_id":
-                key = "id"
-            current[key] = val
+            current_line = lineno
+            stripped = stripped[2:] if stripped.startswith("- ") else ""
+            if not stripped:
+                continue
+        if ":" not in stripped:
+            log.warning("Ignoring unparseable line %d in %s: %r (expected 'key: value')",
+                        lineno, _SUPPRESSIONS_PATH, stripped[:80])
+            continue
+        key, _, val = stripped.partition(":")
+        key = key.strip()
+        val = _strip_inline_comment(val.strip()).strip()
+        # Strip exactly one matching outer quote pair -- not
+        # .strip('"').strip("'"), which removes *every* leading/trailing
+        # occurrence and mangles a reason like `"he said \"hi\""` into
+        # `he said \"hi\` with a dangling backslash. Only a double-quoted
+        # value gets unescaped (single-quoted values carry no escapes).
+        if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+            val = _unescape_suppression_reason(val[1:-1])
+        elif len(val) >= 2 and val[0] == "'" and val[-1] == "'":
+            val = val[1:-1]
+        elif val[:1] in ("[", "{", ">", "|"):
+            # Flow style, block scalars and anchors are valid YAML this parser
+            # cannot represent. Refusing loudly beats storing a half-value.
+            log.warning(
+                "Ignoring %r at %s line %d: flow style, block scalars and anchors are "
+                "not supported — use a plain or double-quoted scalar",
+                key, _SUPPRESSIONS_PATH, lineno,
+            )
+            continue
+        if key == "similarity_id":
+            key = "id"
+        current[key] = val
     _flush()
+
+    if blocks_seen != len(records):
+        log.warning("Parsed %d of %d suppression entries in %s — %d were skipped; "
+                    "see the warnings above",
+                    len(records), blocks_seen, _SUPPRESSIONS_PATH, blocks_seen - len(records))
     return records
 
 
@@ -2147,11 +2394,39 @@ def render_sca_section(
     base_sca: list[dict] | None, head_sca: list[dict] | None, novel_sca: list[dict],
     collapsible: bool = True,
 ) -> str:
-    """Return the SCA block to append to the PR comment. Empty string if no SCA data."""
+    """Return the SCA block to append to the PR comment.
+
+    Three outcomes, three renderings. They used to collapse into one silent
+    empty string, so "SCA is off", "no manifests were found" and "SCA ran and
+    the repo is clean" were indistinguishable. A Go monorepo using only go.mod
+    (absent from _SCA_MANIFESTS) showed no SCA section at all and the user
+    reasonably concluded there were no dependency vulnerabilities, when in
+    fact nothing had been scanned. See QUAL-08.
+
+      SCA disabled                -> "" (the operator turned it off; say nothing)
+      enabled, both sides None    -> explicit "no manifests found — skipped"
+      anything actually scanned   -> the full table, including the ✅ line, so
+                                     coverage is visible even at zero findings
+
+    run_sca_scan returns None for BOTH "disabled" and "no manifests", so the
+    two are separated here by consulting _SCA_ENABLED directly rather than by
+    over-reading None.
+    """
+    if not _SCA_ENABLED:
+        return ""
+    if base_sca is None and head_sca is None:
+        return "\n".join([
+            "", "---", "## 📦 Zagware SCA — Dependency Vulnerabilities", "",
+            "> ℹ️ **No dependency manifests found — SCA skipped.** Nothing was scanned for "
+            "dependency vulnerabilities; this is *not* a statement that the dependencies "
+            "are clean. Supported manifests: "
+            + ", ".join(f"`{m}`" for m in _SCA_MANIFESTS) + ".",
+            "",
+        ])
+    # One side may still be None (the PR added or removed the only manifest);
+    # that side genuinely had nothing to scan, so it counts as zero findings.
     base_list = base_sca or []
     head_list = head_sca or []
-    if not head_list and not base_list:
-        return ""
     by_sev: dict[str, list[dict]] = {}
     for f in novel_sca:
         by_sev.setdefault(f.get("severity", "UNKNOWN"), []).append(f)
@@ -2231,13 +2506,18 @@ def render_secrets_section(
     QUAL-02: ZAGWARE_SECRETS_FAIL_ON_PUBLIC applies conservatively in that case,
     and the comment says so rather than leaving that only in the build log.
 
+    Like the SCA section, this distinguishes three outcomes rather than
+    collapsing them into one empty string: both None means secrets scanning is
+    disabled (say nothing), otherwise the table renders — including the ✅
+    line at zero findings — so coverage is visible. See QUAL-08.
+
     Never renders the secret value itself — only rule_id/file_path/line/tags/
     validation_status, matching what run_secrets_scan() reads from the report.
     """
+    if not _SECRETS_ENABLED:
+        return ""
     base_list = base_secrets or []
     head_list = head_secrets or []
-    if not head_list and not base_list:
-        return ""
     L = [
         "", "---", "## 🔑 Zagware Secrets — Leaked Credentials", "",
         "| | Base | This PR | New |",
@@ -2741,9 +3021,32 @@ def main() -> int:
     if _FAIL_ON_NEW:
         log.info("ZAGWARE_FAIL_ON_NEW=true — build will fail on new findings")
 
-    clone_url   = platform.clone_url()
-    base_branch = platform.base_branch()
-    head_branch = platform.head_branch()
+    # A PR context is a hard precondition: the scanner's entire output is a
+    # diff of the head against the base. Checked BEFORE clone_url() or
+    # base_branch(), because those are exactly what blew up differently on
+    # each platform -- an empty --branch on GitHub, an unhandled KeyError on
+    # GitLab/Bitbucket, and on Azure a silent fallback to the literal "main"
+    # that produced a permanently green build diffing main against itself.
+    # See QUAL-09.
+    if not platform.is_pr_pipeline():
+        log.error(
+            "Not a pull/merge request pipeline — the scanner compares a PR against its "
+            "base branch and has nothing to diff here. Detected platform: %s. "
+            "Run it on a pull_request / merge_request trigger.", platform.name(),
+        )
+        track_scan_failed(platform.name(), platform.repo(), "not_a_pr_pipeline")
+        return 1
+
+    try:
+        clone_url   = platform.clone_url()
+        base_branch = platform.base_branch()
+        head_branch = platform.head_branch()
+    except KeyError as exc:
+        # Name the missing variable instead of surfacing a bare KeyError.
+        log.error("Required %s environment variable is not set: %s",
+                  platform.name(), exc.args[0] if exc.args else exc)
+        track_scan_failed(platform.name(), platform.repo(), "missing_env_var")
+        return 1
     log.info("Repository: %s", clone_url.split("@", 1)[-1])  # redact credentials
     log.info("Base → %s  |  Head → %s", base_branch, head_branch)
 
@@ -2825,7 +3128,7 @@ def main() -> int:
             upload_to_platform(
                 _platform_url, _platform_token,
                 platform.repo(),
-                base_branch, '', head_branch, '',
+                base_branch, platform.base_sha(), head_branch, platform.head_sha(),
                 platform.pr_number(),
                 _redact_kics_results(base_results), _redact_kics_results(pr_results),
             )
@@ -2916,24 +3219,42 @@ def main() -> int:
         # relying on the push to auto-retrigger doesn't work (GITHUB_TOKEN pushes
         # don't fire new workflow runs on GitHub).
         just_suppressed: list[tuple[str, str, str, str]] = []  # (id, reason, author, created_at)
+        suppression_failure = ""  # non-empty -> surfaced in the comment (QUAL-18)
         if platform.pr_number() is not None:
             try:
                 comments = _filter_authorized_comments(platform.read_pr_comments())
                 commands = parse_suppression_commands(comments)
                 resolved: list[tuple[str, str, str, str]] = []
                 for raw_id, reason, author, created_at in commands:
-                    full_id = resolve_suppression_id(raw_id, novel, novel_sca, novel_secrets)
-                    if full_id:
+                    outcome, full_id, n = resolve_suppression_id(
+                        raw_id, novel, novel_sca, novel_secrets)
+                    if outcome == "resolved":
                         resolved.append((full_id, reason, author, created_at))
-                    elif raw_id not in suppressed_ids:
+                    elif outcome == "ambiguous":
+                        # Distinct from not-found: the user needs more
+                        # characters, not a different id. See QUAL-17.
+                        log.warning(
+                            "Suppress id '%s' is ambiguous — matches %d findings; "
+                            "use more characters", raw_id, n,
+                        )
+                    elif not any(s.startswith(raw_id) for s in suppressed_ids):
+                        # Compare by PREFIX: the comment displays 16-char
+                        # prefixes and tells users 6+ is enough, while
+                        # suppressed_ids holds full 64-char hashes. The old
+                        # `raw_id not in suppressed_ids` was therefore never
+                        # true for a copy-pasted id, so an already-suppressed
+                        # finding logged this warning on every run forever --
+                        # 12 suppressions meant 12 spurious WARNINGs per push,
+                        # burying the real ones at the same level. See QUAL-17.
                         log.warning(
                             "Suppress command '%s' doesn't match any current finding "
-                            "(already fixed, already suppressed, or a bad id)", raw_id,
+                            "(already fixed or a bad id)", raw_id,
                         )
                 if resolved:
                     log.info("Resolved %d suppression command(s)", len(resolved))
-                    pushed = apply_suppression_commands(pr_dir, clone_url, head_branch, resolved)
-                    if pushed:
+                    outcome, detail = apply_suppression_commands(
+                        pr_dir, clone_url, head_branch, resolved)
+                    if outcome == "applied":
                         suppressed_ids |= {sid for sid, _, _, _ in resolved}
                         just_suppressed = resolved
                         track_suppression_applied(platform.name(), platform.repo(), len(resolved))
@@ -2942,6 +3263,12 @@ def main() -> int:
                         novel_secrets = new_secrets_findings(base_secrets, head_secrets, suppressed_ids)
                         log.info("Applied — recomputed: %d IaC new, %d SCA new, %d Secrets new",
                                  count_findings(novel), len(novel_sca), len(novel_secrets))
+                    elif outcome == "failed":
+                        # Surfaced in the comment below, not just the log: the
+                        # requesting user is looking at the PR, and a silent
+                        # failure here is indistinguishable from the feature
+                        # being broken. See QUAL-18.
+                        suppression_failure = detail
             except Exception as exc:
                 log.warning("Failed to process suppression commands: %s", exc)
 
@@ -2962,6 +3289,18 @@ def main() -> int:
                 timings["platform_upload_suppressions"] = time.perf_counter() - t0
 
         comment = ""
+        if suppression_failure:
+            # The PR comment is the only surface the requesting user is
+            # looking at. Without this the comment came back byte-identical
+            # and they concluded the feature was broken. See QUAL-18.
+            comment += (
+                f"> ⚠️ **Could not record suppression(s)** — the push to "
+                f"`{_cell(head_branch, 60)}` was rejected: {_cell(suppression_failure, 300)}\n"
+                f">\n"
+                f"> Grant the job `contents: write`, check branch protection, or add the "
+                f"entries to `.zagware/suppressions.yaml` manually. **The suppression was "
+                f"NOT saved and will not apply on future runs.**\n\n"
+            )
         if just_suppressed:
             ids_str = ", ".join(f"`{sid[:16]}`" for sid, _, _, _ in just_suppressed[:5])
             comment += (
