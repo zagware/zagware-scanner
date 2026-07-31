@@ -2,7 +2,7 @@
 
 scanner.py snapshots every ZAGWARE_* environment variable into a module-level
 constant at import time (this is itself QUAL-19/QUAL-20 — see
-REVIEW-2026-07-30.md). Until that is refactored into a proper config object,
+the 2026-07-30 audit). Until that is refactored into a proper config object,
 tests that need a non-default config MUST reload the module rather than
 relying on os.environ mutation alone, or the constants will not reflect the
 new values.

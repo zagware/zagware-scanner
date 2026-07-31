@@ -1,4 +1,4 @@
-"""Tests for the 10 LOW findings from REVIEW-2026-07-30.md — the final phase.
+"""Tests for the 10 LOW findings from the 2026-07-30 audit — the final phase.
 
 SEC-11 Grype writes to disk / artifacts not inflated
 SEC-12 _git is bounded by a timeout

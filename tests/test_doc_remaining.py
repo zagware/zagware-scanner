@@ -1,5 +1,5 @@
 """Tests for DOC-13/DOC-14/DOC-15/DOC-16/DOC-17/DOC-18/DOC-19/DOC-20/DOC-26:
-the remaining README and examples/ documentation defects from REVIEW-2026-07-30.
+the remaining README and examples/ documentation defects from the 2026-07-30 audit.
 
 DOC-13: BITBUCKET_GIT_USER is read by the scanner and defaults to
 `{workspace}-admin` -- a convention, not a guarantee. When it does not hold the

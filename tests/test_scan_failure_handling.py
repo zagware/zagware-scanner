@@ -8,7 +8,7 @@ return [] — indistinguishable from "scanned successfully, found nothing" —
 so the PR comment asserted "No new findings" while nothing was actually
 scanned. This is the same failure shape independently proven live in this
 repo's own CI workflows (grype never installed on the runner — see
-REVIEW-2026-07-30.md Verified evidence #1).
+the 2026-07-30 audit, Verified evidence #1).
 """
 from __future__ import annotations
 

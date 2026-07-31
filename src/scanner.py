@@ -39,7 +39,13 @@ import hashlib
 
 
 # ── Internal constants ─────────────────────────────────────────────────────────
-__version__ = "2.10.0"
+# 3.0.0 is a major bump for three behavioural contracts, not new features: exit
+# code 2 now distinguishes a crashed scanner from a fired policy gate, the scan
+# artifacts are compact JSON rather than indented, and the SCA/Secrets sections
+# render three outcomes where they previously collapsed into one. 2.9.0 and
+# 2.10.0 were set in source during the audit but never tagged or published, so
+# this is the first release since 2.8.2. See CHANGELOG.md.
+__version__ = "3.0.0"
 
 # Boolean-shaped env vars previously used five different, mutually incompatible
 # parsing conventions (.lower()=="true", .lower()!="false", bare truthiness, and
@@ -1326,7 +1332,7 @@ class ScanFailure(RuntimeError):
     issues. Subclasses RuntimeError so any existing `except RuntimeError`
     handler still catches it; callers that need to distinguish scan failures
     specifically should catch ScanFailure. Callers MUST NOT treat this the
-    same as an empty result list. See QUAL-01 in REVIEW-2026-07-30.md.
+    same as an empty result list. See QUAL-01 in the 2026-07-30 audit (CHANGELOG.md).
     """
 
 
@@ -1534,7 +1540,7 @@ def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
     Raises:
         ScanFailure — Syft or Grype crashed, timed out, or produced unreadable
         output. Callers MUST treat this as a failed scan, not as "zero
-        findings" — see QUAL-01 in REVIEW-2026-07-30.md.
+        findings" — see QUAL-01 in the 2026-07-30 audit (CHANGELOG.md).
     """
     if not _SCA_ENABLED:
         return None
@@ -1734,7 +1740,7 @@ def run_secrets_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
     Raises:
         ScanFailure — betterleaks crashed, timed out, or produced unreadable
         output. Callers MUST treat this as a failed scan, not as "zero
-        findings" — see QUAL-01 in REVIEW-2026-07-30.md.
+        findings" — see QUAL-01 in the 2026-07-30 audit (CHANGELOG.md).
     """
     if not _SECRETS_ENABLED:
         return None
@@ -1862,7 +1868,7 @@ def _filter_authorized_comments(comments: list[dict]) -> list[dict]:
 
     MUST be called on every comment list before it reaches
     parse_suppression_commands(); that function does not itself check
-    authorization. See SEC-01 in REVIEW-2026-07-30.md.
+    authorization. See SEC-01 in the 2026-07-30 audit (CHANGELOG.md).
     """
     allowed: list[dict] = []
     for c in comments:
@@ -3155,7 +3161,7 @@ def _secrets_public_gate(repo_visibility: str, has_novel_secrets: bool) -> tuple
     main()'s clone/scan machinery: "unknown" visibility is treated the same
     as "public" (fail closed) unless the operator explicitly opts out via
     ZAGWARE_ASSUME_PRIVATE — a transient API error or missing permission must
-    not silently disable this guarantee. See QUAL-02 in REVIEW-2026-07-30.md.
+    not silently disable this guarantee. See QUAL-02 in the 2026-07-30 audit (CHANGELOG.md).
 
     Returns (should_fail, reason) where reason is "public", "unknown", or None.
     """

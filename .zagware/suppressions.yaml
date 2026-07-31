@@ -4,8 +4,10 @@
 # false positives or accepted-risk findings from the scanner's PR diff.
 #
 # Each entry suppresses a finding by its similarity_id (a SHA256 fingerprint
-# of the finding's unique identity). Find the similarity_id in the scan
-# artifacts (zagware-scan-results/summary.json or the PR comment's raw JSON).
+# of the finding's unique identity). Find the similarity_id in the net-new
+# scan artifacts — zagware-scan-results/iac-new.json, sca-new.json, or
+# secrets-new.json — or by copying it from the PR comment's suppression hint.
+# (summary.json holds only repo metadata and timings, never a similarity_id.)
 #
 # Format:
 #   - id: <similarity_id>        # required — the fingerprint to suppress

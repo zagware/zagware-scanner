@@ -12,7 +12,7 @@ see tests/README.md.
 
 Anchor regression this whole file exists to prevent: before the fix, the real
 publish.yml self-scan step completed in 3ms and printed "0" because `grype`
-was never installed on the runner (see REVIEW-2026-07-30.md, Verified
+was never installed on the runner (see the 2026-07-30 audit, Verified
 evidence #1). A script that can print a fabricated "0"/"999" must never pass
 these tests again.
 """

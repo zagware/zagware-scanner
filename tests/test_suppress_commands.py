@@ -6,7 +6,7 @@ src/scanner.py, so they're covered together.
 
 Threat model exercised here: a hostile PR contributor with no repo privilege
 posting `/zagware suppress <id> <reason>` on a public repo (SEC-01's exact
-scenario from REVIEW-2026-07-30.md).
+scenario from the 2026-07-30 audit).
 """
 from __future__ import annotations
 

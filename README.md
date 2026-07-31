@@ -602,7 +602,7 @@ or not the platform integration is configured:
 | `secrets-head.json` | betterleaks findings on the PR branch |
 | `secrets-new.json` | Net-new Secrets findings introduced by this PR — `[].similarity_id` for suppression ids |
 | `pr-comment.md` | The rendered markdown comment posted to the PR |
-| `summary.json` | Metadata (repo, branches, PR number, repo visibility) plus per-phase timings in seconds |
+| `summary.json` | Metadata (repo, branches, PR number, repo visibility), per-engine base/head/new finding counts, and per-phase timings in seconds. Contains no `similarity_id` — use the `*-new.json` files above for suppression ids. |
 
 Each of the four example CI files ([GitHub Actions](examples/github-actions.yml),
 [GitLab CI](examples/gitlab-ci.yml), [Bitbucket Pipelines](examples/bitbucket-pipelines.yml),
