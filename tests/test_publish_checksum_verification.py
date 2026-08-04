@@ -18,6 +18,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+import re
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -138,3 +139,37 @@ class TestChecksumVerificationAgainstRealUpstream:
         )
         assert proc.returncode != 0
         assert "does not match the signed manifest" in (proc.stdout + proc.stderr)
+
+
+class TestGrypePinIsSingleSourced:
+    """The install-grype composite action carries its own copy of
+    GRYPE_VERSION/GRYPE_CHECKSUM, duplicating the Dockerfile's. SUP-08 flagged
+    the duplication; nothing enforced it, so bumping the Dockerfile to v0.116.1
+    left the action pinning v0.112.0 -- the CVE-gating workflows would have
+    scanned with a four-releases-old Grype while the image shipped a current
+    one. Until the two are genuinely unified, this asserts they agree.
+    """
+
+    def _dockerfile_arg(self, name: str) -> str:
+        text = (REPO_ROOT / "Dockerfile").read_text()
+        m = re.search(rf"^ARG {name}=(.+)$", text, re.MULTILINE)
+        assert m, f"ARG {name} not found in Dockerfile"
+        return m.group(1).strip()
+
+    def _action_env(self, name: str) -> str:
+        doc = yaml.safe_load(
+            (REPO_ROOT / ".github/actions/install-grype/action.yml").read_text()
+        )
+        env = doc["runs"]["steps"][0]["env"]
+        return str(env[name]).strip()
+
+    def test_version_matches_dockerfile(self):
+        assert self._action_env("GRYPE_VERSION") == self._dockerfile_arg("GRYPE_VERSION")
+
+    def test_checksum_matches_dockerfile(self):
+        assert self._action_env("GRYPE_CHECKSUM") == self._dockerfile_arg("GRYPE_CHECKSUM")
+
+    def test_bare_version_is_the_tag_without_the_v(self):
+        """GRYPE_VER is used to build the download filename; a mismatch with
+        GRYPE_VERSION produces a 404 rather than a checksum failure."""
+        assert self._action_env("GRYPE_VER") == self._action_env("GRYPE_VERSION").lstrip("v")

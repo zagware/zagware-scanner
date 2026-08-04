@@ -242,12 +242,24 @@ def _run_resolve(tmp_path: Path, versions: str, *,
     script = _run_block(".github/workflows/promote.yml", RESOLVE_STEP)
     assert "${{" not in script, "this step must not interpolate GH expressions into bash"
 
+    # The cooling gate reads COOLING_DAYS from the workflow-level `env:` block,
+    # which the extracted run-block alone does not carry. Inject it FROM the
+    # workflow rather than restating 7 here -- a hardcoded copy would keep
+    # passing after someone changed the real threshold, which is precisely the
+    # bug this suite exists to catch.
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/promote.yml").read_text()
+    )
+    workflow_env = {k: str(v) for k, v in (workflow.get("env") or {}).items()}
+    assert "COOLING_DAYS" in workflow_env, "promote.yml no longer defines COOLING_DAYS"
+
     fixture = tmp_path / "versions.json"
     fixture.write_text(versions)
 
     return _bash(
         script, tmp_path,
         env_overrides={
+            **workflow_env,
             "GH_TOKEN": "test-token",
             "FAKE_LATEST_DIGEST": latest_digest,
             "FAKE_STABLE_DIGEST": stable_digest,
@@ -686,3 +698,86 @@ class TestKicsRulesVerificationBehaviour:
                                 **kwargs)
         assert proc.returncode != 0
         assert "::error::" in (proc.stdout + proc.stderr)
+
+
+@pytest.mark.integration
+class TestCoolingPeriodIsSevenDays:
+    """The threshold itself, asserted behaviourally. The tests above use ages
+    of 1 and 40 days, which straddle both the old 14 and the new 7 -- so they
+    pass under either and pin nothing. These bracket the actual boundary.
+    """
+
+    def test_the_declared_period_is_seven_days(self):
+        workflow = yaml.safe_load(
+            (REPO_ROOT / ".github/workflows/promote.yml").read_text()
+        )
+        assert int(workflow["env"]["COOLING_DAYS"]) == 7
+
+    def test_six_days_old_is_refused(self, tmp_path):
+        versions = _versions_fixture([
+            {"digest": LATEST_DIGEST, "created_at": _iso_days_ago(6), "tags": ["latest"]},
+        ])
+        out = _parse_output(_run_resolve(tmp_path, versions).gh_output)
+        assert out["skip"] == "true"
+
+    def test_eight_days_old_is_promoted(self, tmp_path):
+        versions = _versions_fixture([
+            {"digest": LATEST_DIGEST, "created_at": _iso_days_ago(8.04), "tags": ["latest"]},
+        ])
+        out = _parse_output(_run_resolve(tmp_path, versions).gh_output)
+        assert out["skip"] == "false"
+        assert out["age_days"] == "8"
+
+    def test_no_stale_literal_threshold_remains(self):
+        """Six copies of `14` used to live in this file, three of them in
+        operator-facing error strings. A gate whose error message disagrees
+        with the gate is worse than no message."""
+        text = (REPO_ROOT / ".github/workflows/promote.yml").read_text()
+        live = "\n".join(l for l in text.splitlines() if not l.strip().startswith("#"))
+        assert "-lt 14" not in live
+        assert "14-day" not in live
+
+
+class TestToolCurrencyWorkflow:
+    """The watch that would have caught KICS going binary-less months earlier."""
+
+    def _doc(self):
+        return yaml.safe_load(
+            (REPO_ROOT / ".github/workflows/tool-currency.yml").read_text()
+        )
+
+    def test_runs_on_a_schedule(self):
+        on = self._doc()[True] if True in self._doc() else self._doc()["on"]
+        assert "schedule" in on
+
+    def test_cannot_write_repository_contents(self):
+        """It reports; a human decides. Write access to contents would let a
+        bad upstream lookup rewrite our pins unattended."""
+        job = self._doc()["jobs"]["currency"]
+        assert job["permissions"]["contents"] == "read"
+        assert job["permissions"]["issues"] == "write"
+
+    def test_watches_every_bundled_tool(self):
+        text = (REPO_ROOT / ".github/workflows/tool-currency.yml").read_text()
+        for repo in ("Checkmarx/kics", "anchore/syft", "anchore/grype",
+                     "betterleaks/betterleaks"):
+            assert repo in text, f"{repo} is not watched"
+
+    def test_watches_every_pinned_base_image(self):
+        text = (REPO_ROOT / ".github/workflows/tool-currency.yml").read_text()
+        for arg in ("WOLFI_DIGEST", "DEBIAN_DIGEST", "GO_DIGEST"):
+            assert arg in text, f"{arg} pin is not checked for pullability"
+
+    def test_escalation_requires_fixable_cves(self):
+        """Escalating on unfixable findings would make the signal permanent --
+        two containerd advisories in KICS have no upstream patch at all."""
+        text = (REPO_ROOT / ".github/workflows/tool-currency.yml").read_text()
+        assert "c.fixable > 0 &&" in text
+
+    def test_unknown_release_age_is_never_treated_as_fresh(self):
+        """A failed date parse previously produced days-since-epoch, which read
+        as catastrophically stale; the opposite error -- reading as 0 days --
+        would silently suppress the escalation this workflow exists for."""
+        text = (REPO_ROOT / ".github/workflows/tool-currency.yml").read_text()
+        assert "AGE=-1" in text
+        assert "unknownAge" in text

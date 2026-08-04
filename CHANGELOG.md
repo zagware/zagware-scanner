@@ -8,6 +8,53 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Versions are published as container tags — see the
 [pinning guidance](README.md#pinning-to-a-specific-version) for which tag to depend on.
 
+## [Unreleased]
+
+Release-process and CI changes only. The scanner and the image are unchanged,
+so there is no version bump — `__version__` identifies image contents and those
+did not move.
+
+### Changed
+
+- **Promotion cooling period 14 days → 7.** The window exists so a regression can
+  surface in real pipelines before an image becomes `:stable`; at two weeks it
+  mostly delayed *security fixes* reaching the channel recommended for
+  production. Every regression actually shipped has surfaced within hours to a
+  day or two. The value is now a single `COOLING_DAYS` in `promote.yml` — it had
+  been the literal `14` in six places, three of them operator-facing error
+  strings, which is how a gate and its own error message drift apart.
+- **The promotion gate and the weekly audit now fire on *fixable* CRITICAL/HIGH
+  findings**, not the raw count. Two `containerd` advisories inside KICS have no
+  upstream patch in existence, so a raw-count gate would have filed an identical
+  issue every week forever for something nobody can action. Totals are still
+  reported everywhere; they just no longer block a release.
+
+### Added
+
+- **`tool-currency.yml`** — a weekly watch over the four bundled scanners and
+  three base images, maintaining one continuously-updated issue. It never edits
+  a pin; it reports. Three signals: *behind* (newer upstream release), *escalate*
+  (fixable CVEs **and** upstream quiet for 90 days or no longer shipping
+  `linux/amd64` binaries), and *unpullable pin* (a pinned base digest that no
+  longer resolves — a live risk, since Chainguard garbage-collects old digests).
+  The escalation signal is the one that caught us out: Checkmarx stopped
+  publishing KICS binaries after v2.1.20 and nothing alerted.
+- README section **"Keeping the tools current"**, documenting the currency
+  signals, the criteria under which we build a tool from source, and the trade
+  that decision makes — a source build gains control of the Go toolchain but
+  gives up the vendor's cosign release signature, which is why KICS qualifies
+  and Syft, Grype, and betterleaks do not.
+- README section **"Our vulnerability posture"**, publishing the actual CVE
+  numbers and the fixable/unfixable split rather than claiming zero.
+
+### Fixed
+
+- The `install-grype` composite action still pinned Grype **v0.112.0** after the
+  Dockerfile moved to v0.116.1, so every CVE-gating workflow was scanning with a
+  four-releases-old scanner while the image shipped a current one. SUP-08 had
+  flagged the duplication but nothing enforced it; a test now asserts the two
+  agree.
+
 ## [3.1.0] — 2026-07-31
 
 Container CVE reduction. **Critical/high drops from 153 to 8** and total matches

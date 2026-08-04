@@ -63,17 +63,29 @@ jobs:
             exit 1
           fi
 
-          HIGH_COUNT=$(echo "$SCAN_JSON" | jq '[.matches[] | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length')
+          # Split fixable from unfixable. The gate fires on FIXABLE only.
+          # Two containerd advisories inside KICS have no upstream patch, so a
+          # raw-count gate would file an identical issue every week forever for
+          # something nobody can action -- and an alert that is always red is an
+          # alert nobody reads. The total is still reported so unfixable
+          # findings stay visible rather than being silently dropped.
+          HIGH_COUNT=$(echo "$SCAN_JSON" | jq '[.matches[]
+            | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length')
+          FIXABLE_COUNT=$(echo "$SCAN_JSON" | jq '[.matches[]
+            | select(.vulnerability.severity | ascii_downcase | test("high|critical"))
+            | select((.vulnerability.fix.state // "") == "fixed")] | length')
 
           echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
-          echo "Found $HIGH_COUNT HIGH/CRITICAL vulnerabilities in :stable"
+          echo "fixable_count=$FIXABLE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Found $HIGH_COUNT HIGH/CRITICAL in :stable ($FIXABLE_COUNT with an upstream fix)"
 
       - name: Open issue for new CVEs
-        if: steps.stable.outputs.skip != 'true' && steps.scan.outputs.high_count != '0'
+        if: steps.stable.outputs.skip != 'true' && steps.scan.outputs.fixable_count != '0'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
-            const count = '${{ steps.scan.outputs.high_count }}';
+            const count = '${{ steps.scan.outputs.fixable_count }}';
+            const total = '${{ steps.scan.outputs.high_count }}';
             const digest = '${{ steps.stable.outputs.digest }}';
 
             // Check if an issue already exists for this digest
@@ -93,8 +105,8 @@ jobs:
             github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Audit alert: ${count} HIGH/CRITICAL CVEs found in :stable (${digest.substring(0, 19)})`,
-              body: `The weekly audit found **${count}** HIGH/CRITICAL vulnerabilities in the current :stable image.\n\n**Digest:** \`${digest}\`\n\n**Action required:**\n- Review the vulnerabilities and determine if they affect the scanner's runtime safety\n- If critical, consider rolling :stable back to the prior known-good digest\n- Patch the base image or affected packages and release a new version\n\nTo see the full scan results, run:\n\`\`\`bash\ngrype ghcr.io/zagware/zagware-scanner@${digest}\n\`\`\``,
+              title: `Audit alert: ${count} fixable HIGH/CRITICAL CVEs in :stable (${digest.substring(0, 19)})`,
+              body: `The weekly audit found **${count}** HIGH/CRITICAL vulnerabilities **with an upstream fix available** in the current :stable image (${total} HIGH/CRITICAL in total; the remainder have no upstream patch yet and do not trigger this alert).\n\n**Digest:** \`${digest}\`\n\n**Action required:**\n- Review the vulnerabilities and determine if they affect the scanner's runtime safety\n- If critical, consider rolling :stable back to the prior known-good digest\n- Patch the base image or affected packages and release a new version\n\nTo see the full scan results, run:\n\`\`\`bash\ngrype ghcr.io/zagware/zagware-scanner@${digest}\n\`\`\`\n\nTo see only what is actionable:\n\`\`\`bash\ngrype ghcr.io/zagware/zagware-scanner@${digest} --only-fixed\n\`\`\``,
               labels: ['security', 'audit-cve']
             });
 
@@ -103,9 +115,13 @@ jobs:
         run: |
           echo "## Weekly Audit Summary" >> $GITHUB_STEP_SUMMARY
           echo "**Stable digest:** \`${{ steps.stable.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**HIGH/CRITICAL CVEs:** ${{ steps.scan.outputs.high_count }}" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.scan.outputs.high_count }}" = "0" ]; then
-            echo "✅ No new HIGH/CRITICAL vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+          echo "**HIGH/CRITICAL CVEs:** ${{ steps.scan.outputs.high_count }} (${{ steps.scan.outputs.fixable_count }} with an upstream fix)" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.scan.outputs.fixable_count }}" = "0" ]; then
+            if [ "${{ steps.scan.outputs.high_count }}" = "0" ]; then
+              echo "✅ No HIGH/CRITICAL vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ Nothing actionable — all ${{ steps.scan.outputs.high_count }} HIGH/CRITICAL findings are awaiting an upstream fix" >> $GITHUB_STEP_SUMMARY
+            fi
           else
-            echo "⚠️ ${{ steps.scan.outputs.high_count }} HIGH/CRITICAL vulnerabilities found — issue opened" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ ${{ steps.scan.outputs.fixable_count }} fixable HIGH/CRITICAL vulnerabilities found — issue opened" >> $GITHUB_STEP_SUMMARY
           fi

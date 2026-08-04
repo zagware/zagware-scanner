@@ -1,0 +1,291 @@
+# Watches the four bundled scanner binaries and the three base images for
+# staleness, and reports in one continuously-updated issue.
+#
+# Two distinct triggers, because "a newer version exists" and "we are stuck on
+# something rotting" are different problems with different responses:
+#
+#   BEHIND    upstream published a newer release than we pin. Routine: bump,
+#             re-checksum, release.
+#
+#   ESCALATE  our pinned build carries fixable CRITICAL/HIGH CVEs *and* upstream
+#             has not published in STALE_DAYS. This is the condition that
+#             justifies building a tool from source instead of consuming its
+#             release, and it is the one nobody notices by eye. Checkmarx hit it
+#             months before we did anything: KICS shipped no usable binary after
+#             v2.1.20 while its vendored dependencies aged, and we only found
+#             out by reading a CVE report by hand.
+#
+# The escalation criteria are deliberately narrow. Building from source trades
+# away a real control -- Anchore and betterleaks sign their releases with
+# keyless cosign, verified in publish.yml before the image is built, and a
+# source build replaces that cryptographic attribution with a bare commit SHA.
+# We took that trade for KICS because there was no binary to verify and their
+# release pipeline had been compromised (TeamPCP). It is an escalation, not a
+# default. See "Keeping the tools current" in README.md.
+#
+# Read-only: this workflow never edits pins. It reports; a human decides.
+
+name: Tool currency
+
+on:
+  schedule:
+    # Mondays 07:00 UTC — a day after the promote cron, so a fresh :stable is
+    # already in place when the report lands.
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Days without an upstream release before a CVE-carrying tool is escalated.
+  # 90 is deliberately patient: a quiet month is normal for a mature scanner,
+  # a quiet quarter while shipping known-vulnerable dependencies is not.
+  STALE_DAYS: 90
+  # Image the CVE attribution is measured against. :stable, not :latest --
+  # this asks "what are users actually running", not "what did we just build".
+  IMAGE: ghcr.io/zagware/zagware-scanner:stable
+
+jobs:
+  currency:
+    name: Check upstream releases and CVE attribution
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write   # open/update the single currency issue
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: ./.github/actions/install-grype
+
+      - name: Read pinned versions from Dockerfile
+        run: sed -n 's/^ARG //p' Dockerfile >> "$GITHUB_ENV"
+
+      # ── Which of our pins are behind upstream? ────────────────────────────
+      - name: Compare pins against upstream releases
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # repo|pinned|label. KICS is compared by tag even though we build it
+          # from source: the question "is there a newer KICS" is unchanged by
+          # how we obtain it.
+          TOOLS=$(cat <<EOF
+          Checkmarx/kics|v${KICS_VERSION}|KICS
+          anchore/syft|${SYFT_VERSION}|Syft
+          anchore/grype|${GRYPE_VERSION}|Grype
+          betterleaks/betterleaks|v${BETTERLEAKS_VERSION}|betterleaks
+          EOF
+          )
+
+          echo "[]" > /tmp/tools.json
+          NOW=$(date -u +%s)
+
+          while IFS='|' read -r repo pinned label; do
+            [ -n "$repo" ] || continue
+
+            # Latest release by tag. Falls back to the newest tag when a project
+            # stops cutting releases -- which is exactly the KICS failure mode,
+            # so treating "no releases" as "up to date" would hide it.
+            LATEST=$(gh api "repos/${repo}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+            if [ -z "$LATEST" ]; then
+              LATEST=$(gh api "repos/${repo}/tags?per_page=1" --jq '.[0].name' 2>/dev/null || echo "")
+            fi
+            [ -n "$LATEST" ] || LATEST="unknown"
+
+            # Date of that release, for the staleness clock. AGE is -1 whenever
+            # it cannot be established -- never a number derived from a failed
+            # parse. `|| echo 0` here made PUB_TS=0 and AGE became days-since-
+            # epoch (~20,669), which reads as catastrophically stale and would
+            # have escalated every tool on any runner whose `date` lacks GNU
+            # `-d`. Same fabricated-fallback class SUP-01 removed from the CVE
+            # gates; caught by dry-running this on a BSD `date`.
+            PUBLISHED=$(gh api "repos/${repo}/releases/latest" --jq '.published_at' 2>/dev/null || echo "")
+            PUB_TS=""
+            if [ -n "$PUBLISHED" ]; then
+              PUB_TS=$(date -u -d "$PUBLISHED" +%s 2>/dev/null || echo "")
+            fi
+            if [ -n "$PUB_TS" ] && [ "$PUB_TS" -gt 0 ] 2>/dev/null; then
+              AGE=$(( (NOW - PUB_TS) / 86400 ))
+            else
+              AGE=-1   # unknown, and reported as unknown -- not as fresh, not as stale
+            fi
+
+            # Does the newest release actually ship a linux_amd64 artifact? A
+            # tag with no binaries is the precise thing that stranded us on
+            # KICS v2.1.20, and it is invisible from a version number alone.
+            ASSETS=$(gh api "repos/${repo}/releases/latest" \
+                       --jq '[.assets[].name | select(test("linux[_-]amd64|linux_x64"))] | length' \
+                       2>/dev/null || echo 0)
+
+            BEHIND=false
+            [ "$pinned" != "$LATEST" ] && BEHIND=true
+
+            jq -c --arg repo "$repo" --arg label "$label" --arg pinned "$pinned" \
+                  --arg latest "$LATEST" --argjson age "$AGE" \
+                  --argjson assets "${ASSETS:-0}" --argjson behind "$BEHIND" \
+              '. += [{repo:$repo,label:$label,pinned:$pinned,latest:$latest,
+                      age_days:$age,linux_assets:$assets,behind:$behind}]' \
+              /tmp/tools.json > /tmp/tools.next && mv /tmp/tools.next /tmp/tools.json
+          done <<< "$TOOLS"
+
+          echo "Upstream comparison:"
+          jq -r '.[] | "  \(.label): pinned=\(.pinned) latest=\(.latest) age=\(.age_days)d assets=\(.linux_assets)"' /tmp/tools.json
+
+      # ── Which binary owns each unfixed CVE? ───────────────────────────────
+      - name: Attribute CVEs in the shipped image to their owning binary
+        id: cves
+        run: |
+          set -euo pipefail
+
+          if ! grype -q "$IMAGE" -o json --file /tmp/img.json 2>/dev/null; then
+            echo "::warning::Could not scan ${IMAGE} — reporting upstream drift only."
+            echo '{}' > /tmp/cves.json
+            exit 0
+          fi
+
+          # Count CRITICAL/HIGH per owning binary, split by whether a fix even
+          # exists. Only *fixable* findings can escalate: two containerd
+          # advisories with no upstream patch are not a reason to fork a build,
+          # and counting them would make the signal permanent noise.
+          jq '[ .matches[]
+                | select(.vulnerability.severity | ascii_downcase
+                         | test("critical|high"))
+                | { owner: ((.artifact.locations[0].path // "unknown")
+                            | split("/") | last),
+                    fixable: ((.vulnerability.fix.state // "") == "fixed") } ]
+              | group_by(.owner)
+              | map({ key: .[0].owner,
+                      value: { total: length,
+                               fixable: (map(select(.fixable)) | length) } })
+              | from_entries' /tmp/img.json > /tmp/cves.json
+
+          echo "CVE attribution (critical/high):"
+          jq -r 'to_entries[] | "  \(.key): \(.value.total) total, \(.value.fixable) fixable"' /tmp/cves.json
+
+      # ── Are the pinned base image digests still pullable? ─────────────────
+      - name: Check base image digests still resolve
+        id: bases
+        run: |
+          set -euo pipefail
+          # Chainguard's free tier publishes only :latest and garbage-collects
+          # older digests, so a pinned Wolfi digest can become unpullable and
+          # break the build with no code change. Debian and the Go toolchain do
+          # not GC this way, but they are checked identically -- a pin that
+          # cannot be fetched is the same outage whatever the registry's policy.
+          echo "[]" > /tmp/bases.json
+          check() {
+            if docker manifest inspect "$2" >/dev/null 2>&1; then S=ok; else S=UNPULLABLE; fi
+            echo "  $1: $S"
+            jq -c --arg n "$1" --arg s "$S" '. += [{name:$n,status:$s}]' \
+              /tmp/bases.json > /tmp/b.next && mv /tmp/b.next /tmp/bases.json
+          }
+          echo "Base image pins:"
+          check "Wolfi (runtime)"  "cgr.dev/chainguard/wolfi-base@${WOLFI_DIGEST}"
+          check "Debian (builder)" "debian:bookworm-slim@${DEBIAN_DIGEST}"
+          check "Go (kics build)"  "golang:1.26.5@${GO_DIGEST}"
+
+      - name: Open or update the currency issue
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            const fs = require('fs');
+            const tools  = JSON.parse(fs.readFileSync('/tmp/tools.json', 'utf8'));
+            const cves   = JSON.parse(fs.readFileSync('/tmp/cves.json', 'utf8'));
+            const bases  = JSON.parse(fs.readFileSync('/tmp/bases.json', 'utf8'));
+            const stale  = parseInt(process.env.STALE_DAYS, 10);
+
+            // Map a repo label to the binary name grype attributes CVEs to.
+            const binaryOf = { KICS: 'kics', Syft: 'syft', Grype: 'grype',
+                               betterleaks: 'betterleaks' };
+
+            const rows = [], escalations = [], behind = [];
+            for (const t of tools) {
+              const c = cves[binaryOf[t.label]] || { total: 0, fixable: 0 };
+              const noAssets = t.linux_assets === 0;
+              // age_days === -1 means the release date could not be resolved.
+              // Treated as escalating (fail closed, consistent with the rest of
+              // this repo's gates) but reported honestly as unknown rather than
+              // as a day count we do not have.
+              const unknownAge = t.age_days < 0;
+              const isStale    = t.age_days > stale || unknownAge;
+              const escalate   = c.fixable > 0 && (isStale || noAssets);
+
+              if (t.behind) behind.push(t.label);
+              if (escalate) escalations.push({ ...t, ...c, noAssets, unknownAge });
+
+              rows.push(`| ${t.label} | \`${t.pinned}\` | \`${t.latest}\` | ` +
+                        `${t.behind ? '**yes**' : 'no'} | ` +
+                        `${t.age_days < 0 ? '?' : t.age_days + 'd'} | ` +
+                        `${noAssets ? '**none**' : t.linux_assets} | ` +
+                        `${c.total} (${c.fixable} fixable) | ` +
+                        `${escalate ? '🔴 **escalate**' : 'ok'} |`);
+            }
+
+            const badBases = bases.filter(b => b.status !== 'ok');
+
+            let body = `_Automated weekly check. This workflow never edits pins — it reports._\n\n`;
+            body += `## Bundled tools\n\n`;
+            body += `| Tool | Pinned | Latest upstream | Behind | Since release | linux/amd64 assets | Crit+High in \`:stable\` | |\n`;
+            body += `|---|---|---|---|---|---|---|---|\n${rows.join('\n')}\n\n`;
+
+            if (escalations.length) {
+              body += `## 🔴 Escalation: consider building from source\n\n`;
+              body += `These carry **fixable** critical/high CVEs while upstream has gone quiet `;
+              body += `(no release in ${stale}d) or has stopped shipping linux/amd64 binaries. `;
+              body += `That is the specific condition under which a source build is worth its cost — `;
+              body += `see "Keeping the tools current" in the README before acting, because it means `;
+              body += `giving up the vendor's release signature.\n\n`;
+              for (const e of escalations) {
+                const why = e.noAssets
+                  ? `latest release ships **no linux/amd64 asset**`
+                  : e.unknownAge
+                    ? `upstream release date could not be resolved`
+                    : `no upstream release in ${e.age_days} days`;
+                body += `- **${e.label}** — ${e.fixable} fixable crit/high; ${why}\n`;
+              }
+              body += `\n`;
+            }
+
+            if (badBases.length) {
+              body += `## 🔴 Base image pin unresolvable\n\n`;
+              body += `A pinned digest can no longer be fetched — the next build will fail.\n\n`;
+              for (const b of badBases) body += `- **${b.name}**: ${b.status}\n`;
+              body += `\n`;
+            }
+
+            if (!behind.length && !escalations.length && !badBases.length) {
+              body += `✅ Everything pinned is current, every pin resolves, and nothing is `;
+              body += `carrying fixable CVEs against a stale upstream.\n`;
+            }
+
+            body += `\n<sub>Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}</sub>`;
+
+            const TITLE = 'Tool currency: bundled scanners and base images';
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'security,tool-currency',
+            });
+
+            // One long-lived issue, edited in place. A weekly cron that opens a
+            // fresh issue trains everyone to close them unread.
+            if (existing.data.length) {
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number, body,
+              });
+              core.info(`Updated issue #${existing.data[0].number}`);
+            } else if (behind.length || escalations.length || badBases.length) {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: TITLE, body, labels: ['security', 'tool-currency'],
+              });
+              core.info(`Opened issue #${created.data.number}`);
+            } else {
+              core.info('Everything current — no issue opened.');
+            }
+
+            await core.summary.addRaw(body).write();

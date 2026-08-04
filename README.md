@@ -64,7 +64,7 @@ historical tracking, trend charts, and suppression management.
 |---|---|
 | `:<version>` | Immutable per release. Pick a tag from the [releases](https://github.com/zagware/zagware-scanner/releases) page. Pin by digest for the strongest guarantee. |
 | `:latest` | Newest release. Moves on every tag push. **Not** security-vetted. |
-| `:stable` | Promoted from `:latest` after a 14-day cooling period, a clean CVE scan, and a signature-verify check. **Not yet published** — no release has completed a full promotion cycle at time of writing. |
+| `:stable` | Promoted from `:latest` after a 7-day cooling period, a clean CVE scan, and a signature-verify check. **Not yet published** — no release has completed a full promotion cycle at time of writing. |
 | `:secure` | Identical digest to `:stable`, once `:stable` exists. |
 
 **Recommendation:** once `:stable` exists, pin it (or better, pin by digest — see
@@ -76,12 +76,21 @@ cooling-off period.
 ### Promotion workflow
 
 1. A new version is tagged → image builds as `:<version>` and `:latest`
-2. After 14 days, the promotion workflow verifies the image's cosign signature and scans it for
-   CVEs with Grype
-3. If the signature is valid and no HIGH/CRITICAL CVEs are found → `:stable` and `:secure` are
-   re-tagged to the same digest
-4. If CVEs are found → promotion is blocked, a GitHub issue is opened, `:latest` stays
+2. After the cooling period, the promotion workflow verifies the image's cosign signature and
+   scans it for CVEs with Grype
+3. If the signature is valid and no HIGH/CRITICAL CVEs with an available fix are found →
+   `:stable` and `:secure` are re-tagged to the same digest
+4. If fixable CVEs are found → promotion is blocked, a GitHub issue is opened, `:latest` stays
 5. A weekly audit workflow re-scans `:stable` for post-promotion CVE disclosures
+
+**Why 7 days.** The cooling period exists so a regression can surface in real pipelines before an
+image is blessed as `:stable`. It was originally 14 days, which in practice mostly delayed *security
+fixes* reaching the channel recommended for production — the opposite of the intent. Every
+regression we have actually shipped surfaced within hours to a day or two, not weeks. The value is
+set once as `COOLING_DAYS` in
+[`promote.yml`](.github/workflows/promote.yml); it used to be the literal `14` repeated in six
+places, including operator-facing error messages, which is how a gate and its own error text drift
+apart.
 
 ---
 
@@ -725,6 +734,94 @@ gh attestation verify oci://ghcr.io/zagware/zagware-scanner:latest \
 # sidecar tag -- so retrieve it with imagetools, not `cosign download attestation`.
 docker buildx imagetools inspect ghcr.io/zagware/zagware-scanner:latest \
   --format '{{ json .SBOM.SPDX }}' | jq -r '.packages[].name'
+```
+
+### Keeping the tools current
+
+This image bundles four third-party scanners — KICS, Syft, Grype, and betterleaks — plus three base
+images. Every one is pinned, and a pin that nobody watches is just a slow-motion vulnerability. A
+[weekly workflow](.github/workflows/tool-currency.yml) checks all seven and maintains a single,
+continuously-updated issue. It **never edits a pin**; it reports, and a human decides.
+
+It distinguishes two situations, because they call for different responses:
+
+| Signal | Meaning | Response |
+|---|---|---|
+| **Behind** | Upstream published a newer release than we pin | Routine: bump, re-checksum, release |
+| **Escalate** | Our pinned build carries **fixable** CRITICAL/HIGH CVEs **and** upstream has gone quiet (no release in 90 days) or has stopped shipping `linux/amd64` binaries | Consider building that tool from source — see below |
+| **Unpullable pin** | A pinned base-image digest can no longer be fetched | Re-pin before the next build fails |
+
+The escalation signal is the one that is genuinely hard to notice by eye, and it is the one that
+caught us out: Checkmarx quietly stopped publishing KICS binaries after v2.1.20 while its vendored
+dependencies kept ageing. Nothing failed, nothing alerted, and we only found out by reading a CVE
+report by hand. The unpullable-pin check exists for a specific known risk too — Chainguard's free
+tier publishes only `:latest` and garbage-collects older digests, so our Wolfi pin will eventually
+stop resolving.
+
+### When we build a tool from source
+
+Building from source is an **escalation, not a default**, because it is a genuine trade rather than
+a free win.
+
+What it buys: the Go toolchain becomes ours, so `stdlib` CVEs inherited from whatever compiler the
+vendor happened to use disappear. Measured on Grype v0.116.1 — 3 critical/high from Anchore's
+released `.deb`, 1 when we compile the identical commit with Go 1.26.5.
+
+What it costs: Anchore and betterleaks sign their releases with keyless cosign, and
+[`publish.yml`](.github/workflows/publish.yml) verifies those signatures *before* the image is
+built. A source build replaces that cryptographic attribution with a bare commit SHA — content-
+addressed, but not provably from the vendor. It also means our binary matches no published
+artifact, so you can no longer check it against upstream's own checksums.
+
+So we require a specific justification, and only KICS currently meets it:
+
+| | KICS | Syft / Grype / betterleaks |
+|---|---|---|
+| Upstream publishes a usable binary | **No** — none since v2.1.20 | Yes, current |
+| Release pipeline known-compromised | **Yes** — TeamPCP, Mar–Apr 2026 | No |
+| Signed releases we can verify | No | Yes (keyless cosign) |
+| **Built from source?** | **Yes** | No |
+
+For KICS there was no signature to give up and no binary to consume, so the trade was free. For the
+others it would swap a working control for a handful of `stdlib` findings that clear on the
+vendor's next release anyway. If one of them goes quiet the way Checkmarx did, the currency
+workflow will say so, and the KICS build stage in the
+[`Dockerfile`](Dockerfile) is already the template.
+
+### Our vulnerability posture
+
+We publish the numbers rather than claiming zero. As of v3.1.0, `grype` against the released image
+reports **8 CRITICAL/HIGH**, down from 153 in v3.0.2:
+
+| | v3.0.2 | v3.1.0 |
+|---|---|---|
+| Total matches | 455 | **21** |
+| Critical | 36 | **2** |
+| High | 117 | **6** |
+| From OS packages | 105 | **0** |
+
+Two things make that number honest rather than cosmetic:
+
+**We separate fixable from unfixable.** Of the 8, two are `containerd` advisories inside KICS with
+no upstream patch in existence. The promotion gate and the weekly audit both fire on **fixable**
+findings only. Gating on the raw count would have meant an identical red alert every single week
+for something nobody can action — and an alarm that is always on is an alarm nobody reads. The
+total is still reported everywhere; it is just not what blocks a release.
+
+**Zero of them come from the operating system.** That is the whole reason the runtime base is
+Wolfi. On `debian:bookworm-slim` the OS contributed 105 critical/high of which *not one was
+fixable* — 70 marked "won't fix" by Debian, 35 with no fix at all. No amount of patching would
+have closed a single one; only leaving the distro could. 44 came from `perl`, in the image purely
+because Debian's `git` depends on it.
+
+To reproduce any of this yourself:
+
+```bash
+# Everything, including findings nobody can currently act on
+grype ghcr.io/zagware/zagware-scanner:latest
+
+# Only what is actionable today -- what our gates enforce
+grype ghcr.io/zagware/zagware-scanner:latest --only-fixed
 ```
 
 ---
