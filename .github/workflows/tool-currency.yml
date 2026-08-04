@@ -42,9 +42,11 @@ env:
   # 90 is deliberately patient: a quiet month is normal for a mature scanner,
   # a quiet quarter while shipping known-vulnerable dependencies is not.
   STALE_DAYS: 90
-  # Image the CVE attribution is measured against. :stable, not :latest --
-  # this asks "what are users actually running", not "what did we just build".
+  # Image the CVE attribution is measured against. :stable first -- that asks
+  # "what are users actually running" -- falling back to :latest, which is all
+  # that exists until a release completes its first promotion cycle.
   IMAGE: ghcr.io/zagware/zagware-scanner:stable
+  FALLBACK_IMAGE: ghcr.io/zagware/zagware-scanner:latest
 
 jobs:
   currency:
@@ -141,11 +143,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          if ! grype -q "$IMAGE" -o json --file /tmp/img.json 2>/dev/null; then
-            echo "::warning::Could not scan ${IMAGE} — reporting upstream drift only."
+          # :stable is preferred -- it asks "what are users actually running".
+          # But it does not exist until a release completes its first promotion
+          # cycle, and without CVE data the escalation signal cannot fire at
+          # all. Falling back to :latest keeps the check live from day one;
+          # the first real run found exactly this gap. Which image was measured
+          # is recorded so the report is never ambiguous about its own basis.
+          SCANNED=""
+          for ref in "$IMAGE" "$FALLBACK_IMAGE"; do
+            if grype -q "$ref" -o json --file /tmp/img.json 2>/dev/null; then
+              SCANNED="$ref"; break
+            fi
+            echo "::notice::${ref} could not be scanned — trying the next candidate."
+          done
+
+          if [ -z "$SCANNED" ]; then
+            echo "::warning::Neither ${IMAGE} nor ${FALLBACK_IMAGE} could be scanned — reporting upstream drift only."
             echo '{}' > /tmp/cves.json
+            echo "none" > /tmp/scanned_ref.txt
             exit 0
           fi
+          echo "$SCANNED" > /tmp/scanned_ref.txt
+          echo "CVE attribution measured against ${SCANNED}"
 
           # Count CRITICAL/HIGH per owning binary, split by whether a fix even
           # exists. Only *fixable* findings can escalate: two containerd
@@ -197,6 +216,8 @@ jobs:
             const cves   = JSON.parse(fs.readFileSync('/tmp/cves.json', 'utf8'));
             const bases  = JSON.parse(fs.readFileSync('/tmp/bases.json', 'utf8'));
             const stale  = parseInt(process.env.STALE_DAYS, 10);
+            const scanned = fs.existsSync('/tmp/scanned_ref.txt')
+              ? fs.readFileSync('/tmp/scanned_ref.txt', 'utf8').trim() : 'none';
 
             // Map a repo label to the binary name grype attributes CVEs to.
             const binaryOf = { KICS: 'kics', Syft: 'syft', Grype: 'grype',
@@ -228,8 +249,12 @@ jobs:
             const badBases = bases.filter(b => b.status !== 'ok');
 
             let body = `_Automated weekly check. This workflow never edits pins — it reports._\n\n`;
+            body += scanned === 'none'
+              ? `> ⚠️ No image could be scanned, so the CVE column is empty and the ` +
+                `escalation signal is inactive this run. Upstream drift below is still accurate.\n\n`
+              : `_CVE columns measured against \`${scanned}\`._\n\n`;
             body += `## Bundled tools\n\n`;
-            body += `| Tool | Pinned | Latest upstream | Behind | Since release | linux/amd64 assets | Crit+High in \`:stable\` | |\n`;
+            body += `| Tool | Pinned | Latest upstream | Behind | Since release | linux/amd64 assets | Crit+High | |\n`;
             body += `|---|---|---|---|---|---|---|---|\n${rows.join('\n')}\n\n`;
 
             if (escalations.length) {

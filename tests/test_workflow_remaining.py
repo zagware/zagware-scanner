@@ -781,3 +781,18 @@ class TestToolCurrencyWorkflow:
         text = (REPO_ROOT / ".github/workflows/tool-currency.yml").read_text()
         assert "AGE=-1" in text
         assert "unknownAge" in text
+
+    def test_cve_attribution_falls_back_to_latest(self):
+        """:stable does not exist until a release completes its first promotion
+        cycle. Without a fallback the escalation signal is dead from day one --
+        the first real run of this workflow proved it, skipping CVE attribution
+        entirely."""
+        text = (REPO_ROOT / ".github/workflows/tool-currency.yml").read_text()
+        assert "FALLBACK_IMAGE" in text
+        assert 'for ref in "$IMAGE" "$FALLBACK_IMAGE"' in text
+
+    def test_report_names_the_image_it_measured(self):
+        """A CVE table whose basis is ambiguous invites the wrong conclusion."""
+        text = (REPO_ROOT / ".github/workflows/tool-currency.yml").read_text()
+        assert "scanned_ref.txt" in text
+        assert "measured against" in text
