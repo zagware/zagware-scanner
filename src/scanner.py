@@ -54,7 +54,11 @@ import hashlib
 # 3.0.2 fixes the secrets scan, broken for everyone in 3.0.0 and 3.0.1: the
 # generated betterleaks allowlist put regexes in TOML basic strings, where
 # `\.` is an invalid escape, so betterleaks refused to start. See CHANGELOG.md.
-__version__ = "3.0.2"
+#
+# 3.1.0 rebases the image on Wolfi and builds KICS from source: critical/high
+# CVEs 153 -> 8, with identical scan output. Scanner behaviour is unchanged;
+# this version exists to identify the image contents. See CHANGELOG.md.
+__version__ = "3.1.0"
 
 # Boolean-shaped env vars previously used five different, mutually incompatible
 # parsing conventions (.lower()=="true", .lower()!="false", bare truthiness, and

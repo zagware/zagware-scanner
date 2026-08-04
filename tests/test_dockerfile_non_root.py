@@ -74,11 +74,11 @@ class TestNonRootUser:
 
 
 class TestBaseImagePinnedByDigest:
-    """SUP-10: both stages must pin the debian base image by digest, not the
-    mutable `bookworm-slim` tag -- the same argument the Dockerfile already
-    makes for pinning KICS's query rules by commit SHA (a repointed tag or
-    compromised registry namespace would substitute ca-certificates, git and
-    python3 with no tracked-line change and no CI check noticing)."""
+    """SUP-10: every stage must pin its base image by digest, not by a mutable
+    tag -- the same argument the Dockerfile already makes for pinning KICS by
+    commit SHA (a repointed tag or compromised registry namespace would
+    substitute ca-certificates, git, python3, or the Go toolchain that compiles
+    KICS, with no tracked-line change and no CI check noticing)."""
 
     def _resolved_from_lines(self) -> list[str]:
         """FROM lines with any leading ARG default (e.g. ${DEBIAN_DIGEST})
@@ -105,9 +105,24 @@ class TestBaseImagePinnedByDigest:
         for line in from_lines:
             assert "@sha256:" in line, f"FROM instruction is not pinned by digest: {line!r}"
 
-    def test_both_stages_pin_the_same_digest(self):
-        """A drift between the builder and final stage's base image would
-        defeat the point of a single source of truth."""
-        from_lines = self._resolved_from_lines()
-        digests = {l.split("@", 1)[1].split()[0] for l in from_lines if "@" in l}
-        assert len(digests) == 1, f"stages pin different base image digests: {digests}"
+    def test_every_base_digest_comes_from_a_named_arg(self):
+        """Originally this asserted all stages pinned the SAME digest, which
+        made sense when there were two Debian stages. There are now three
+        deliberately different bases -- Wolfi at runtime (its OS packages
+        contributed 105 unfixable critical/high CVEs on Debian), Debian for the
+        dpkg-based download stage, and a Go toolchain to build KICS from source
+        -- so sameness is the wrong invariant.
+
+        What still matters is that no digest is hardcoded inline: each base has
+        exactly one ARG to edit when re-pinning, so a stale pin cannot hide in
+        the middle of the file.
+        """
+        text = (REPO_ROOT / "Dockerfile").read_text()
+        raw_froms = [l.strip() for l in text.splitlines()
+                     if l.strip().upper().startswith("FROM ")]
+        for line in raw_froms:
+            assert "${" in line, (
+                f"FROM pins a digest inline instead of via an ARG: {line!r}"
+            )
+        for line in self._resolved_from_lines():
+            assert "@sha256:" in line, f"unresolved base pin: {line!r}"

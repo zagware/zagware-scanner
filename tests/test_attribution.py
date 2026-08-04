@@ -48,14 +48,19 @@ class TestNoticeFile:
         assert "Checkmarx" in text and "Apache-2.0" in text
         assert "Anchore" in text
         assert "MIT" in text  # betterleaks -- the one non-Apache-2.0 component
-        assert "2.1.20" in text  # KICS version
-        assert "v1.50.0" in text  # Syft version
-        assert "v0.112.0" in text  # Grype version
-        assert "1.7.2" in text  # betterleaks version
+        # Versions are asserted against the Dockerfile in
+        # test_notice_versions_match_dockerfile_pins rather than hardcoded
+        # here. Hardcoding meant every bump broke two tests for no added
+        # coverage, and the literals were the thing that went stale.
 
     def test_notice_credits_the_kics_rules_commit(self):
-        text = (REPO_ROOT / "NOTICE").read_text()
-        assert "e1f23cad9640f55b963f22a116b04906b8c16ac6" in text
+        """KICS's Rego policies are vendored, so the NOTICE must name the exact
+        commit they came from -- now also the commit the binary is built from,
+        since the two share one pin."""
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text()
+        m = re.search(r"^ARG KICS_RULES_COMMIT=(.+)$", dockerfile, re.MULTILINE)
+        assert m, "ARG KICS_RULES_COMMIT not found in Dockerfile"
+        assert m.group(1).strip() in (REPO_ROOT / "NOTICE").read_text()
 
     def test_readme_links_to_notice(self):
         text = (REPO_ROOT / "README.md").read_text()

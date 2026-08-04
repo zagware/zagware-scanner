@@ -1,65 +1,106 @@
-# Base image pinned by digest, not the mutable `bookworm-slim` tag -- the same
-# argument Dockerfile:36-38 makes for pinning KICS's rules by commit SHA
-# applies here: a repointed tag or compromised Docker Hub namespace (the
-# TeamPCP vector cited below) would substitute ca-certificates (the CA bundle
-# every checksum download in this file trusts), git (which clones untrusted PR
-# branches at runtime) and python3 without changing a single tracked line. See
-# SUP-10. Resolved via: skopeo inspect --raw docker://debian:bookworm-slim | ...
-# or `docker manifest inspect debian:bookworm-slim`; re-pin deliberately on
-# each Debian point release, not on every build.
+# Every base image is pinned by digest, not by a mutable tag. A repointed tag
+# or compromised namespace (the TeamPCP vector cited below) would substitute
+# ca-certificates (the CA bundle every checksum download here trusts), git
+# (which clones untrusted PR branches at runtime), python3, or the Go toolchain
+# that compiles KICS -- without changing a single tracked line. See SUP-10.
+# Resolve with `docker buildx imagetools inspect <ref>`; re-pin deliberately,
+# not on every build.
+
+# Runtime base. Wolfi, not debian:bookworm-slim, and the reason is measurable
+# rather than aesthetic: bookworm-slim contributed 105 critical/high CVEs, of
+# which exactly ZERO were fixable -- 70 carried Debian's "won't fix" and 35 had
+# no fix at all. `apt upgrade` could not have closed one of them; only leaving
+# the distro could. 44 of those 105 came from perl, present solely because
+# Debian's git depends on it, and 24 more from python 3.11. Wolfi's git needs
+# no perl and it ships python 3.13, so the OS contribution drops to zero.
+#
+# Trade-off, recorded so it is a decision and not an accident: Chainguard's
+# free tier publishes only :latest and garbage-collects older digests, so this
+# pin can eventually become unpullable. That forces periodic re-pinning, which
+# a rolling base wants anyway. Mirror the digest into our own registry if
+# reproducible rebuilds of old tags ever become a hard requirement.
+ARG WOLFI_DIGEST=sha256:003627df3c1e1bba0c4116afcddb314aca9594ee2328c7e876a8081a6c988b2e
+
+# Debian is still used for the download/verify stage only: it has dpkg, which
+# the Syft and Grype .deb artifacts need. Nothing from this stage's filesystem
+# reaches the runtime image except the four verified binaries.
 ARG DEBIAN_DIGEST=sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
-# ── Builder stage: download and verify all binaries ──────────────────────────
-# curl is only needed here; the final stage omits it to reduce attack surface.
-FROM debian:bookworm-slim@${DEBIAN_DIGEST} AS builder
+# Go toolchain for the KICS build. The toolchain version is a security input,
+# not an implementation detail -- KICS's go.mod declares go 1.26.2, and that
+# exact stdlib is what the released binary was compiled against and what showed
+# up as stdlib CVEs in scans of this image. Building with 1.26.5 clears them.
+ARG GO_DIGEST=sha256:3aff6657219a4d9c14e27fb1d8976c49c29fddb70ba835014f477e1c70636647
 
-ARG KICS_VERSION=2.1.20
-ARG KICS_CHECKSUM=8a5aa375ccfdc0ddd1114eddf1f9638ad7f6122e98d12a592207509dbe6d81f8
-ARG KICS_RULES_COMMIT=e1f23cad9640f55b963f22a116b04906b8c16ac6
+# ── KICS: built from source at a pinned commit, not downloaded ────────────────
+# Checkmarx stopped publishing release binaries after v2.1.20 -- v2.1.21 is a
+# tag with zero assets, and v2.1.17 through v2.1.19 shipped none either. Pinning
+# to the last release that happens to have a tarball means freezing on an
+# artifact whose vendored dependencies only rot further.
+#
+# Building is also the stronger supply-chain position. TeamPCP compromised
+# Checkmarx's GitHub Actions and Docker Hub in March-April 2026 -- their
+# *release pipeline*. A source build at a content-addressed commit does not
+# trust that pipeline at all, and publish.yml's SUP-15 step still proves the
+# commit is what refs/tags/v${KICS_VERSION} resolves to.
+#
+# Measured effect: the v2.1.20 binary carried 23 critical/high in its vendored
+# modules, mostly Go stdlib from the toolchain it was built with. The same code
+# rebuilt with Go 1.26.5 carries 2 -- both containerd advisories with no fix
+# available upstream. Identical scan output: 157 queries, 338 findings on the
+# same fixture.
+#
+# One commit now yields BOTH the binary and the query rules, so they can no
+# longer drift apart the way a separate binary pin and rules pin could.
+FROM golang:1.26.5@${GO_DIGEST} AS kicsbuild
+
+ARG KICS_VERSION=2.1.21
+ARG KICS_RULES_COMMIT=3778c88b04d04c861c98234069010930079176c3
+
+WORKDIR /src
+# Fetch the commit directly rather than cloning a branch: content-addressed, so
+# immune to tag rewrites and force-pushes.
+RUN git init -q . \
+    && git remote add origin https://github.com/Checkmarx/kics.git \
+    && git fetch --depth=1 --quiet origin ${KICS_RULES_COMMIT} \
+    && git checkout --quiet ${KICS_RULES_COMMIT}
+
+# CGO_ENABLED=0 for a static binary -- the runtime base is a different libc
+# from the build base, and static is what makes that safe.
+# -trimpath keeps build paths out of the binary so the output is reproducible.
+# `make build` is not used: it depends on `generate`, which needs a JRE for
+# ANTLR. The generated sources are committed, so the documented plain-go-build
+# path in docs/getting-started.md is sufficient and avoids pulling Java in.
+RUN CGO_ENABLED=0 go build -trimpath \
+        -ldflags "-s -w \
+            -X github.com/Checkmarx/kics/v2/internal/constants.SCMCommit=${KICS_RULES_COMMIT} \
+            -X github.com/Checkmarx/kics/v2/internal/constants.Version=v${KICS_VERSION}" \
+        -o /out/kics cmd/console/main.go \
+    && /out/kics version
+
+# Query rules from the same tree as the binary above.
+RUN mkdir -p /out/iac-rules/assets \
+    && cp -r assets/queries assets/libraries /out/iac-rules/assets/
+
+# ── Download/verify stage: Syft, Grype, Betterleaks ───────────────────────────
+# curl and dpkg are only needed here; the runtime image has neither.
+FROM debian:bookworm-slim@${DEBIAN_DIGEST} AS builder
 
 ARG SYFT_VERSION=v1.50.0
 ARG SYFT_CHECKSUM=d2755869bb9f6f0f648ad8e8be9ea20de0c376aa3b1997601b0e8adcfc94c432
 
-ARG GRYPE_VERSION=v0.112.0
-ARG GRYPE_CHECKSUM=434bae8af635b6308d7a33ea842c6216dc382d4ec49fe3873f927b7805cc69e2
+# Grype v0.112.0 was four minor releases behind and carried 22 critical/high in
+# its own vendored modules -- an unacceptable posture for a vulnerability
+# scanner. v0.116.1 brings that to 3.
+ARG GRYPE_VERSION=v0.116.1
+ARG GRYPE_CHECKSUM=f005c69c326fb27ef5e2c15bca3c6c50fa69dc12e36b01b637b3733746da4fca
 
 ARG BETTERLEAKS_VERSION=1.7.2
 ARG BETTERLEAKS_CHECKSUM=ea9ed6a4aa2845ac2e00c0eafbc841057631321d53c061d5a435cf33e6e9ddaf
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl git \
+    ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-
-# ── KICS binary — SHA256-verified (not GPG — see supply chain note below) ──────
-# KICS GitHub Actions and Docker Hub images were compromised in March–April 2026
-# (TeamPCP campaign). KICS v2.1.20 was published 2026-03-03, before those windows.
-# We verify by hardcoded SHA256 rather than the KICS GPG signature because
-# downloading the signing key from the same endpoint as the binary gives no
-# independent trust — both could be swapped together.
-RUN curl -fsSL \
-        "https://github.com/Checkmarx/kics/releases/download/v${KICS_VERSION}/kics_${KICS_VERSION}_linux_amd64.tar.gz" \
-        -o /tmp/kics.tar.gz \
-    && echo "${KICS_CHECKSUM}  /tmp/kics.tar.gz" | sha256sum -c - \
-    && tar -xzf /tmp/kics.tar.gz -C /tmp kics \
-    && rm /tmp/kics.tar.gz
-
-# ── KICS query rules — pinned to immutable commit SHA (not mutable tag) ────────
-# The Checkmarx/kics repo was compromised in TeamPCP. A mutable tag could be
-# force-updated to a malicious commit. We pin to the exact commit SHA that the
-# v2.1.20 tag pointed to at build time. This is content-addressed (immune to
-# tag rewrites and force-pushes) but NOT cryptographically authenticated --
-# no automated check confirms this SHA came from Checkmarx rather than an
-# attacker with write access at pin time. Re-verify manually before bumping
-# KICS_RULES_COMMIT: `gh api repos/Checkmarx/kics/commits/<sha>` and confirm
-# it matches the target release tag. See SUP-07/SUP-15.
-RUN git init /tmp/iac-rules \
-    && cd /tmp/iac-rules \
-    && git remote add origin https://github.com/Checkmarx/kics.git \
-    && git fetch --depth=1 origin ${KICS_RULES_COMMIT} \
-    && git sparse-checkout init --cone \
-    && git sparse-checkout set assets/queries assets/libraries \
-    && git checkout ${KICS_RULES_COMMIT} \
-    && rm -rf .git
 
 # ── Syft — SHA256-verified .deb ───────────────────────────────────────────────
 # Anchore's cosign signatures on checksums.txt are verified in publish.yml
@@ -90,12 +131,13 @@ RUN curl -fsSL \
     && tar -xzf /tmp/betterleaks.tar.gz -C /tmp betterleaks \
     && rm /tmp/betterleaks.tar.gz
 
-# ── Final stage: minimal runtime image (no curl) ──────────────────────────────
-FROM debian:bookworm-slim@${DEBIAN_DIGEST}
+# ── Final stage: minimal runtime image (no curl, no dpkg, no compiler) ────────
+FROM cgr.dev/chainguard/wolfi-base@${WOLFI_DIGEST}
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git python3 \
-    && rm -rf /var/lib/apt/lists/*
+# python-3.13 provides /usr/bin/python3 directly; no symlink needed. Wolfi's
+# git pulls no perl, which is where 44 of the old image's critical/high CVEs
+# came from.
+RUN apk add --no-cache ca-certificates git python-3.13
 
 # ── Non-root runtime user ──────────────────────────────────────────────────────
 # This image clones and scans untrusted pull-request content (scanner.py's
@@ -103,8 +145,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # betterleaks -- directly over attacker-authored input (Terraform/YAML,
 # lockfiles, arbitrary repo blobs). A parser bug in any of them must degrade to
 # an unprivileged crash, not root-in-container. See SUP-06.
-RUN groupadd --gid 1000 zagware \
-    && useradd --uid 1000 --gid zagware --create-home --shell /usr/sbin/nologin zagware
+# busybox addgroup/adduser, not shadow's groupadd/useradd: they are already in
+# the base, so the image needs no extra package to create the account.
+RUN addgroup -g 1000 zagware \
+    && adduser -D -u 1000 -G zagware -s /sbin/nologin -h /home/zagware zagware
 ENV HOME=/home/zagware
 
 # Scope git safe.directory to /tmp (where scanner clones repos) instead of '*'
@@ -114,13 +158,13 @@ ENV HOME=/home/zagware
 RUN git config --system safe.directory '/tmp/*' \
     && git config --system advice.detachedHead false
 
-# ── Copy verified binaries from builder (--chmod=755 makes them
-# world-readable/executable so the non-root USER below can run them) ──────────
-COPY --from=builder --chmod=755 /tmp/kics         /usr/local/bin/kics
-COPY --from=builder --chmod=755 /tmp/iac-rules    /opt/iac-rules
-COPY --from=builder --chmod=755 /usr/bin/syft     /usr/bin/syft
-COPY --from=builder --chmod=755 /usr/bin/grype    /usr/bin/grype
-COPY --from=builder --chmod=755 /tmp/betterleaks  /usr/local/bin/betterleaks
+# ── Copy verified binaries (--chmod=755 makes them world-readable/executable
+# so the non-root USER below can run them) ────────────────────────────────────
+COPY --from=kicsbuild --chmod=755 /out/kics        /usr/local/bin/kics
+COPY --from=kicsbuild --chmod=755 /out/iac-rules   /opt/iac-rules
+COPY --from=builder   --chmod=755 /usr/bin/syft    /usr/bin/syft
+COPY --from=builder   --chmod=755 /usr/bin/grype   /usr/bin/grype
+COPY --from=builder   --chmod=755 /tmp/betterleaks /usr/local/bin/betterleaks
 
 # ── Zagware scanner entrypoint ────────────────────────────────────────────────
 COPY --chmod=755 src/scanner.py /usr/local/bin/zagware-scan

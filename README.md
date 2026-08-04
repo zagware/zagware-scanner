@@ -681,7 +681,7 @@ Every release of `ghcr.io/zagware/zagware-scanner` is built with a verifiable su
 
 | Layer | How |
 |---|---|
-| **KICS binary** | SHA256 checksum hardcoded in the Dockerfile and verified at build time. GPG signature is intentionally NOT used — downloading the signing key from the same endpoint as the binary provides no independent trust (both could be swapped together) |
+| **KICS binary** | **Built from source** in the image build, from a pinned Checkmarx/kics commit — not downloaded. Checkmarx published no release binary after v2.1.20, and a source build removes any dependence on their release pipeline, which is exactly what TeamPCP compromised. CI verifies the pinned commit is the one `refs/tags/v${KICS_VERSION}` resolves to before building |
 | **Syft binary** | SHA256 checksum verified at build time; cosign signature on checksums verified in CI before build |
 | **Grype binary** | SHA256 checksum verified at build time; cosign signature on checksums verified in CI before build |
 | **betterleaks binary** | SHA256 checksum hardcoded in the Dockerfile and verified at build time; cosign sigstore-bundle signature verified in CI before build |
@@ -695,11 +695,13 @@ In March–April 2026, the TeamPCP campaign compromised KICS GitHub Actions (Mar
 KICS Docker Hub images (April 22), and downstream packages using stolen tokens.
 
 Our mitigations:
-- We build from **source-controlled release tarballs on GitHub**, not Docker Hub
-- KICS 2.1.20 was published March 3, 2026 — before the compromise windows
-- Every binary is **content-addressed by SHA256 checksum** pinned in the Dockerfile.
-  A tag being moved or a release artifact being swapped will break the build with
-  a clear checksum mismatch error — not a silent supply chain compromise
+- KICS is **built from a pinned commit**, so its release pipeline — the part TeamPCP
+  actually compromised — is not in our trust path at all. The same commit supplies
+  both the binary and the Rego query rules, so the two cannot drift apart
+- The other three binaries come from **source-controlled release tarballs on GitHub**,
+  not Docker Hub, and are **content-addressed by SHA256 checksum** pinned in the
+  Dockerfile. A tag being moved or a release artifact being swapped will break the
+  build with a clear checksum mismatch error — not a silent supply chain compromise
 - The cosign signatures for Syft and Grype are verified in CI **before the Docker
   build starts**, ensuring the checksums file itself was produced by a legitimate
   GitHub Actions run in the anchore org

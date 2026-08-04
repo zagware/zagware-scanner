@@ -8,6 +8,56 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Versions are published as container tags — see the
 [pinning guidance](README.md#pinning-to-a-specific-version) for which tag to depend on.
 
+## [3.1.0] — 2026-07-31
+
+Container CVE reduction. **Critical/high drops from 153 to 8** and total matches
+from 455 to 21, with no change to scan behaviour: identical IaC output on the
+same fixture (157 queries, 338 findings).
+
+| | 3.0.2 | 3.1.0 |
+|---|---|---|
+| total matches | 455 | **21** |
+| critical | 36 | **2** |
+| high | 117 | **6** |
+| OS-level critical/high | 105 | **0** |
+| image size | 511 MB | 418 MB |
+
+### Changed
+
+- **Runtime base is now Chainguard Wolfi** instead of `debian:bookworm-slim`.
+  Not a preference — of the 105 critical/high CVEs Debian contributed, *zero*
+  were fixable: 70 were marked "won't fix" and 35 had no fix at all, so no
+  amount of patching could have closed them. 44 came from `perl`, present only
+  because Debian's `git` depends on it; Wolfi's git does not. 24 more came from
+  Python 3.11; Wolfi ships 3.13. The OS contribution is now zero.
+- **KICS is built from source** at a pinned commit rather than downloaded.
+  Checkmarx published no release binary after v2.1.20 — v2.1.21 is a tag with
+  no assets — so the previous approach meant freezing on an ageing artifact.
+  Building with Go 1.26.5 took KICS from 23 critical/high to 2. It is also the
+  stronger supply-chain position: TeamPCP compromised Checkmarx's *release
+  pipeline*, which is now entirely outside our trust path. The same commit
+  supplies the binary and the Rego query rules, so they can no longer drift.
+- **Grype v0.112.0 → v0.116.1**, four minor releases forward. It had been
+  reporting 22 critical/high against itself; now 3.
+- Python in the image moves 3.11 → 3.13, and git 2.39 → 2.55.
+
+### Known remaining
+
+All 8 remaining critical/high live inside third-party scanner binaries, not in
+anything this project controls at the OS level:
+
+- 2 critical `containerd` advisories inside KICS with **no upstream fix**.
+- 6 high in Grype, Syft, and betterleaks — `docker/docker`, `golang.org/x/text`,
+  and Go stdlib from the toolchain Anchore built their releases with. These
+  clear when those projects publish rebuilt binaries.
+
+### Note for operators
+
+Chainguard's free tier publishes only `:latest` and garbage-collects older
+digests, so the pinned Wolfi digest can eventually become unpullable. Re-pin on
+a regular cadence — a rolling base wants that anyway — or mirror the digest into
+your own registry if reproducible rebuilds of old tags are a hard requirement.
+
 ## [3.0.2] — 2026-07-31
 
 Fixes secrets scanning, which was broken for every user in 3.0.0 and 3.0.1.
@@ -319,6 +369,7 @@ remediation, not new features.
 ### Added
 - Grype SCA scanning alongside KICS IaC scanning, unified into a single scanner.
 
+[3.1.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.1.0
 [3.0.2]: https://github.com/zagware/zagware-scanner/releases/tag/v3.0.2
 [3.0.1]: https://github.com/zagware/zagware-scanner/releases/tag/v3.0.1
 [3.0.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.0.0

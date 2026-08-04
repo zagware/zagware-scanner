@@ -13,9 +13,11 @@ KICS
   Vendor:    Checkmarx
   License:   Apache-2.0
   Source:    https://github.com/Checkmarx/kics
-  Version:   2.1.20 (binary)
-  Query rules: vendored from Checkmarx/kics at commit e1f23cad9640f55b963f22a116b04906b8c16ac6
-               (the commit the v2.1.20 tag pointed to at build time)
+  Version:   2.1.21 (built from source)
+  Built from: Checkmarx/kics at commit 3778c88b04d04c861c98234069010930079176c3
+               (the commit the v2.1.21 tag points to; Checkmarx published no
+               release binaries for this version)
+  Query rules: vendored from the same commit, so binary and rules cannot drift
 
 Syft
   Vendor:    Anchore
@@ -28,7 +30,7 @@ Grype
   Vendor:    Anchore
   License:   Apache-2.0
   Source:    https://github.com/anchore/grype
-  Version:   v0.112.0
+  Version:   v0.116.1
 
 betterleaks
   Vendor:    betterleaks

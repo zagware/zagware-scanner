@@ -68,10 +68,19 @@ class TestSedExtractsAllPinnedValues:
         extracted = dict(
             line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line
         )
-        for name in ("KICS_VERSION", "KICS_CHECKSUM", "SYFT_VERSION", "SYFT_CHECKSUM",
+        # KICS_CHECKSUM is deliberately gone: KICS is built from source at a
+        # pinned commit, because Checkmarx published no release binary after
+        # v2.1.20. KICS_RULES_COMMIT is the pin that replaced it, and SUP-15
+        # in publish.yml verifies it against refs/tags/v${KICS_VERSION}.
+        for name in ("KICS_VERSION", "KICS_RULES_COMMIT",
+                      "SYFT_VERSION", "SYFT_CHECKSUM",
                       "GRYPE_VERSION", "GRYPE_CHECKSUM", "BETTERLEAKS_VERSION",
                       "BETTERLEAKS_CHECKSUM"):
             assert name in extracted, f"{name} missing from sed extraction"
+        assert "KICS_CHECKSUM" not in extracted, (
+            "KICS_CHECKSUM is back -- if KICS is being downloaded again rather "
+            "than built from source, revisit why (see the Dockerfile header)"
+        )
 
 
 class TestBuildArgsRemoved:
