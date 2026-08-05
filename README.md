@@ -10,7 +10,7 @@ Zagware Scanner runs on every pull request and posts a focused comment showing o
 findings *introduced by that PR* — not the hundreds that may already exist in the codebase.
 Your team sees exactly what they need to act on, nothing more.
 
-Three scan engines, one container:
+Four scan engines, one container:
 
 | Engine | What it scans | Detects |
 |---|---|---|
@@ -690,7 +690,7 @@ Every release of `ghcr.io/zagware/zagware-scanner` is built with a verifiable su
 
 | Layer | How |
 |---|---|
-| **KICS binary** | **Built from source** in the image build, from a pinned Checkmarx/kics commit — not downloaded. Checkmarx published no release binary after v2.1.20, and a source build removes any dependence on their release pipeline, which is exactly what TeamPCP compromised. CI verifies the pinned commit is the one `refs/tags/v${KICS_VERSION}` resolves to before building |
+| **KICS binary** | **Built from source** in the image build, from a pinned Checkmarx/kics commit — not downloaded. Checkmarx don't always publish release binaries, and a source build removes any dependence on their release pipeline, which is exactly what TeamPCP compromised. CI verifies the pinned commit is the one `refs/tags/v${KICS_VERSION}` resolves to before building |
 | **Syft binary** | SHA256 checksum verified at build time; cosign signature on checksums verified in CI before build |
 | **Grype binary** | SHA256 checksum verified at build time; cosign signature on checksums verified in CI before build |
 | **betterleaks binary** | SHA256 checksum hardcoded in the Dockerfile and verified at build time; cosign sigstore-bundle signature verified in CI before build |
@@ -751,13 +751,6 @@ It distinguishes two situations, because they call for different responses:
 | **Escalate** | Our pinned build carries **fixable** CRITICAL/HIGH CVEs **and** upstream has gone quiet (no release in 90 days) or has stopped shipping `linux/amd64` binaries | Consider building that tool from source — see below |
 | **Unpullable pin** | A pinned base-image digest can no longer be fetched | Re-pin before the next build fails |
 
-The escalation signal is the one that is genuinely hard to notice by eye, and it is the one that
-caught us out: Checkmarx quietly stopped publishing KICS binaries after v2.1.20 while its vendored
-dependencies kept ageing. Nothing failed, nothing alerted, and we only found out by reading a CVE
-report by hand. The unpullable-pin check exists for a specific known risk too — Chainguard's free
-tier publishes only `:latest` and garbage-collects older digests, so our Wolfi pin will eventually
-stop resolving.
-
 ### When we build a tool from source
 
 Building from source is an **escalation, not a default**, because it is a genuine trade rather than
@@ -777,7 +770,7 @@ So we require a specific justification, and only KICS currently meets it:
 
 | | KICS | Syft / Grype / betterleaks |
 |---|---|---|
-| Upstream publishes a usable binary | **No** — none since v2.1.20 | Yes, current |
+| Upstream publishes a usable binary | **No** | Yes, current |
 | Release pipeline known-compromised | **Yes** — TeamPCP, Mar–Apr 2026 | No |
 | Signed releases we can verify | No | Yes (keyless cosign) |
 | **Built from source?** | **Yes** | No |
