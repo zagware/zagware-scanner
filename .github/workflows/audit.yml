@@ -32,9 +32,16 @@ jobs:
       - name: Resolve :stable digest
         id: stable
         run: |
+          # `|| true` is load-bearing. GitHub runs this with `bash -e`, so the
+          # failing imagetools lookup aborted the step outright and the "nothing
+          # to audit" branch below was unreachable -- the weekly audit reported
+          # a red failure every run purely because :stable does not exist yet,
+          # which is the ordinary pre-first-promotion state. A missing tag is a
+          # skip, not an error; a genuine scan failure is still caught further
+          # down, where it is a real finding rather than a bootstrap condition.
           DIGEST=$(docker buildx imagetools inspect \
             ghcr.io/zagware/zagware-scanner:stable \
-            --format '{{.Manifest.Digest}}' 2>/dev/null)
+            --format '{{.Manifest.Digest}}' 2>/dev/null || true)
 
           if [ -z "$DIGEST" ]; then
             echo "No :stable tag found — nothing to audit"

@@ -72,10 +72,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Get the manifest digest of :latest
+          # `|| true` for the same reason audit.yml needs it: under `bash -e` a
+          # failing lookup aborts the step and the "nothing to promote" branch
+          # below never runs, turning an ordinary missing-tag state into a red
+          # workflow. :latest exists today so this has never fired, but the
+          # guard four lines down is only reachable with it.
           LATEST_DIGEST=$(docker buildx imagetools inspect \
             ghcr.io/zagware/zagware-scanner:latest \
-            --format '{{.Manifest.Digest}}' 2>/dev/null)
+            --format '{{.Manifest.Digest}}' 2>/dev/null || true)
 
           if [ -z "$LATEST_DIGEST" ]; then
             echo "No :latest tag found — nothing to promote"

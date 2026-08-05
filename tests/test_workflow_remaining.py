@@ -842,3 +842,36 @@ class TestActionPinsAreLegible:
             seen.setdefault(repo, set()).add(sha)
         drifted = {r: s for r, s in seen.items() if len(s) > 1}
         assert not drifted, f"same action pinned at different SHAs: {drifted}"
+
+
+class TestMissingTagIsASkipNotAFailure:
+    """GitHub runs `run:` blocks under `bash -e`. A bare command substitution
+    that fails aborts the step, so a following `if [ -z "$VAR" ]` guard never
+    executes. audit.yml had exactly that: the weekly audit went red on every
+    run purely because :stable does not exist before the first promotion --
+    an ordinary bootstrap state reported as a failure.
+    """
+
+    @pytest.mark.parametrize("workflow,tag", [
+        (".github/workflows/audit.yml", "stable"),
+        (".github/workflows/promote.yml", "latest"),
+    ])
+    def test_digest_lookup_cannot_abort_the_step(self, workflow, tag):
+        text = (REPO_ROOT / workflow).read_text()
+        block = re.search(
+            r'imagetools inspect\s*\\\s*\n\s*ghcr\.io/zagware/zagware-scanner:'
+            + tag + r'\s*\\\s*\n\s*--format[^\n]*\n',
+            text,
+        )
+        assert block, f"{workflow}: could not find the :{tag} digest lookup"
+        assert re.search(r'\|\|\s*(true|echo\s*"")', block.group(0)), (
+            f"{workflow}: the :{tag} lookup can abort the step under `bash -e`, "
+            f"making the following empty-digest guard unreachable"
+        )
+
+    def test_both_workflows_still_have_the_guard_they_protect(self):
+        for wf, var in ((".github/workflows/audit.yml", "DIGEST"),
+                        (".github/workflows/promote.yml", "LATEST_DIGEST")):
+            text = (REPO_ROOT / wf).read_text()
+            assert f'if [ -z "${var}" ]; then' in text, f"{wf}: empty-digest guard gone"
+            assert 'skip=true' in text
