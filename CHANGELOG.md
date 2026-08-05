@@ -54,6 +54,38 @@ did not move.
   four-releases-old scanner while the image shipped a current one. SUP-08 had
   flagged the duplication but nothing enforced it; a test now asserts the two
   agree.
+- **Every pinned GitHub Action bumped off the deprecated `node20` runtime.**
+  All nine were annotated as deprecated by the runner. Each was verified before
+  bumping — the target SHA resolved from its release tag, its `runs.using`
+  confirmed as `node24` (or `composite`), and every input and output we consume
+  checked against the new definition:
+
+  | Action | From | To |
+  |---|---|---|
+  | `actions/checkout` | v4.4.0 | v7.0.1 |
+  | `actions/github-script` | v7.1.0 | v9.0.0 |
+  | `actions/attest` | v2.4.0 | v4.2.2 |
+  | `actions/attest-build-provenance` | v2.x | v4.1.1 |
+  | `docker/build-push-action` | v6.19.2 | v7.3.0 |
+  | `docker/login-action` | v3.7.0 | v4.6.0 |
+  | `docker/metadata-action` | v5.10.0 | v6.2.0 |
+  | `docker/setup-buildx-action` | v3.12.0 | v4.2.0 |
+  | `sigstore/cosign-installer` | v3.x | v4.1.2 |
+
+  All are major bumps. The `docker/*` majors are runtime-only. `github-script`
+  v9 drops `require('@actions/github')` — our only `require` is `require('fs')`,
+  a Node builtin, so it is unaffected. `checkout` v7 blocks fork checkouts on
+  `pull_request_target` and `workflow_run`; no workflow here uses either
+  trigger, and the change is hardening regardless.
+
+  These actions require Actions Runner **v2.327.1+**. GitHub-hosted runners are
+  fine. This affects building this repo only — consumers invoke the scanner as
+  a container action, which has no Node runtime.
+- Action pins now carry a `# vX.Y.Z` comment, and a test requires it. The SHA is
+  the security property but is unreadable; nothing in the file said whether a
+  pin was current or three majors behind, which is exactly how all nine aged
+  onto a deprecated runtime unnoticed. A second test asserts an action is not
+  pinned at two different SHAs in different workflows.
 
 ## [3.1.0] — 2026-07-31
 

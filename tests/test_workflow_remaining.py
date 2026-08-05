@@ -796,3 +796,49 @@ class TestToolCurrencyWorkflow:
         text = (REPO_ROOT / ".github/workflows/tool-currency.yml").read_text()
         assert "scanned_ref.txt" in text
         assert "measured against" in text
+
+
+class TestActionPinsAreLegible:
+    """Every action is pinned to a 40-char SHA, which is the security property
+    but is also unreadable: nothing in the file says whether
+    `@11d5960a...` is a current release or three majors behind. That is how all
+    nine pins quietly ended up on the deprecated node20 runtime. The trailing
+    `# vX.Y.Z` comment is what makes drift visible to a human.
+    """
+
+    def _uses(self):
+        import itertools
+        files = itertools.chain(
+            (REPO_ROOT / ".github/workflows").glob("*.yml"),
+            (REPO_ROOT / ".github/actions").glob("*/action.yml"),
+        )
+        out = []
+        for f in files:
+            for line in f.read_text().splitlines():
+                s = line.strip()
+                if s.startswith("uses:") and "./" not in s:
+                    out.append((f.name, s))
+        return out
+
+    def test_every_action_is_pinned_to_a_full_sha(self):
+        for fname, line in self._uses():
+            assert re.search(r'@[a-f0-9]{40}\b', line), f"{fname}: not SHA-pinned -- {line}"
+
+    def test_every_pin_records_the_version_it_represents(self):
+        for fname, line in self._uses():
+            assert re.search(r'@[a-f0-9]{40}\s*#\s*v\d+\.\d+', line), (
+                f"{fname}: SHA pin has no `# vX.Y.Z` comment, so drift is invisible -- {line}"
+            )
+
+    def test_one_sha_per_action_across_the_repo(self):
+        """Two workflows pinning the same action at different SHAs means one of
+        them was missed during a bump."""
+        seen = {}
+        for fname, line in self._uses():
+            m = re.search(r'uses:\s*([\w.-]+/[\w.-]+)@([a-f0-9]{40})', line)
+            if not m:
+                continue
+            repo, sha = m.groups()
+            seen.setdefault(repo, set()).add(sha)
+        drifted = {r: s for r, s in seen.items() if len(s) > 1}
+        assert not drifted, f"same action pinned at different SHAs: {drifted}"
