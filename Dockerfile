@@ -98,6 +98,14 @@ ARG GRYPE_CHECKSUM=f005c69c326fb27ef5e2c15bca3c6c50fa69dc12e36b01b637b3733746da4
 ARG BETTERLEAKS_VERSION=1.7.2
 ARG BETTERLEAKS_CHECKSUM=ea9ed6a4aa2845ac2e00c0eafbc841057631321d53c061d5a435cf33e6e9ddaf
 
+# osv-scanner: cross-ecosystem advisory matching for the core image. Static Go
+# binary, SHA256-pinned exactly like Syft/Grype. The release carries SLSA
+# provenance (multiple.intoto.jsonl) rather than a cosign signature; publish.yml
+# verifies that provenance BEFORE this build, the osv equivalent of the
+# Syft/Grype cosign step.
+ARG OSV_SCANNER_VERSION=v2.4.0
+ARG OSV_SCANNER_CHECKSUM=15314940c10d26af9c6649f150b8a47c1262e8fc7e17b1d1029b0e479e8ed8a0
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
@@ -131,8 +139,27 @@ RUN curl -fsSL \
     && tar -xzf /tmp/betterleaks.tar.gz -C /tmp betterleaks \
     && rm /tmp/betterleaks.tar.gz
 
+# ── osv-scanner — SHA256-verified static binary ───────────────────────────────
+RUN curl -fL \
+        "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64" \
+        -o /tmp/osv-scanner \
+    && echo "${OSV_SCANNER_CHECKSUM}  /tmp/osv-scanner" | sha256sum -c - \
+    && chmod 0755 /tmp/osv-scanner
+
+# ── govulncheck build (reachability variant only) ─────────────────────────────
+# govulncheck ships no release binary, only `go install`, whose integrity is the
+# Go module checksum database (sum.golang.org — a signed transparency log), the
+# same guarantee backing every dependency of the KICS source build above. Pinned
+# version, static output, `-mod=readonly` so the build cannot silently pull an
+# unpinned module. This binary lands ONLY in the opt-in reachability image.
+FROM golang:1.26.5@${GO_DIGEST} AS govulnbuild
+ARG GOVULNCHECK_VERSION=v1.1.4
+ENV GOBIN=/out GOFLAGS=-mod=readonly
+RUN go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" \
+    && /out/govulncheck -version
+
 # ── Final stage: minimal runtime image (no curl, no dpkg, no compiler) ────────
-FROM cgr.dev/chainguard/wolfi-base@${WOLFI_DIGEST}
+FROM cgr.dev/chainguard/wolfi-base@${WOLFI_DIGEST} AS base-min
 
 # python-3.13 provides /usr/bin/python3 directly; no symlink needed. Wolfi's
 # git pulls no perl, which is where 44 of the old image's critical/high CVEs
@@ -165,6 +192,9 @@ COPY --from=kicsbuild --chmod=755 /out/iac-rules   /opt/iac-rules
 COPY --from=builder   --chmod=755 /usr/bin/syft    /usr/bin/syft
 COPY --from=builder   --chmod=755 /usr/bin/grype   /usr/bin/grype
 COPY --from=builder   --chmod=755 /tmp/betterleaks /usr/local/bin/betterleaks
+# osv-scanner ships in BOTH images (advisory matching in core; call analysis in
+# the reachability variant, where a Go toolchain is present).
+COPY --from=builder   --chmod=755 /tmp/osv-scanner /usr/local/bin/osv-scanner
 
 # ── Zagware scanner entrypoint ────────────────────────────────────────────────
 COPY --chmod=755 src/scanner.py /usr/local/bin/zagware-scan
@@ -200,3 +230,22 @@ RUN mkdir -p /tmp/.cache && chown zagware:zagware /tmp/.cache && chmod 700 /tmp/
 
 USER zagware
 ENTRYPOINT ["python3", "/usr/local/bin/zagware-scan"]
+
+# ── Reachability variant (opt-in) — + Go/Node toolchains + govulncheck ────────
+# The SAME attested core plus the toolchains that govulncheck and osv-scanner's
+# call analysis need at SCAN time to build a call graph, plus npm for
+# dependency-scope enrichment. Larger trusted surface, so it is a SEPARATE tag
+# consumers opt into — the default core image never carries a compiler or Node.
+# Still cosign-signed + SLSA-attested by publish.yml. go/nodejs/npm come from
+# Wolfi's apk repos, which apk verifies against Chainguard's signing keys.
+FROM base-min AS reachability
+USER root
+RUN apk add --no-cache go nodejs npm
+COPY --from=govulnbuild --chmod=755 /out/govulncheck /usr/local/bin/govulncheck
+USER zagware
+
+# ── Core (DEFAULT target) — the minimal, fully-attested image ─────────────────
+# Declared last so a bare `docker build` (and CI's build step) produces the
+# minimal core, never the heavier reachability variant. publish.yml builds
+# `--target core` for :latest and `--target reachability` for :reachability.
+FROM base-min AS core

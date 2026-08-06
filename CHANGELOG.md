@@ -10,9 +10,13 @@ Versions are published as container tags — see the
 
 ## [Unreleased]
 
-Release-process and CI changes only. The scanner and the image are unchanged,
-so there is no version bump — `__version__` identifies image contents and those
-did not move.
+## [3.2.0] — 2026-08-06
+
+Advisory SCA reachability enrichment. Language-native tools now layer a
+reachability verdict, dependency scope, and evidence traces onto Grype findings
+and upload them to the platform alongside the usual results. This release also
+folds in the release-process and CI changes previously staged as unreleased; the
+image contents move, so `__version__` bumps to 3.2.0.
 
 ### Changed
 
@@ -30,6 +34,32 @@ did not move.
   reported everywhere; they just no longer block a release.
 
 ### Added
+- **SCA reachability enrichment (advisory).** Where a supported manifest and the
+  matching tool are both present, the scanner enriches each Grype finding with a
+  reachability verdict, dependency scope, and evidence traces, uploaded via the
+  new fields on `POST /api/v1/sca/upload` plus a per-scan `enrichment` map:
+  - **govulncheck** — Go call-graph reachability (`reachable` / `not_reachable`)
+    with call-path traces.
+  - **npm audit** — dependency scope (runtime vs dev); reachability left
+    `unknown` (it is not call analysis).
+  - **osv-scanner** — cross-ecosystem; only claims a reachability verdict where
+    OSV call analysis is present (needs the Go toolchain), otherwise it records
+    an advisory version-match pass and leaves findings as plain Grype.
+
+  Additive and best-effort: each tool is gated on its binary and the ecosystem's
+  manifest, runs under `ZAGWARE_ENRICH_TIMEOUT`, and never blocks or fails a scan.
+  `unknown` is never treated as `not_reachable`. Disable with
+  `ZAGWARE_SCA_REACHABILITY=false`.
+- **Two published images, both cosign-signed + SLSA-attested.** The default
+  `:latest` (`--target core`) stays the minimal, fully-attested image, gaining
+  only the `osv-scanner` static binary — SHA256-pinned and checksum-matched
+  against upstream in `publish.yml`, exactly like Syft/Grype/Betterleaks; it
+  carries **no compiler or Node runtime**. Call-graph reachability needs a Go
+  toolchain and `npm` needs Node at scan time, so those live in a separate opt-in
+  `:reachability` tag (`--target reachability`) that layers `go`/`nodejs`/`npm`
+  (apk, Chainguard-signed) plus `govulncheck` (built from pinned source via the
+  Go checksum DB). Consumers choose the surface they trust; the core's posture is
+  unchanged.
 
 - **`tool-currency.yml`** — a weekly watch over the four bundled scanners and
   three base images, maintaining one continuously-updated issue. It never edits
@@ -448,6 +478,7 @@ remediation, not new features.
 ### Added
 - Grype SCA scanning alongside KICS IaC scanning, unified into a single scanner.
 
+[3.2.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.2.0
 [3.1.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.1.0
 [3.0.2]: https://github.com/zagware/zagware-scanner/releases/tag/v3.0.2
 [3.0.1]: https://github.com/zagware/zagware-scanner/releases/tag/v3.0.1

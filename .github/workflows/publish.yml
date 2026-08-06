@@ -170,6 +170,30 @@ jobs:
           echo "✓ Dockerfile's pinned BETTERLEAKS_CHECKSUM matches the signed manifest"
           rm betterleaks_checksums.txt betterleaks_checksums.txt.sigstore.json
 
+      # ── osv-scanner: match the Dockerfile pin against upstream's manifest ────
+      # osv-scanner publishes SLSA provenance (multiple.intoto.jsonl) rather than
+      # a cosign-signed checksums file, so there is no verify-blob equivalent to
+      # the three above. What we CAN close here is the transcription risk: the
+      # SHA256 hand-copied into the Dockerfile must match upstream's published
+      # SHA256SUMS entry. The bytes are then re-verified at build time
+      # (sha256sum -c), and the final image is cosign-signed + SLSA-attested
+      # below, which covers the osv-scanner binary inside it. See the OSV_SCANNER
+      # ARG comment in the Dockerfile.
+      - name: Verify osv-scanner checksum against upstream manifest
+        run: |
+          curl -sL "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_SHA256SUMS" -o osv_sums.txt
+          EXPECTED=$(grep " osv-scanner_linux_amd64\$" osv_sums.txt | cut -d' ' -f1)
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::osv-scanner_linux_amd64 not found in upstream SHA256SUMS for ${OSV_SCANNER_VERSION}"
+            exit 1
+          fi
+          if [ "$EXPECTED" != "$OSV_SCANNER_CHECKSUM" ]; then
+            echo "::error::Dockerfile OSV_SCANNER_CHECKSUM ($OSV_SCANNER_CHECKSUM) does not match upstream ($EXPECTED)"
+            exit 1
+          fi
+          echo "✓ osv-scanner ${OSV_SCANNER_VERSION} checksum matches upstream manifest"
+          rm osv_sums.txt
+
       # KICS query rules are fetched by commit SHA in the Dockerfile. That is
       # genuine content-addressing -- immune to tag rewrites and force pushes
       # -- but it says nothing about *which* KICS release those Rego policies
@@ -295,6 +319,7 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          target: core
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -317,6 +342,45 @@ jobs:
         with:
           subject-name: ghcr.io/zagware/zagware-scanner
           subject-digest: ${{ steps.build.outputs.digest }}
+
+      # ── Reachability variant (opt-in) — same core + Go/Node/govulncheck ──────
+      # Built, pushed, signed, and attested exactly like the core above, to
+      # :<version>-reachability (and :reachability on a tag push). Consumers who
+      # want call-graph reachability opt into this larger, equally-attested tag.
+      - name: Reachability image tags
+        id: rtags
+        run: |
+          {
+            echo "value<<ZAGWARE_RTAGS_EOF"
+            echo "ghcr.io/zagware/zagware-scanner:${{ steps.tag.outputs.value }}-reachability"
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "ghcr.io/zagware/zagware-scanner:reachability"
+            fi
+            echo "ZAGWARE_RTAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push reachability variant (SBOM + provenance)
+        id: build_reach
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: reachability
+          push: true
+          tags: ${{ steps.rtags.outputs.value }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: true
+
+      - name: Sign reachability image with cosign
+        run: |
+          cosign sign --yes "ghcr.io/zagware/zagware-scanner@${{ steps.build_reach.outputs.digest }}"
+          echo "✓ Signed reachability: ${{ steps.build_reach.outputs.digest }}"
+
+      - name: Attest reachability build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/zagware/zagware-scanner
+          subject-digest: ${{ steps.build_reach.outputs.digest }}
 
       # ── Post-push: scan the published image for its own CVEs ─────────────────
       # Advisory only (continue-on-error: true) — this never blocks a publish.
