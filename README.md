@@ -66,12 +66,21 @@ historical tracking, trend charts, and suppression management.
 | `:latest` | Newest release. Moves on every tag push. **Not** security-vetted. |
 | `:stable` | Promoted from `:latest` after a 7-day cooling period, a clean CVE scan, and a signature-verify check. **Not yet published** — no release has completed a full promotion cycle at time of writing. |
 | `:secure` | Identical digest to `:stable`, once `:stable` exists. |
+| `:reachability` (and `:<version>-reachability`) | The same core plus the Go/Node toolchains needed for **advisory SCA reachability enrichment** (govulncheck, npm audit, osv-scanner call analysis). Larger image, larger trusted surface — opt in only if you want reachability verdicts. Equally cosign-signed + SLSA-attested. |
 
 **Recommendation:** once `:stable` exists, pin it (or better, pin by digest — see
 [Pinning to a specific version](#pinning-to-a-specific-version)) for production CI. Until then, pin
 an exact `:<version>` tag for a reproducible build rather than tracking `:latest`, unless you
 specifically want new features immediately and are comfortable with `:latest`'s lack of a
 cooling-off period.
+
+**Two images, one source of truth.** The default `:latest`/`:<version>` (and future
+`:stable`/`:secure`) is the **minimal core** — the four scan engines plus the SHA256-pinned
+`osv-scanner` static binary, no compiler or Node runtime. The **`:reachability`** variant adds
+`go`/`nodejs`/`npm` + `govulncheck` for call-graph reachability and dependency-scope enrichment.
+Both are built from the same commit and carry identical cosign signatures + SLSA provenance; pick
+the surface you're willing to trust. Enrichment is advisory and can also be turned off at runtime
+with `ZAGWARE_SCA_REACHABILITY=false`.
 
 ### Promotion workflow
 
@@ -551,6 +560,8 @@ it is never silently misread as the opposite of what you intended.
 | `ZAGWARE_EXCLUDE_PATHS` | `.git` | Comma-separated paths or globs to exclude from IaC scanning. |
 | `ZAGWARE_SCA_ENABLED` | `true` | Set `false` to skip Grype dependency scanning entirely. |
 | `ZAGWARE_SECRETS_ENABLED` | `true` | Set `false` to skip betterleaks secrets scanning entirely. |
+| `ZAGWARE_SCA_REACHABILITY` | `true` | Set `false` to skip advisory reachability enrichment (govulncheck / npm audit / osv-scanner) and upload plain Grype findings only. Disabling it removes the extra scan time and image runtimes those tools need. |
+| `ZAGWARE_ENRICH_TIMEOUT` | `150` | Per-tool wall-clock budget (seconds) for each reachability enricher. A tool that exceeds it is abandoned and its findings stay plain Grype matches — enrichment never blocks or fails the scan. |
 | `ZAGWARE_SECRETS_FAIL_ON_PUBLIC` | `true` | Exit 1 when a new secret is found in a **public** repository, regardless of `ZAGWARE_FAIL_ON_NEW`. Betterleaks has no severity to gate on, so repo visibility is the priority signal instead. |
 | `ZAGWARE_OUTPUT_DIR` | `zagware-scan-results` | Directory scan artifacts are written to — see [Scan artifacts](#scan-artifacts). |
 | `ZAGWARE_SUPPRESSIONS_FILE` | `.zagware/suppressions.yaml` | Path (relative to the repo root) to the suppressions file. Change this for monorepos that can't use the default location. |

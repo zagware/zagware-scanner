@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import shutil
 import time
 import tomllib
 import urllib.error
@@ -58,7 +59,7 @@ import hashlib
 # 3.1.0 rebases the image on Wolfi and builds KICS from source: critical/high
 # CVEs 153 -> 8, with identical scan output. Scanner behaviour is unchanged;
 # this version exists to identify the image contents. See CHANGELOG.md.
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 # Boolean-shaped env vars previously used five different, mutually incompatible
 # parsing conventions (.lower()=="true", .lower()!="false", bare truthiness, and
@@ -1713,7 +1714,317 @@ def run_sca_scan(path: str, tmp_dir: str, label: str) -> list[dict] | None:
             log.warning("SCA: skipping malformed match: %s", e)
             continue
     log.info("SCA %s: %d finding(s)", label, len(findings))
+    try:
+        _SCA_ENRICHMENT[label] = enrich_sca_findings(path, findings)
+    except Exception as e:  # enrichment is advisory — never fail the scan over it
+        log.warning("SCA %s: reachability enrichment failed: %s", label, e)
+        _init_enrichment_defaults(findings)
+        _SCA_ENRICHMENT[label] = {}
     return findings
+
+# ── SCA reachability enrichment (advisory) ────────────────────────────────────
+# Layer language-native tools on top of Grype to add an ADVISORY reachability
+# verdict, dependency scope, and evidence traces to each finding. Additive and
+# best-effort: a tool runs only when its binary AND the ecosystem's manifest are
+# present; otherwise the finding stays a plain Grype match (reachability
+# "unknown", which is NOT the same as "not_reachable"). Enrichment never blocks a
+# scan and never drops a finding. Stdlib-only, like the rest of the scanner —
+# each tool is a subprocess whose JSON we parse. Upload contract + platform side:
+# see docs/scanner-repo-doc-updates.md in the git-tracking-platform repo.
+
+_SCA_ENRICH_ENABLED = _env_bool("ZAGWARE_SCA_REACHABILITY", True)
+_ENRICH_TIMEOUT     = int(os.environ.get("ZAGWARE_ENRICH_TIMEOUT", "150"))
+_GO_BIN          = os.environ.get("_ZAGWARE_GO_BIN",          "go")
+_GOVULNCHECK_BIN = os.environ.get("_ZAGWARE_GOVULNCHECK_BIN", "govulncheck")
+_OSV_BIN         = os.environ.get("_ZAGWARE_OSV_BIN",         "osv-scanner")
+_NPM_BIN         = os.environ.get("_ZAGWARE_NPM_BIN",         "npm")
+
+_REACH_VALUES = {"reachable", "not_reachable", "unknown", "not_applicable"}
+_SCOPE_VALUES = {"runtime", "dev", "build", "peer", "test", "unknown"}
+
+# Per-label enrichment metadata ({eco: {tool, version, mode}}) captured by
+# run_sca_scan and read by upload_sca_to_platform. Keyed by scan label
+# ("base"/"pr"/"local") so base and head uploads carry their own map.
+_SCA_ENRICHMENT: dict[str, dict] = {}
+
+
+def _init_enrichment_defaults(findings: list[dict]) -> None:
+    for f in findings:
+        f.setdefault("reachability", "unknown")
+        f.setdefault("reachability_source", "")
+        f.setdefault("dependency_scope", "unknown")
+        f.setdefault("call_paths", [])
+
+
+def _norm_vid(vid) -> str:
+    return str(vid or "").strip().upper()
+
+
+def _tool_available(binary: str) -> bool:
+    return shutil.which(binary) is not None or os.path.isfile(binary)
+
+
+def _tool_version(cmd: list[str]) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        lines = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+        return lines[0][:60] if lines else ""
+    except Exception:
+        return ""
+
+
+def _parse_json_stream(text: str) -> list[dict]:
+    """Parse a stream of whitespace-separated JSON objects (govulncheck -json)."""
+    dec = json.JSONDecoder()
+    idx, n, out = 0, len(text or ""), []
+    while idx < n:
+        while idx < n and text[idx] in " \t\r\n":
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            obj, end = dec.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            break
+        out.append(obj)
+        idx = end
+    return out
+
+
+def _nearest_manifest_dir(path: str, filename: str) -> str | None:
+    p = Path(path)
+    if (p / filename).is_file():
+        return str(p)
+    best, best_depth = None, 1 << 30
+    for hit in p.rglob(filename):
+        rel = hit.relative_to(p).as_posix()
+        if "node_modules/" in rel or rel.startswith(".git/"):
+            continue
+        depth = rel.count("/")
+        if depth < best_depth:
+            best, best_depth = str(hit.parent), depth
+    return best
+
+
+def _findings_by_name(findings: list[dict]) -> dict[str, list[dict]]:
+    idx: dict[str, list[dict]] = {}
+    for f in findings:
+        idx.setdefault(str(f.get("package_name", "")).lower(), []).append(f)
+    return idx
+
+
+def _add_source(f: dict, source: str) -> None:
+    parts = [p for p in (f.get("reachability_source") or "").split(",") if p]
+    if source not in parts:
+        parts.append(source)
+    f["reachability_source"] = ",".join(parts)
+
+
+def _apply_verdict(by_name: dict[str, list[dict]], v: dict) -> int:
+    """Apply one native-tool verdict onto matching findings. Only upgrades fields
+    still at their default, so a stronger source (e.g. govulncheck reachability)
+    is never clobbered by a weaker one applied later. `ids` None => match by
+    package name alone (used for package-level signals like dependency scope)."""
+    cands = by_name.get(str(v.get("name", "")).lower(), [])
+    if not cands:
+        return 0
+    ids = v.get("ids")
+    idset = {_norm_vid(i) for i in ids} if ids else None
+    reach = v.get("reachability")
+    scope = v.get("scope")
+    cps = v.get("call_paths") or []
+    applied = 0
+    for f in cands:
+        if idset is not None and _norm_vid(f["vulnerability_id"]) not in idset:
+            continue
+        changed = False
+        if reach in _REACH_VALUES and reach != "unknown" and f["reachability"] == "unknown":
+            f["reachability"] = reach
+            changed = True
+        if scope in _SCOPE_VALUES and scope != "unknown" and f["dependency_scope"] == "unknown":
+            f["dependency_scope"] = scope
+            changed = True
+        if cps:
+            f["call_paths"] = (f.get("call_paths") or []) + list(cps)
+            changed = True
+        if changed and v.get("source"):
+            _add_source(f, v["source"])
+            applied += 1
+    return applied
+
+
+def _run_govulncheck(path: str) -> tuple[list[dict], dict | None]:
+    """Go: true call-graph reachability. reachable = a vulnerable symbol is
+    actually called; not_reachable = the module is required/imported but the
+    symbol is never called."""
+    if not os.path.isfile(os.path.join(path, "go.mod")):
+        return [], None
+    if not (_tool_available(_GOVULNCHECK_BIN) and _tool_available(_GO_BIN)):
+        return [], None
+    try:
+        r = subprocess.run(
+            [_GOVULNCHECK_BIN, "-json", "./..."],
+            cwd=path, capture_output=True, text=True, timeout=_ENRICH_TIMEOUT,
+            env={**os.environ, "GOFLAGS": "-mod=mod"},
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log.warning("SCA enrichment: govulncheck failed: %s", e)
+        return [], None
+    aliases: dict[str, set[str]] = {}
+    modules: dict[str, set[str]] = {}
+    called:  dict[str, bool] = {}
+    paths:   dict[str, list[str]] = {}
+    for m in _parse_json_stream(r.stdout):
+        if "osv" in m:
+            o = m["osv"] or {}
+            oid = o.get("id", "")
+            if not oid:
+                continue
+            aliases.setdefault(oid, {oid}).update(o.get("aliases", []) or [])
+            for aff in o.get("affected", []) or []:
+                nm = (aff.get("package") or {}).get("name")
+                if nm:
+                    modules.setdefault(oid, set()).add(nm)
+        elif "finding" in m:
+            fnd = m["finding"] or {}
+            oid = fnd.get("osv", "")
+            if not oid:
+                continue
+            trace = fnd.get("trace") or []
+            top = trace[0] if trace else {}
+            if top.get("function"):
+                called[oid] = True
+                chain = " ← ".join(
+                    f"{t.get('package') or t.get('module', '')}.{t.get('function')}"
+                    for t in trace if t.get("function")
+                )
+                if chain:
+                    paths.setdefault(oid, []).append(chain)
+            else:
+                called.setdefault(oid, False)
+            if top.get("module"):
+                modules.setdefault(oid, set()).add(top["module"])
+    verdicts: list[dict] = []
+    for oid in set(aliases) | set(called) | set(modules):
+        reach = "reachable" if called.get(oid) else "not_reachable"
+        cps = [{"source": "govulncheck", "trace": c} for c in paths.get(oid, [])]
+        for nm in (modules.get(oid) or {""}):
+            if not nm:
+                continue
+            verdicts.append({
+                "name": nm, "ids": aliases.get(oid, {oid}),
+                "reachability": reach, "scope": "runtime",
+                "source": "govulncheck", "call_paths": cps,
+            })
+    # `govulncheck -version` prints two lines ("Go: goX" then "Scanner: govulncheck@vY");
+    # record the Scanner line so the enrichment map reports the tool's own version.
+    ver = ""
+    try:
+        vout = subprocess.run([_GOVULNCHECK_BIN, "-version"], capture_output=True, text=True, timeout=15)
+        for line in ((vout.stdout or "") + (vout.stderr or "")).splitlines():
+            if "govulncheck@" in line or line.strip().lower().startswith("scanner:"):
+                ver = line.split(":", 1)[-1].strip()[:60]
+                break
+    except Exception:
+        pass
+    return verdicts, {"tool": "govulncheck", "version": ver, "mode": "reachability"}
+
+
+def _run_npm_audit(path: str) -> tuple[list[dict], dict | None]:
+    """Node: dependency scope (runtime vs dev) from the resolved lockfile. npm
+    audit does not do call reachability, so reachability stays unknown — the
+    value here is prod/dev scope (dev deps never ship)."""
+    d = _nearest_manifest_dir(path, "package-lock.json") or _nearest_manifest_dir(path, "npm-shrinkwrap.json")
+    if not d or not _tool_available(_NPM_BIN):
+        return [], None
+
+    def _audit(extra: list[str]) -> dict:
+        try:
+            r = subprocess.run(
+                [_NPM_BIN, "audit", "--json", *extra],
+                cwd=d, capture_output=True, text=True, timeout=_ENRICH_TIMEOUT,
+            )
+            return json.loads(r.stdout) if (r.stdout or "").strip() else {}
+        except Exception:
+            return {}
+
+    full = _audit([])
+    prod = _audit(["--omit=dev"])
+    fv = full.get("vulnerabilities") or {}
+    pv = prod.get("vulnerabilities") or {}
+    meta = {"tool": "npm-audit", "version": _tool_version([_NPM_BIN, "--version"]), "mode": "advisory"}
+    verdicts = [
+        {"name": name, "scope": "runtime" if name in pv else "dev", "source": "npm-audit"}
+        for name in fv
+    ]
+    return verdicts, meta
+
+
+def _run_osv_scanner(path: str) -> tuple[list[dict], dict | None]:
+    """Cross-ecosystem. Contributes a reachability verdict only where OSV call
+    analysis is available (experimentalAnalysis.called) — that needs a Go
+    toolchain, so it fires in the reachability image, not the core. Either way it
+    records that osv-scanner assessed the tree: mode=reachability when call
+    analysis ran, mode=advisory (version match only) otherwise."""
+    if not _tool_available(_OSV_BIN):
+        return [], None
+    try:
+        r = subprocess.run(
+            [_OSV_BIN, "--format", "json", "--recursive", path],
+            capture_output=True, text=True, timeout=_ENRICH_TIMEOUT,
+        )
+        data = json.loads(r.stdout) if (r.stdout or "").strip() else {}
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        log.warning("SCA enrichment: osv-scanner failed: %s", e)
+        return [], None
+    verdicts: list[dict] = []
+    any_analysis = False
+    for res in data.get("results", []) or []:
+        for pkg in res.get("packages", []) or []:
+            name = (pkg.get("package") or {}).get("name", "")
+            analysis: dict[str, dict] = {}
+            for g in pkg.get("groups", []) or []:
+                for gid, info in (g.get("experimentalAnalysis") or {}).items():
+                    analysis[_norm_vid(gid)] = info
+            for vuln in pkg.get("vulnerabilities", []) or []:
+                vid = vuln.get("id", "")
+                ids = {vid} | set(vuln.get("aliases", []) or [])
+                reach = None
+                for i in ids:
+                    info = analysis.get(_norm_vid(i))
+                    if info and "called" in info:
+                        any_analysis = True
+                        reach = "reachable" if info["called"] else "not_reachable"
+                        break
+                verdicts.append({"name": name, "ids": ids, "reachability": reach, "source": "osv-scanner"})
+    mode = "reachability" if any_analysis else "advisory"
+    return verdicts, {"tool": "osv-scanner",
+                      "version": _tool_version([_OSV_BIN, "--version"]), "mode": mode}
+
+
+def enrich_sca_findings(path: str, findings: list[dict]) -> dict:
+    """Annotate Grype *findings* in place with advisory reachability / scope /
+    evidence, and return the per-ecosystem enrichment map {eco: {tool, version,
+    mode}}. Best-effort: each tool runs only if its binary + manifest are present;
+    any tool failure degrades to a plain Grype match, never an error."""
+    _init_enrichment_defaults(findings)
+    enrichment: dict[str, dict] = {}
+    if not (_SCA_ENRICH_ENABLED and findings):
+        return enrichment
+    by_name = _findings_by_name(findings)
+    # Order matters: govulncheck (true reachability) before osv (weaker) before
+    # npm (scope only). _apply_verdict only fills defaults, so the strongest wins.
+    for eco, runner in (("go", _run_govulncheck), ("osv", _run_osv_scanner), ("npm", _run_npm_audit)):
+        try:
+            verdicts, meta = runner(path)
+        except Exception as e:  # a broken tool must not sink the whole scan
+            log.warning("SCA enrichment: %s runner errored: %s", eco, e)
+            continue
+        for v in verdicts:
+            _apply_verdict(by_name, v)
+        if meta is not None:
+            enrichment[eco] = meta
+    return enrichment
 
 
 def new_sca_findings(
@@ -3109,6 +3420,7 @@ def upload_sca_to_platform(
                               'scan_type': 'pr_base' if pr_number else 'branch',
                               'pr_number': pr_number, 'pr_comparison_id': None,
                               'scanner_name': 'grype', 'findings': base_findings,
+                              'enrichment': _SCA_ENRICHMENT.get('base', {}),
                               'repo_base_url': _repo_base_url() or None})
         base_scan_id = base_resp.get('scan_id')
         if pr_number and base_scan_id:
@@ -3116,6 +3428,7 @@ def upload_sca_to_platform(
                    'scan_type': 'pr_head', 'pr_number': pr_number,
                    'pr_comparison_id': base_scan_id,
                    'scanner_name': 'grype', 'findings': head_findings,
+                   'enrichment': _SCA_ENRICHMENT.get('pr', {}),
                    'repo_base_url': _repo_base_url() or None})
         log.info('SCA results uploaded to platform (base: %s)', base_scan_id)
     except Exception as e:
