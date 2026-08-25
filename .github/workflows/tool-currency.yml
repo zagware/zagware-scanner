@@ -1,4 +1,4 @@
-# Watches the four bundled scanner binaries and the three base images for
+# Watches the five bundled scanner binaries and the three base images for
 # staleness, and reports in one continuously-updated issue.
 #
 # Two distinct triggers, because "a newer version exists" and "we are stuck on
@@ -75,11 +75,18 @@ jobs:
           # repo|pinned|label. KICS is compared by tag even though we build it
           # from source: the question "is there a newer KICS" is unchanged by
           # how we obtain it.
+          #
+          # osv-scanner belongs here for the same reason as the rest -- it is a
+          # pinned third-party binary in BOTH published images -- and it was
+          # missing until the 2026-08-25 review, which is how its pin sat at
+          # v2.4.0 for 68 days, two releases behind, carrying 11 critical/high,
+          # the worst of any bundled tool, with nothing reporting it.
           TOOLS=$(cat <<EOF
           Checkmarx/kics|v${KICS_VERSION}|KICS
           anchore/syft|${SYFT_VERSION}|Syft
           anchore/grype|${GRYPE_VERSION}|Grype
           betterleaks/betterleaks|v${BETTERLEAKS_VERSION}|betterleaks
+          google/osv-scanner|${OSV_SCANNER_VERSION}|osv-scanner
           EOF
           )
 
@@ -195,17 +202,38 @@ jobs:
           # break the build with no code change. Debian and the Go toolchain do
           # not GC this way, but they are checked identically -- a pin that
           # cannot be fetched is the same outage whatever the registry's policy.
+          #
+          # Three states, not two. `docker manifest inspect` failing does NOT
+          # mean the digest is gone: on 2026-08-24 this reported BOTH Docker Hub
+          # pins as UNPULLABLE and told a human "the next build will fail",
+          # while an authenticated registry HEAD showed both digests present and
+          # returning 200. The runner had simply hit Docker Hub's anonymous
+          # pull limit, which cgr.dev does not impose -- hence Wolfi passing in
+          # the same run. Reporting a rate-limit as a dead pin is the same
+          # fabricated-answer class SUP-01 removed from the CVE gates: a failed
+          # lookup is "unknown", and it must say so.
           echo "[]" > /tmp/bases.json
           check() {
-            if docker manifest inspect "$2" >/dev/null 2>&1; then S=ok; else S=UNPULLABLE; fi
-            echo "  $1: $S"
-            jq -c --arg n "$1" --arg s "$S" '. += [{name:$n,status:$s}]' \
+            local name="$1" ref="$2" err=""
+            if err=$(docker manifest inspect "$ref" 2>&1 >/dev/null); then
+              S=ok
+            elif printf '%s' "$err" | grep -qiE 'manifest unknown|not found|no such manifest|MANIFEST_UNKNOWN'; then
+              # The registry answered, and the answer was "that digest is gone".
+              S=UNPULLABLE
+            else
+              # Rate limit, auth failure, DNS, timeout -- the registry never
+              # told us anything about the digest.
+              S=UNRESOLVED
+            fi
+            echo "  $name: $S${err:+ -- ${err%%$'\n'*}}"
+            jq -c --arg n "$name" --arg s "$S" --arg e "${err%%$'\n'*}" \
+              '. += [{name:$n,status:$s,detail:$e}]' \
               /tmp/bases.json > /tmp/b.next && mv /tmp/b.next /tmp/bases.json
           }
           echo "Base image pins:"
           check "Wolfi (runtime)"  "cgr.dev/chainguard/wolfi-base@${WOLFI_DIGEST}"
           check "Debian (builder)" "debian:bookworm-slim@${DEBIAN_DIGEST}"
-          check "Go (kics build)"  "golang:1.26.5@${GO_DIGEST}"
+          check "Go (kics build)"  "golang:${GO_VERSION}@${GO_DIGEST}"
 
       - name: Open or update the currency issue
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -221,7 +249,8 @@ jobs:
 
             // Map a repo label to the binary name grype attributes CVEs to.
             const binaryOf = { KICS: 'kics', Syft: 'syft', Grype: 'grype',
-                               betterleaks: 'betterleaks' };
+                               betterleaks: 'betterleaks',
+                               'osv-scanner': 'osv-scanner' };
 
             const rows = [], escalations = [], behind = [];
             for (const t of tools) {
@@ -246,7 +275,8 @@ jobs:
                         `${escalate ? '🔴 **escalate**' : 'ok'} |`);
             }
 
-            const badBases = bases.filter(b => b.status !== 'ok');
+            const deadBases    = bases.filter(b => b.status === 'UNPULLABLE');
+            const unknownBases = bases.filter(b => b.status === 'UNRESOLVED');
 
             let body = `_Automated weekly check. This workflow never edits pins — it reports._\n\n`;
             body += scanned === 'none'
@@ -275,14 +305,25 @@ jobs:
               body += `\n`;
             }
 
-            if (badBases.length) {
+            if (deadBases.length) {
               body += `## 🔴 Base image pin unresolvable\n\n`;
-              body += `A pinned digest can no longer be fetched — the next build will fail.\n\n`;
-              for (const b of badBases) body += `- **${b.name}**: ${b.status}\n`;
+              body += `The registry answered, and the digest is gone — the next build will fail.\n\n`;
+              for (const b of deadBases) body += `- **${b.name}**: ${b.detail || b.status}\n`;
               body += `\n`;
             }
 
-            if (!behind.length && !escalations.length && !badBases.length) {
+            if (unknownBases.length) {
+              body += `## ⚠️ Base image pin not checked this run\n\n`;
+              body += `The registry lookup itself failed, so nothing is known about these `;
+              body += `digests either way. A Docker Hub anonymous pull-rate limit on the `;
+              body += `runner is the usual cause and it clears by itself; this is reported `;
+              body += `rather than counted as a dead pin, because guessing which one it was `;
+              body += `is how a rate limit gets read as an outage.\n\n`;
+              for (const b of unknownBases) body += `- **${b.name}**: ${b.detail || b.status}\n`;
+              body += `\n`;
+            }
+
+            if (!behind.length && !escalations.length && !deadBases.length && !unknownBases.length) {
               body += `✅ Everything pinned is current, every pin resolves, and nothing is `;
               body += `carrying fixable CVEs against a stale upstream.\n`;
             }
@@ -303,7 +344,7 @@ jobs:
                 issue_number: existing.data[0].number, body,
               });
               core.info(`Updated issue #${existing.data[0].number}`);
-            } else if (behind.length || escalations.length || badBases.length) {
+            } else if (behind.length || escalations.length || deadBases.length || unknownBases.length) {
               const created = await github.rest.issues.create({
                 owner: context.repo.owner, repo: context.repo.repo,
                 title: TITLE, body, labels: ['security', 'tool-currency'],

@@ -107,6 +107,52 @@ VULNERABLE_GRYPE = textwrap.dedent("""\
       {"vulnerability": {"id": "CVE-2099-0003", "severity": "Low"}}
     ]}'
 """)
+
+
+def _match(cve: str, severity: str, pkg: str, owner: str, fix: str) -> str:
+    """One Grype match, shaped the way the real presenter emits it."""
+    return json.dumps({
+        "vulnerability": {"id": cve, "severity": severity, "fix": {"state": fix}},
+        "artifact": {"name": pkg, "version": "1.0.0",
+                     "locations": [{"path": owner}]},
+    })
+
+
+def _grype_stub(*matches: str) -> str:
+    return "cat <<'EOF'\n" + json.dumps({"matches": [json.loads(m) for m in matches]}) + "\nEOF"
+
+
+# Findings a base re-pin or a Dockerfile version bump would clear: an OS
+# package from the Wolfi base, and Go stdlib inside kics -- which this repo
+# compiles itself, so its toolchain is a pin we control.
+ACTIONABLE_GRYPE = _grype_stub(
+    _match("CVE-2099-1001", "High", "libcrypto3", "/usr/lib/libcrypto.so.3", "fixed"),
+    _match("GO-2099-1002", "High", "stdlib", "/usr/local/bin/kics", "fixed"),
+)
+
+# Go stdlib inside VENDOR-built binaries. Grype calls these fixed because Go
+# published the patch, but no pin we own applies it -- only Anchore's and
+# betterleaks' next release does. Reported, never blocking; this is the exact
+# class that kept :stable from ever existing under the old raw-count gate.
+VENDOR_STDLIB_GRYPE = _grype_stub(
+    _match("GO-2099-2001", "High", "stdlib", "/usr/bin/syft", "fixed"),
+    _match("GO-2099-2002", "High", "stdlib", "/usr/local/bin/osv-scanner", "fixed"),
+)
+
+# A vendored MODULE (not stdlib) inside a vendor binary. A newer upstream
+# release of that tool clears it, so bumping our pin is a real remedy and it
+# must block -- this is what actually happened with go-git in Syft v1.51.0.
+VENDOR_MODULE_GRYPE = _grype_stub(
+    _match("GHSA-2099-3001", "High", "github.com/go-git/go-git/v5", "/usr/bin/syft", "fixed"),
+)
+
+# No fix exists anywhere: the containerd advisories in kics, patched only in a
+# containerd/v2 module path kics does not use.
+UNFIXABLE_GRYPE = _grype_stub(
+    _match("GO-2099-4001", "Critical", "github.com/containerd/containerd",
+           "/usr/local/bin/kics", ""),
+)
+
 MISSING_BINARY_GRYPE = "echo 'grype: command not found' >&2; exit 127"
 GARBAGE_OUTPUT_GRYPE = "echo 'not json at all' ; exit 0"
 
@@ -126,6 +172,29 @@ class TestAuditYmlScanStep:
         proc = _run_bash_step(script, tmp_path, VULNERABLE_GRYPE)
         assert proc.returncode == 0, proc.stderr
         assert _parse_output(proc.gh_output)["high_count"] == "2"  # 1 Critical + 1 High
+
+    def test_actionable_findings_are_counted_as_actionable(self, tmp_path):
+        script = _extract_run_block(".github/workflows/audit.yml", self.STEP)
+        out = _parse_output(_run_bash_step(script, tmp_path, ACTIONABLE_GRYPE).gh_output)
+        assert out["high_count"] == "2"
+        assert out["fixable_count"] == "2"
+        assert out["actionable_count"] == "2"
+
+    def test_vendor_stdlib_is_reported_but_not_actionable(self, tmp_path):
+        """Reported in the total AND in fixable -- the audit never hides a
+        finding -- but it must not raise a weekly alert nobody here can close."""
+        script = _extract_run_block(".github/workflows/audit.yml", self.STEP)
+        out = _parse_output(_run_bash_step(script, tmp_path, VENDOR_STDLIB_GRYPE).gh_output)
+        assert out["high_count"] == "2"
+        assert out["fixable_count"] == "2"
+        assert out["actionable_count"] == "0"
+
+    def test_unfixable_finding_is_reported_but_not_actionable(self, tmp_path):
+        script = _extract_run_block(".github/workflows/audit.yml", self.STEP)
+        out = _parse_output(_run_bash_step(script, tmp_path, UNFIXABLE_GRYPE).gh_output)
+        assert out["high_count"] == "1"
+        assert out["fixable_count"] == "0"
+        assert out["actionable_count"] == "0"
 
     def test_missing_grype_binary_fails_closed_not_zero(self, tmp_path):
         """The exact real-world bug this fix targets: grype absent -> the step
@@ -154,12 +223,53 @@ class TestPromoteYmlScanStep:
         assert out["high_count"] == "0"
         assert out["scan_failed"] == "false"
 
-    def test_vulnerable_image_blocks_promotion_with_real_count(self, tmp_path):
+    def test_unfixable_findings_do_not_block_promotion(self, tmp_path):
+        """VULNERABLE_GRYPE carries no fix data at all. It is real, it is
+        counted, and it must not block: no version of anything closes it."""
         script = _extract_run_block(".github/workflows/promote.yml", self.STEP)
         proc = _run_bash_step(script, tmp_path, VULNERABLE_GRYPE)
         assert proc.returncode == 0, proc.stderr
         out = _parse_output(proc.gh_output)
         assert out["high_count"] == "2"
+        assert out["blocking_count"] == "0"
+        assert out["scan_failed"] == "false"
+
+    def test_actionable_findings_block_promotion(self, tmp_path):
+        """An OS package we can re-pin and stdlib in the binary we compile
+        ourselves: both have a remedy on our side, so both must block."""
+        script = _extract_run_block(".github/workflows/promote.yml", self.STEP)
+        proc = _run_bash_step(script, tmp_path, ACTIONABLE_GRYPE)
+        assert proc.returncode == 0, proc.stderr
+        out = _parse_output(proc.gh_output)
+        assert out["high_count"] == "2"
+        assert out["fixable_count"] == "2"
+        assert out["blocking_count"] == "2"
+        assert out["scan_failed"] == "true"
+        assert "libcrypto3" in proc.stdout, "the log must name each blocking finding"
+        assert "kics" in proc.stdout
+
+    def test_vendor_stdlib_does_not_block_promotion(self, tmp_path):
+        """The regression this whole gate change exists for: 32 of the 50
+        critical/high in the 2026-08-25 image were exactly this shape, and a
+        raw-count gate meant :stable could never be published at all."""
+        script = _extract_run_block(".github/workflows/promote.yml", self.STEP)
+        proc = _run_bash_step(script, tmp_path, VENDOR_STDLIB_GRYPE)
+        assert proc.returncode == 0, proc.stderr
+        out = _parse_output(proc.gh_output)
+        assert out["high_count"] == "2"
+        assert out["fixable_count"] == "2", "still reported as fixable, just not ours"
+        assert out["blocking_count"] == "0"
+        assert out["scan_failed"] == "false"
+
+    def test_vendor_module_cve_still_blocks_promotion(self, tmp_path):
+        """Not stdlib: a newer release of that same vendor tool clears it, so
+        bumping the pin is a real remedy and the gate must demand it. Without
+        this, 'vendor binary' would become a blanket exemption."""
+        script = _extract_run_block(".github/workflows/promote.yml", self.STEP)
+        proc = _run_bash_step(script, tmp_path, VENDOR_MODULE_GRYPE)
+        assert proc.returncode == 0, proc.stderr
+        out = _parse_output(proc.gh_output)
+        assert out["blocking_count"] == "1"
         assert out["scan_failed"] == "true"
 
     def test_missing_grype_binary_fails_the_step_instead_of_reporting_999(self, tmp_path):
@@ -218,7 +328,9 @@ PREDICATE_EXPR_MAP = {
     "steps.latest.outputs.digest": TEST_DIGEST,
     "steps.latest.outputs.previous_stable_digest": "sha256:" + "cd" * 32,
     "steps.latest.outputs.age_days": "17",
-    "steps.scan.outputs.high_count": "0",
+    "steps.scan.outputs.high_count": "28",
+    "steps.scan.outputs.fixable_count": "25",
+    "steps.scan.outputs.blocking_count": "0",
     "github.server_url": "https://github.com",
     "github.repository": "zagware/zagware-scanner",
     "github.run_id": "123456789",
@@ -270,7 +382,15 @@ class TestPromoteYmlPredicateStep:
         assert predicate["sourceTag"] == "latest"
         # real ints, not the string forms the GH expressions resolve to
         assert predicate["coolingPeriodDays"] == 17
-        assert predicate["cveScan"] == {"tool": "grype", "highOrCriticalCount": 0}
+        # The signed record keeps all three numbers. A promoted digest that
+        # carried 28 critical/high must say so; what promotion asserts is that
+        # none of them were ours to close, not that there were none.
+        assert predicate["cveScan"] == {
+            "tool": "grype",
+            "highOrCriticalCount": 28,
+            "fixableCount": 25,
+            "actionableCount": 0,
+        }
         assert predicate["workflowRun"] == (
             "https://github.com/zagware/zagware-scanner/actions/runs/123456789"
         )
@@ -292,3 +412,40 @@ class TestPromoteYmlPredicateStep:
         assert has_predicate != has_predicate_path, (
             "actions/attest requires exactly one of predicate or predicate-path"
         )
+
+
+class TestVendorBinaryListIsSingleSourced:
+    """promote.yml and audit.yml each declare VENDOR_BINARIES, and the two
+    gates only agree on what "actionable" means while the lists are identical.
+    Same test-enforced-duplication arrangement install-grype uses for the Grype
+    pin: the copy is allowed, the drift is not.
+
+    The membership itself is load-bearing, not cosmetic. A name added here is
+    exempted from blocking on stdlib findings forever, so the list must contain
+    exactly the binaries somebody else builds and signs -- never kics, which
+    this repo compiles from source and whose toolchain is ours to re-pin."""
+
+    LIST_RE = re.compile(r"VENDOR_BINARIES='(\[[^']*\])'")
+
+    def _list(self, workflow: str) -> list[str]:
+        text = (REPO_ROOT / workflow).read_text()
+        found = self.LIST_RE.findall(text)
+        assert len(found) == 1, f"{workflow} must declare VENDOR_BINARIES exactly once"
+        return json.loads(found[0])
+
+    def test_both_gates_declare_the_same_vendor_binaries(self):
+        assert (self._list(".github/workflows/promote.yml")
+                == self._list(".github/workflows/audit.yml"))
+
+    def test_list_is_exactly_the_externally_built_binaries(self):
+        assert self._list(".github/workflows/promote.yml") == [
+            "syft", "grype", "betterleaks", "osv-scanner",
+        ]
+
+    def test_kics_is_never_exempt(self):
+        """kics is built here, from source, with a Go toolchain pinned in the
+        Dockerfile -- every stdlib CVE it carries is closed by editing
+        GO_VERSION. Exempting it would silence the one class of stdlib finding
+        this repo can actually fix."""
+        for workflow in (".github/workflows/promote.yml", ".github/workflows/audit.yml"):
+            assert "kics" not in self._list(workflow)

@@ -10,6 +10,120 @@ Versions are published as container tags — see the
 
 ## [Unreleased]
 
+## [3.3.0] — 2026-08-25
+
+Tool currency and a promotion gate that can actually pass. Image critical/high
+drops 50 -> 28 and the subset this repository can act on drops 19 -> 0, which
+is the condition `:stable` has been waiting on since the promotion workflow was
+written. Scanner code is unchanged; the image contents move, so `__version__`
+bumps to 3.3.0.
+
+### Security
+
+- **Bundled tool pins updated; image CRITICAL/HIGH 50 → 28, actionable 19 → 0.**
+  Measured 2026-08-25 against `sha256:b510b834…` and against each upstream
+  release artifact individually, with Grype's database of the same date.
+  - **Wolfi base re-pinned** — closes 8 OS findings (`busybox` ×4,
+    `libcrypto3`/`libssl3` ×4). `cgr.dev/chainguard/wolfi-base:latest` scans
+    clean; the old pin had simply aged.
+  - **Go toolchain 1.26.5 → 1.26.7** — clears all 5 `stdlib` CRITICAL/HIGH in
+    the source-built KICS binary. The advisories (GO-2026-5026, -5972, -5942,
+    -6088, -6090) are fixed in 1.26.6, released 2026-08-13. KICS's two
+    remaining findings are `containerd` advisories patched only in the
+    `containerd/v2` module line, which KICS does not use — no fix exists for us.
+  - **osv-scanner v2.4.0 → v2.5.1** — 11 → 6. The largest single win, and the
+    only bumped tool whose *module* CVEs were all clearable: `go-git`,
+    `x/text`, `grpc` and `docker/docker` all drop out. It was also the only
+    bundled binary the currency workflow never watched, which is how its pin
+    sat 68 days and two releases behind unnoticed.
+  - **betterleaks 1.7.2 → 1.8.1** — 7 → 5 (`x/text` 0.38.0 → 0.39.0, one
+    `stdlib`).
+  - **Syft v1.50.0 → v1.51.0** and **Grype v0.116.1 → v0.117.0** — 8 → 7 and
+    9 → 8 respectively, both clearing `go-git` GHSA-hc8v-wwc9-vgxm. Routine
+    currency rather than CVE-driven: both are still built with go1.26.3, which
+    predates the Go 1.26.6 patch by three days.
+  - **Not done: source-building Syft, Grype, betterleaks or osv-scanner.** It
+    would take the remaining 25 `stdlib` findings to zero and cost four
+    verified vendor cosign signatures for a number. Upstream is alive, signing,
+    and releasing on a two-week cadence; their next builds pick up Go 1.26.6+
+    without us giving anything up.
+
+### Changed
+
+- **The promotion gate now blocks on *actionable* CRITICAL/HIGH findings, not
+  every fixable one.** 3.2.0's changelog claimed the gate already fired on
+  fixable findings only; `audit.yml` did, `promote.yml` never did — it counted
+  every match at HIGH or above. Both are now consistent, and both use a
+  narrower rule than "fixable".
+
+  The reason is arithmetic. 32 of the 50 CRITICAL/HIGH in the published image
+  were Go `stdlib` advisories inside vendor-built binaries. Grype marks them
+  fixed because Go published the patch, but applying it means Anchore, Google
+  or betterleaks rebuilding — no pin we own moves them. Bumping every tool to
+  its newest release still leaves 25. A gate demanding zero was unsatisfiable
+  by construction and had blocked **every** scheduled promotion since it was
+  written: `:stable` did not exist, so the documentation directed users to
+  `:latest`, which has no CVE gate at all. The safest-looking gate produced the
+  least safe recommendation.
+
+  Blocking now means: OS packages (we re-pin the base), anything in `kics` (we
+  compile it), and vendored *modules* in vendor binaries (a version bump clears
+  them). Go `stdlib` in a vendor binary, and anything with no published fix,
+  are reported and do not block. Passing the gate now requires an action that
+  exists — and performing it takes this image from 19 blocking findings to 0.
+
+  Nothing is hidden: totals appear in the run summary, in the signed promotion
+  attestation (`cveScan.highOrCriticalCount` / `.fixableCount` /
+  `.actionableCount`), and per owning binary in the weekly currency issue.
+
+  The cooling period was never involved. The candidate digest was 18 days old
+  against a 7-day requirement; every run cleared the age gate and failed the
+  CVE gate. `COOLING_DAYS` stays 7.
+
+### Fixed
+
+- **Currency workflow reported unreachable registries as dead pins.** On
+  2026-08-24 it declared both Docker Hub base pins `UNPULLABLE` and told a
+  maintainer "the next build will fail"; an authenticated registry HEAD showed
+  both digests present and serving. The runner had hit Docker Hub's anonymous
+  pull limit — which is why the Chainguard pin passed in the same run. A failed
+  lookup is now reported as unchecked, distinct from a digest the registry
+  confirms is gone. Same fabricated-answer class SUP-01 removed from the CVE
+  gates.
+- **osv-scanner is now tracked by the currency workflow** and credited in
+  `NOTICE`, alongside `govulncheck`. Both ship in published images and neither
+  was attributed.
+- **`golang:1.26.5` was a bare literal in three places** — two `FROM` lines and
+  the currency workflow's pullability check — none tied to `GO_DIGEST` by any
+  test, so a re-pin could leave the tag and the digest disagreeing silently.
+  The tag is now `ARG GO_VERSION`, resolved from the same single source as
+  every other pin.
+- **`NOTICE` described the runtime base as `debian:bookworm-slim`.** The
+  runtime image has been Wolfi since v3.1.0; Debian is a build-only stage whose
+  filesystem reaches neither published image.
+- **Two comments claimed verification that does not happen.** `Dockerfile`
+  stated that `publish.yml` verifies osv-scanner's SLSA provenance
+  (`multiple.intoto.jsonl`) "the osv equivalent of the Syft/Grype cosign step".
+  It does not — it compares the pinned checksum against the release's
+  `osv-scanner_SHA256SUMS`, which closes transcription error, not substitution.
+  The comment now says what the step does; verifying the provenance remains an
+  open gap.
+
+### Notes for consumers
+
+- **betterleaks 1.8.0 split `generic-api-key`** into `generic-api-key`,
+  `generic-password` and `generic-credential-uri`. Fingerprints are
+  `file:rule_id:line`, so a `.zagware/suppressions.yaml` entry pinned to an old
+  `generic-api-key` password or credential-URI finding stops matching, and that
+  finding returns once as net-new. PR diffs are unaffected — base and head are
+  scanned with the same image. Re-suppress from the new `similarity_id` in the
+  PR comment hint.
+- Expect legitimate finding-count churn from the SBOM and matcher fixes in this
+  set: Syft v1.51.0 stops emitting phantom `<name>@unknown` npm packages and
+  fixes legacy-JAR PURLs, Grype v0.117.0 honours `match.rust.using-cpes`, and
+  osv-scanner v2.5.x adds several Linux ecosystems and fixes RHEL epoch
+  matching.
+
 ## [3.2.0] — 2026-08-06
 
 Advisory SCA reachability enrichment. Language-native tools now layer a
@@ -478,6 +592,7 @@ remediation, not new features.
 ### Added
 - Grype SCA scanning alongside KICS IaC scanning, unified into a single scanner.
 
+[3.3.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.3.0
 [3.2.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.2.0
 [3.1.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.1.0
 [3.0.2]: https://github.com/zagware/zagware-scanner/releases/tag/v3.0.2

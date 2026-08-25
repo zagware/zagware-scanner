@@ -174,12 +174,47 @@ jobs:
         if: steps.latest.outputs.skip == 'true'
         run: echo "Skipping promotion — see previous step output for reason."
 
+      # ── The CVE gate ──────────────────────────────────────────────────────
+      # This blocks on findings WE CAN ACT ON, which is not the same as every
+      # fixable finding, and is very much not the same as every finding.
+      #
+      # A raw `HIGH_COUNT != 0` gate was unsatisfiable by construction and had
+      # therefore never promoted anything: the image bundles five third-party
+      # Go binaries, and 2026-08-25's :latest carried 50 critical/high of which
+      # 32 were Go `stdlib` advisories baked into vendor-built binaries. Grype
+      # marks those "fixed" because a patched Go release exists -- but the fix
+      # is Anchore's or betterleaks' to apply by rebuilding, not ours. Bumping
+      # every pin to its newest upstream release still leaves them. A gate that
+      # can only pass on a condition no action of ours produces is not a gate;
+      # it is a permanently closed door, and it is why :stable did not exist.
+      #
+      # So the gate asks the question that actually has an answer: is there a
+      # finding a base re-pin or a version bump would clear?
+      #
+      #   OS packages           -> ours (re-pin WOLFI_DIGEST)          BLOCKS
+      #   kics                  -> ours (we build it; re-pin GO_VERSION) BLOCKS
+      #   vendor binary, module -> a newer upstream release clears it  BLOCKS
+      #   vendor binary, stdlib -> only a vendor rebuild clears it     reported
+      #   no fix in existence   -> nobody can clear it                 reported
+      #
+      # The last two are not silence: tool-currency.yml reports every one of
+      # them weekly, per owning binary, and escalates when a vendor goes quiet
+      # while carrying them. The count is also written into the signed
+      # promotion predicate below, so a promoted digest always carries its own
+      # honest vulnerability total -- we publish the number, we just stopped
+      # pretending we could drive it to zero.
+      #
+      # VENDOR_BINARIES is duplicated in audit.yml and pinned equal by
+      # tests/test_workflow_grype_gating.py, the same test-enforced-duplication
+      # arrangement install-grype uses for the Grype pin.
       - name: Scan image for CVEs (Grype)
         if: steps.latest.outputs.skip != 'true'
         id: scan
         run: |
           IMAGE_REF="ghcr.io/zagware/zagware-scanner@${{ steps.latest.outputs.digest }}"
           echo "Scanning $IMAGE_REF for CVEs..."
+
+          VENDOR_BINARIES='["syft","grype","betterleaks","osv-scanner"]'
 
           set +e
           SCAN_JSON=$(grype "$IMAGE_REF" -o json 2>/tmp/grype-stderr.log)
@@ -193,15 +228,43 @@ jobs:
             exit 1
           fi
 
-          HIGH_COUNT=$(echo "$SCAN_JSON" | jq '[.matches[] | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length')
+          # `$vendors | index($owner)` binds $owner FIRST on purpose: writing
+          # `index(.owner)` reads `.` as the piped-in $vendors array, not the
+          # finding, and jq fails with "cannot index array with string".
+          COUNTS=$(echo "$SCAN_JSON" | jq -c --argjson vendors "$VENDOR_BINARIES" '
+            [ .matches[]
+              | select(.vulnerability.severity | ascii_downcase | test("high|critical"))
+              | ((.artifact.locations[0].path // "") | split("/") | last) as $owner
+              | { fixable: ((.vulnerability.fix.state // "") == "fixed"),
+                  stdlib:  ((.artifact.name // "") == "stdlib"),
+                  vendor:  (($vendors | index($owner)) != null) } ]
+            | { total:    length,
+                fixable:  (map(select(.fixable)) | length),
+                blocking: (map(select(.fixable and ((.stdlib and .vendor) | not))) | length) }')
+
+          HIGH_COUNT=$(echo "$COUNTS" | jq -r '.total')
+          FIXABLE_COUNT=$(echo "$COUNTS" | jq -r '.fixable')
+          BLOCKING_COUNT=$(echo "$COUNTS" | jq -r '.blocking')
 
           echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
+          echo "fixable_count=$FIXABLE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "blocking_count=$BLOCKING_COUNT" >> "$GITHUB_OUTPUT"
 
-          if [ "$HIGH_COUNT" != "0" ]; then
-            echo "Found $HIGH_COUNT HIGH/CRITICAL vulnerabilities — promotion blocked"
+          echo "$HIGH_COUNT HIGH/CRITICAL total; $FIXABLE_COUNT have an upstream fix; $BLOCKING_COUNT are ours to act on"
+
+          if [ "$BLOCKING_COUNT" != "0" ]; then
+            echo "Found $BLOCKING_COUNT actionable HIGH/CRITICAL vulnerabilities — promotion blocked"
+            echo "$SCAN_JSON" | jq -r --argjson vendors "$VENDOR_BINARIES" '
+              .matches[]
+              | select(.vulnerability.severity | ascii_downcase | test("high|critical"))
+              | select((.vulnerability.fix.state // "") == "fixed")
+              | ((.artifact.locations[0].path // "") | split("/") | last) as $owner
+              | select((((.artifact.name // "") == "stdlib")
+                        and (($vendors | index($owner)) != null)) | not)
+              | "  \($owner): \(.vulnerability.id) in \(.artifact.name // "?")@\(.artifact.version // "?")"'
             echo "scan_failed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "No HIGH/CRITICAL vulnerabilities found — safe to promote"
+            echo "Nothing actionable — safe to promote"
             echo "scan_failed=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -210,7 +273,8 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const count = '${{ steps.scan.outputs.high_count }}';
+            const count = '${{ steps.scan.outputs.blocking_count }}';
+            const total = '${{ steps.scan.outputs.high_count }}';
             const digest = '${{ steps.latest.outputs.digest }}';
 
             // Check if a blocked-promotion issue already exists for this digest —
@@ -233,8 +297,8 @@ jobs:
             github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Promotion blocked: ${digest} has ${count} HIGH/CRITICAL CVEs`,
-              body: `The promotion of \`ghcr.io/zagware/zagware-scanner@${digest}\` to :stable was blocked because Grype found ${count} HIGH/CRITICAL vulnerabilities.\n\nThe image remains on :latest. Once the CVEs are resolved (either by patching the base image or bumping affected packages), re-run this workflow to retry promotion.`,
+              title: `Promotion blocked: ${digest} has ${count} actionable HIGH/CRITICAL CVEs`,
+              body: `The promotion of \`ghcr.io/zagware/zagware-scanner@${digest}\` to :stable was blocked because Grype found **${count}** HIGH/CRITICAL vulnerabilities that a base re-pin or a tool version bump would clear (${total} HIGH/CRITICAL in total; the remainder are either unfixable upstream or Go \`stdlib\` inside a vendor-built binary, which only that vendor's next release can move — tool-currency.yml tracks those).\n\nThe scan step's log lists each blocking finding with its owning binary.\n\nThe image remains on :latest. Re-pin the base or bump the affected tool, publish, and this workflow will retry on its next run.`,
               labels: ['security', 'promotion-blocked']
             });
 
@@ -264,12 +328,27 @@ jobs:
           # and nothing else in the repo archives the digest :stable pointed at
           # before this run overwrote it. Putting it in the signed promotion
           # predicate means the value survives log retention. See SUP-17.
+          #
+          # cveScan carries all three counts, not just the one the gate reads.
+          # highOrCriticalCount is what the image actually contains;
+          # fixableCount is how many have a patch published anywhere upstream;
+          # actionableCount is how many a base re-pin or a version bump here
+          # would clear, and zero is the promotion condition. The gap between
+          # the middle number and the last one is Go stdlib compiled into
+          # vendor-built binaries, which moves only when that vendor rebuilds.
+          # A promoted digest therefore always ships its own honest total.
+          #
+          # These notes live above the jq program, not inside it: an apostrophe
+          # in a jq comment closes the surrounding shell quote and the step
+          # dies with "jq: 1 compile error".
           jq -n \
             --arg digest "${{ steps.latest.outputs.digest }}" \
             --arg replaced_digest "${{ steps.latest.outputs.previous_stable_digest }}" \
             --arg promoted_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg cooling_period_days "${{ steps.latest.outputs.age_days }}" \
             --arg high_critical_count "${{ steps.scan.outputs.high_count }}" \
+            --arg fixable_count "${{ steps.scan.outputs.fixable_count }}" \
+            --arg blocking_count "${{ steps.scan.outputs.blocking_count }}" \
             --arg workflow_run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             '{
               digest: $digest,
@@ -280,7 +359,9 @@ jobs:
               coolingPeriodDays: ($cooling_period_days | tonumber),
               cveScan: {
                 tool: "grype",
-                highOrCriticalCount: ($high_critical_count | tonumber)
+                highOrCriticalCount: ($high_critical_count | tonumber),
+                fixableCount: ($fixable_count | tonumber),
+                actionableCount: ($blocking_count | tonumber)
               },
               workflowRun: $workflow_run
             }' > /tmp/promotion-predicate.json
@@ -302,7 +383,7 @@ jobs:
           echo "## Promoted to :stable and :secure" >> $GITHUB_STEP_SUMMARY
           echo "**Digest:** \`${{ steps.latest.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Cooling period:** ${{ steps.latest.outputs.age_days }} days" >> $GITHUB_STEP_SUMMARY
-          echo "**CVE scan:** Clean (0 HIGH/CRITICAL)" >> $GITHUB_STEP_SUMMARY
+          echo "**CVE scan:** ${{ steps.scan.outputs.high_count }} HIGH/CRITICAL (${{ steps.scan.outputs.fixable_count }} fixable upstream, ${{ steps.scan.outputs.blocking_count }} actionable by us — promotion requires 0 actionable)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           # Rollback record. audit.yml alerts but cannot re-tag, and nothing
           # else archives the digest :stable pointed at before this run. See

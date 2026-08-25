@@ -59,7 +59,13 @@ import hashlib
 # 3.1.0 rebases the image on Wolfi and builds KICS from source: critical/high
 # CVEs 153 -> 8, with identical scan output. Scanner behaviour is unchanged;
 # this version exists to identify the image contents. See CHANGELOG.md.
-__version__ = "3.2.0"
+#
+# 3.3.0 re-pins every bundled tool and the Wolfi base: critical/high 50 -> 28,
+# and the ones this repo can actually act on 19 -> 0, which is what lets
+# :stable exist at all. Scanner code is unchanged, but betterleaks 1.8.x splits
+# generic-api-key into three rules, so some secrets findings change rule id and
+# therefore similarity_id once. See CHANGELOG.md.
+__version__ = "3.3.0"
 
 # Boolean-shaped env vars previously used five different, mutually incompatible
 # parsing conventions (.lower()=="true", .lower()!="false", bare truthiness, and

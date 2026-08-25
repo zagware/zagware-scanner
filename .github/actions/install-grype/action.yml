@@ -19,9 +19,9 @@ runs:
     - name: Install Grype (pinned, checksum-verified)
       shell: bash
       env:
-        GRYPE_VERSION: v0.116.1
-        GRYPE_VER: 0.116.1
-        GRYPE_CHECKSUM: f005c69c326fb27ef5e2c15bca3c6c50fa69dc12e36b01b637b3733746da4fca
+        GRYPE_VERSION: v0.117.0
+        GRYPE_VER: 0.117.0
+        GRYPE_CHECKSUM: ded1af2d2946fc92863ba2278d91da64dabb2c7a33a0e703868311686bc98873
       run: |
         curl -fL \
           "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_linux_amd64.deb" \

@@ -23,27 +23,46 @@ Syft
   Vendor:    Anchore
   License:   Apache-2.0
   Source:    https://github.com/anchore/syft
-  Version:   v1.50.0
+  Version:   v1.51.0
   Role:      Generates the SBOM that Grype scans for known vulnerabilities.
 
 Grype
   Vendor:    Anchore
   License:   Apache-2.0
   Source:    https://github.com/anchore/grype
-  Version:   v0.116.1
+  Version:   v0.117.0
 
 betterleaks
   Vendor:    betterleaks
   License:   MIT
   Source:    https://github.com/betterleaks/betterleaks
-  Version:   1.7.2
+  Version:   1.8.1
+
+osv-scanner
+  Vendor:    Google
+  License:   Apache-2.0
+  Source:    https://github.com/google/osv-scanner
+  Version:   v2.5.1
+  Role:      Cross-ecosystem advisory matching in both images; call analysis
+             in the :reachability variant only.
+
+govulncheck
+  Vendor:    The Go Authors
+  License:   BSD-3-Clause
+  Source:    https://golang.org/x/vuln
+  Version:   v1.1.4
+  Role:      Go reachability analysis. Present ONLY in the :reachability
+             image, not in the default core image.
 
 --------------------------------------------------------------------------------
 
-The final runtime image is also built on a `debian:bookworm-slim` base image
-(pinned by digest in Dockerfile), which itself bundles ca-certificates, git,
-and python3 plus their own transitive dependencies under a variety of licenses
-(GPL-2.0, GPL-3.0, LGPL, PSF-2.0, and others). The full composition of the
-published image, including base-image packages, is enumerated in the SPDX
+The runtime image is built on `cgr.dev/chainguard/wolfi-base` (pinned by
+digest in Dockerfile) plus ca-certificates, git and python-3.13 from Wolfi's
+apk repositories; the :reachability variant adds go, nodejs and npm from the
+same repositories. A `debian:bookworm-slim` stage is used at BUILD time only,
+to run dpkg over the Syft and Grype .deb artifacts -- nothing from its
+filesystem reaches either published image. These base packages carry their own
+licenses (GPL-2.0, GPL-3.0, LGPL, PSF-2.0, and others). The full composition of
+the published image, including base-image packages, is enumerated in the SPDX
 SBOM attached to each release as an OCI attestation -- see "Supply chain
 security" in README.md for how to inspect it.
