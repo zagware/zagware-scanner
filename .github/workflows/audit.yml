@@ -70,28 +70,57 @@ jobs:
             exit 1
           fi
 
-          # Split fixable from unfixable. The gate fires on FIXABLE only.
-          # Two containerd advisories inside KICS have no upstream patch, so a
-          # raw-count gate would file an identical issue every week forever for
-          # something nobody can action -- and an alert that is always red is an
-          # alert nobody reads. The total is still reported so unfixable
-          # findings stay visible rather than being silently dropped.
-          HIGH_COUNT=$(echo "$SCAN_JSON" | jq '[.matches[]
-            | select(.vulnerability.severity | ascii_downcase | test("high|critical"))] | length')
-          FIXABLE_COUNT=$(echo "$SCAN_JSON" | jq '[.matches[]
-            | select(.vulnerability.severity | ascii_downcase | test("high|critical"))
-            | select((.vulnerability.fix.state // "") == "fixed")] | length')
+          # Three numbers, because they answer three different questions.
+          #
+          #   total     — what the image carries. Always reported, never hidden.
+          #   fixable   — a patched version exists SOMEWHERE upstream.
+          #   actionable— a patched version exists in something WE pin.
+          #
+          # The alert fires on `actionable`, not `fixable`, for the same reason
+          # promote.yml's gate does: 32 of the 50 critical/high in the
+          # 2026-08-25 image were Go `stdlib` advisories compiled into
+          # vendor-built binaries. Grype calls them fixed because Go shipped the
+          # patch; nothing we can pin applies it — only Anchore's or
+          # betterleaks' next release does. Alerting weekly on findings whose
+          # only remedy is somebody else's release train is the same
+          # always-red-alarm failure the fixable/unfixable split was introduced
+          # to avoid, one level further in. tool-currency.yml is where those
+          # live: it reports them per binary and escalates when the vendor
+          # goes quiet.
+          #
+          # VENDOR_BINARIES is duplicated in promote.yml and pinned equal by
+          # tests/test_workflow_grype_gating.py.
+          VENDOR_BINARIES='["syft","grype","betterleaks","osv-scanner"]'
+
+          # $owner is bound before the lookup: `index(.owner)` would read `.`
+          # as the piped-in $vendors array and jq would abort the step.
+          COUNTS=$(echo "$SCAN_JSON" | jq -c --argjson vendors "$VENDOR_BINARIES" '
+            [ .matches[]
+              | select(.vulnerability.severity | ascii_downcase | test("high|critical"))
+              | ((.artifact.locations[0].path // "") | split("/") | last) as $owner
+              | { fixable: ((.vulnerability.fix.state // "") == "fixed"),
+                  stdlib:  ((.artifact.name // "") == "stdlib"),
+                  vendor:  (($vendors | index($owner)) != null) } ]
+            | { total:      length,
+                fixable:    (map(select(.fixable)) | length),
+                actionable: (map(select(.fixable and ((.stdlib and .vendor) | not))) | length) }')
+
+          HIGH_COUNT=$(echo "$COUNTS" | jq -r '.total')
+          FIXABLE_COUNT=$(echo "$COUNTS" | jq -r '.fixable')
+          ACTIONABLE_COUNT=$(echo "$COUNTS" | jq -r '.actionable')
 
           echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
           echo "fixable_count=$FIXABLE_COUNT" >> "$GITHUB_OUTPUT"
-          echo "Found $HIGH_COUNT HIGH/CRITICAL in :stable ($FIXABLE_COUNT with an upstream fix)"
+          echo "actionable_count=$ACTIONABLE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Found $HIGH_COUNT HIGH/CRITICAL in :stable ($FIXABLE_COUNT with an upstream fix, $ACTIONABLE_COUNT actionable here)"
 
       - name: Open issue for new CVEs
-        if: steps.stable.outputs.skip != 'true' && steps.scan.outputs.fixable_count != '0'
+        if: steps.stable.outputs.skip != 'true' && steps.scan.outputs.actionable_count != '0'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const count = '${{ steps.scan.outputs.fixable_count }}';
+            const count = '${{ steps.scan.outputs.actionable_count }}';
+            const fixable = '${{ steps.scan.outputs.fixable_count }}';
             const total = '${{ steps.scan.outputs.high_count }}';
             const digest = '${{ steps.stable.outputs.digest }}';
 
@@ -112,8 +141,8 @@ jobs:
             github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Audit alert: ${count} fixable HIGH/CRITICAL CVEs in :stable (${digest.substring(0, 19)})`,
-              body: `The weekly audit found **${count}** HIGH/CRITICAL vulnerabilities **with an upstream fix available** in the current :stable image (${total} HIGH/CRITICAL in total; the remainder have no upstream patch yet and do not trigger this alert).\n\n**Digest:** \`${digest}\`\n\n**Action required:**\n- Review the vulnerabilities and determine if they affect the scanner's runtime safety\n- If critical, consider rolling :stable back to the prior known-good digest\n- Patch the base image or affected packages and release a new version\n\nTo see the full scan results, run:\n\`\`\`bash\ngrype ghcr.io/zagware/zagware-scanner@${digest}\n\`\`\`\n\nTo see only what is actionable:\n\`\`\`bash\ngrype ghcr.io/zagware/zagware-scanner@${digest} --only-fixed\n\`\`\``,
+              title: `Audit alert: ${count} actionable HIGH/CRITICAL CVEs in :stable (${digest.substring(0, 19)})`,
+              body: `The weekly audit found **${count}** HIGH/CRITICAL vulnerabilities in the current :stable image that a base re-pin or a bundled-tool version bump would clear.\n\n${total} HIGH/CRITICAL in total, ${fixable} of them fixable somewhere upstream. The gap between ${fixable} and ${count} is Go \`stdlib\` compiled into a vendor-built binary: Grype reports a fix exists because Go published one, but only that vendor's next release applies it. Those are tracked weekly in the tool-currency issue, not here.\n\n**Digest:** \`${digest}\`\n\n**Action required:**\n- Review the vulnerabilities and determine if they affect the scanner's runtime safety\n- If critical, consider rolling :stable back to the prior known-good digest\n- Re-pin the base image or bump the affected tool and release a new version\n\nTo see the full scan results, run:\n\`\`\`bash\ngrype ghcr.io/zagware/zagware-scanner@${digest}\n\`\`\`\n\nTo see only what has an upstream fix:\n\`\`\`bash\ngrype ghcr.io/zagware/zagware-scanner@${digest} --only-fixed\n\`\`\``,
               labels: ['security', 'audit-cve']
             });
 
@@ -122,13 +151,13 @@ jobs:
         run: |
           echo "## Weekly Audit Summary" >> $GITHUB_STEP_SUMMARY
           echo "**Stable digest:** \`${{ steps.stable.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**HIGH/CRITICAL CVEs:** ${{ steps.scan.outputs.high_count }} (${{ steps.scan.outputs.fixable_count }} with an upstream fix)" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.scan.outputs.fixable_count }}" = "0" ]; then
+          echo "**HIGH/CRITICAL CVEs:** ${{ steps.scan.outputs.high_count }} (${{ steps.scan.outputs.fixable_count }} fixable upstream, ${{ steps.scan.outputs.actionable_count }} actionable here)" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.scan.outputs.actionable_count }}" = "0" ]; then
             if [ "${{ steps.scan.outputs.high_count }}" = "0" ]; then
               echo "✅ No HIGH/CRITICAL vulnerabilities found" >> $GITHUB_STEP_SUMMARY
             else
-              echo "✅ Nothing actionable — all ${{ steps.scan.outputs.high_count }} HIGH/CRITICAL findings are awaiting an upstream fix" >> $GITHUB_STEP_SUMMARY
+              echo "✅ Nothing actionable — all ${{ steps.scan.outputs.high_count }} HIGH/CRITICAL findings await either an upstream patch or a vendor rebuild" >> $GITHUB_STEP_SUMMARY
             fi
           else
-            echo "⚠️ ${{ steps.scan.outputs.fixable_count }} fixable HIGH/CRITICAL vulnerabilities found — issue opened" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ ${{ steps.scan.outputs.actionable_count }} actionable HIGH/CRITICAL vulnerabilities found — issue opened" >> $GITHUB_STEP_SUMMARY
           fi

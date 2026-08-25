@@ -64,7 +64,7 @@ historical tracking, trend charts, and suppression management.
 |---|---|
 | `:<version>` | Immutable per release. Pick a tag from the [releases](https://github.com/zagware/zagware-scanner/releases) page. Pin by digest for the strongest guarantee. |
 | `:latest` | Newest release. Moves on every tag push. **Not** security-vetted. |
-| `:stable` | Promoted from `:latest` after a 7-day cooling period, a clean CVE scan, and a signature-verify check. **Not yet published** — no release has completed a full promotion cycle at time of writing. |
+| `:stable` | Promoted from `:latest` after a 7-day cooling period, a signature-verify check, and a CVE scan with **zero actionable** HIGH/CRITICAL findings. **Not yet published** — see [Promotion workflow](#promotion-workflow) for why the first cycle had not completed. |
 | `:secure` | Identical digest to `:stable`, once `:stable` exists. |
 | `:reachability` (and `:<version>-reachability`) | The same core plus the Go/Node toolchains needed for **advisory SCA reachability enrichment** (govulncheck, npm audit, osv-scanner call analysis). Larger image, larger trusted surface — opt in only if you want reachability verdicts. Equally cosign-signed + SLSA-attested. |
 
@@ -87,10 +87,45 @@ with `ZAGWARE_SCA_REACHABILITY=false`.
 1. A new version is tagged → image builds as `:<version>` and `:latest`
 2. After the cooling period, the promotion workflow verifies the image's cosign signature and
    scans it for CVEs with Grype
-3. If the signature is valid and no HIGH/CRITICAL CVEs with an available fix are found →
+3. If the signature is valid and **zero actionable** HIGH/CRITICAL CVEs are found →
    `:stable` and `:secure` are re-tagged to the same digest
-4. If fixable CVEs are found → promotion is blocked, a GitHub issue is opened, `:latest` stays
+4. If actionable CVEs are found → promotion is blocked, a GitHub issue is opened, `:latest` stays
 5. A weekly audit workflow re-scans `:stable` for post-promotion CVE disclosures
+
+**What "actionable" means, and why the gate is not simply zero.** The image bundles five
+third-party Go binaries. Most of their CRITICAL/HIGH findings are Go `stdlib` advisories baked in
+by whichever toolchain the vendor compiled with. Grype reports those as *fixed* — Go published the
+patch — but the fix is applied by the vendor rebuilding, not by anything we can pin. On
+2026-08-25 the published image carried 50 CRITICAL/HIGH, of which **32 were exactly that**.
+Upgrading every bundled tool to its newest upstream release still left 25.
+
+A gate demanding zero was therefore unsatisfiable by construction, and it had blocked every
+scheduled promotion since the workflow was written: `:stable` did not exist, so the README told
+users to pin `:latest`, which has no CVE gate at all. A gate that can only pass on a condition no
+action of ours produces is not a gate.
+
+So promotion blocks on the findings a base re-pin or a version bump would clear:
+
+| Finding | Remedy | Gate |
+|---|---|---|
+| OS package (Wolfi base) | re-pin `WOLFI_DIGEST` | **blocks** |
+| Anything in `kics` | ours — we build it from source | **blocks** |
+| Vendored *module* in a vendor binary | bump that tool's pin | **blocks** |
+| Go `stdlib` in a vendor binary | only that vendor's next release | reported |
+| No fix published anywhere | nobody can clear it | reported |
+
+Nothing is hidden by this. The full total is printed in the run summary, written into the signed
+promotion attestation (`cveScan.highOrCriticalCount`, `.fixableCount`, `.actionableCount`), and
+tracked per owning binary by the weekly
+[tool-currency workflow](.github/workflows/tool-currency.yml), which escalates when a vendor goes
+quiet while carrying them. The list of vendor-built binaries is declared in
+[`promote.yml`](.github/workflows/promote.yml) and [`audit.yml`](.github/workflows/audit.yml) and
+held identical by a test; `kics` is deliberately not on it.
+
+**The cooling period was never the blocker.** It is worth saying plainly, because it is the
+obvious suspect: on 2026-08-25 the candidate digest was 18 days old against a 7-day requirement.
+Every promotion run cleared the age gate and then failed the CVE gate. Shortening the cooling
+period would not have produced a `:stable` image; it would only have shortened the soak.
 
 **Why 7 days.** The cooling period exists so a regression can surface in real pipelines before an
 image is blessed as `:stable`. It was originally 14 days, which in practice mostly delayed *security
@@ -749,18 +784,32 @@ docker buildx imagetools inspect ghcr.io/zagware/zagware-scanner:latest \
 
 ### Keeping the tools current
 
-This image bundles four third-party scanners — KICS, Syft, Grype, and betterleaks — plus three base
-images. Every one is pinned, and a pin that nobody watches is just a slow-motion vulnerability. A
-[weekly workflow](.github/workflows/tool-currency.yml) checks all seven and maintains a single,
-continuously-updated issue. It **never edits a pin**; it reports, and a human decides.
+This image bundles five third-party scanners — KICS, Syft, Grype, betterleaks and osv-scanner —
+plus three base images. Every one is pinned, and a pin that nobody watches is just a slow-motion
+vulnerability. A [weekly workflow](.github/workflows/tool-currency.yml) checks all eight and
+maintains a single, continuously-updated issue. It **never edits a pin**; it reports, and a human
+decides.
 
-It distinguishes two situations, because they call for different responses:
+osv-scanner was missing from that list until 2026-08-25, and the cost was exactly what the
+workflow exists to prevent: the pin sat at v2.4.0 (released 2026-06-18) for 68 days, two releases
+behind, carrying 11 CRITICAL/HIGH — the worst of any bundled tool — with nothing reporting it. A
+watcher that omits a tool is worse than no watcher, because the silence reads as health.
+
+It distinguishes four situations, because they call for different responses:
 
 | Signal | Meaning | Response |
 |---|---|---|
 | **Behind** | Upstream published a newer release than we pin | Routine: bump, re-checksum, release |
 | **Escalate** | Our pinned build carries **fixable** CRITICAL/HIGH CVEs **and** upstream has gone quiet (no release in 90 days) or has stopped shipping `linux/amd64` binaries | Consider building that tool from source — see below |
-| **Unpullable pin** | A pinned base-image digest can no longer be fetched | Re-pin before the next build fails |
+| **Unpullable pin** | The registry answered, and the pinned digest is gone | Re-pin before the next build fails |
+| **Unchecked pin** | The registry lookup itself failed, so nothing is known either way | Usually a Docker Hub anonymous pull-rate limit on the runner; it clears by itself |
+
+The last two used to be one signal, and it lied. On 2026-08-24 the report declared both Docker Hub
+pins `UNPULLABLE` and told a human "the next build will fail", when an authenticated registry HEAD
+showed both digests present and serving. The runner had hit Docker Hub's anonymous pull limit —
+which is also why the Chainguard pin passed in the same run. Reporting a failed lookup as a dead
+pin is the same fabricated-answer class the CVE gates had removed; a lookup that did not happen
+now says so.
 
 ### When we build a tool from source
 
@@ -768,8 +817,10 @@ Building from source is an **escalation, not a default**, because it is a genuin
 a free win.
 
 What it buys: the Go toolchain becomes ours, so `stdlib` CVEs inherited from whatever compiler the
-vendor happened to use disappear. Measured on Grype v0.116.1 — 3 critical/high from Anchore's
-released `.deb`, 1 when we compile the identical commit with Go 1.26.5.
+vendor happened to use disappear, and they disappear *when we decide*, not when the vendor next
+cuts a release. Measured on KICS — 5 `stdlib` critical/high when compiled with Go 1.26.5, 0 with
+Go 1.26.7, one `ARG GO_VERSION` edit apart. Every other bundled binary still carries its vendor's
+toolchain, which is why the promotion gate treats those two cases differently.
 
 What it costs: Anchore and betterleaks sign their releases with keyless cosign, and
 [`publish.yml`](.github/workflows/publish.yml) verifies those signatures *before* the image is
@@ -787,36 +838,68 @@ So we require a specific justification, and only KICS currently meets it:
 | **Built from source?** | **Yes** | No |
 
 For KICS there was no signature to give up and no binary to consume, so the trade was free. For the
-others it would swap a working control for a handful of `stdlib` findings that clear on the
-vendor's next release anyway. If one of them goes quiet the way Checkmarx did, the currency
-workflow will say so, and the KICS build stage in the
-[`Dockerfile`](Dockerfile) is already the template.
+others it would swap a working control for `stdlib` findings that clear on the vendor's next
+release anyway — and the evidence says they do clear: Go 1.26.6, which fixes six of the advisories
+in question, was released 2026-08-13, three days *after* Syft v1.51.0 and Grype v0.117.0 were
+built. There is nothing wrong with those releases; they simply predate the patch. If one of these
+projects goes quiet the way Checkmarx did, the currency workflow will say so, and the KICS build
+stage in the [`Dockerfile`](Dockerfile) is already the template.
 
 ### Our vulnerability posture
 
-We publish the numbers rather than claiming zero. As of v3.1.0, `grype` against the released image
-reports **8 CRITICAL/HIGH**, down from 153 in v3.0.2:
+We publish the numbers rather than claiming zero, and we say who can act on each one.
 
-| | v3.0.2 | v3.1.0 |
+Measured 2026-08-25 with Grype's database of the same date, against the published image
+`sha256:b510b834…` and against each bundled binary individually:
+
+| | published image | after the pin bumps below |
 |---|---|---|
-| Total matches | 455 | **21** |
-| Critical | 36 | **2** |
-| High | 117 | **6** |
-| From OS packages | 105 | **0** |
+| CRITICAL/HIGH | 50 | **28** |
+| — Critical | 2 | **2** |
+| — High | 48 | **26** |
+| From OS packages | 8 | **0** |
+| With no upstream fix at all | 4 | **3** |
+| Actionable by us (what the gate enforces) | 19 | **0** |
 
-Two things make that number honest rather than cosmetic:
+The bumps: Wolfi base re-pinned, Go 1.26.5 → 1.26.7, Syft v1.50.0 → v1.51.0, Grype v0.116.1 →
+v0.117.0, betterleaks 1.7.2 → 1.8.1, osv-scanner v2.4.0 → v2.5.1. The right-hand column is
+per-binary measurement of the actual upstream release artifacts plus a re-pinned base; the built
+image's own total is re-measured by `publish.yml`'s self-scan on the next release.
 
-**We separate fixable from unfixable.** Of the 8, two are `containerd` advisories inside KICS with
-no upstream patch in existence. The promotion gate and the weekly audit both fire on **fixable**
-findings only. Gating on the raw count would have meant an identical red alert every single week
-for something nobody can action — and an alarm that is always on is an alarm nobody reads. The
-total is still reported everywhere; it is just not what blocks a release.
+Where the remaining 28 sit, and why each is where it is:
 
-**Zero of them come from the operating system.** That is the whole reason the runtime base is
-Wolfi. On `debian:bookworm-slim` the OS contributed 105 critical/high of which *not one was
-fixable* — 70 marked "won't fix" by Debian, 35 with no fix at all. No amount of patching would
-have closed a single one; only leaving the distro could. 44 came from `perl`, in the image purely
-because Debian's `git` depends on it.
+| Owner | Count | Nature |
+|---|---|---|
+| `syft` v1.51.0 | 7 | Go `stdlib` from Anchore's go1.26.3 build |
+| `grype` v0.117.0 | 8 | 7 the same `stdlib`, 1 `docker/docker` patched only in `moby/moby/v2` |
+| `osv-scanner` v2.5.1 | 6 | Go `stdlib` from Google's go1.26.5 build |
+| `betterleaks` 1.8.1 | 5 | Go `stdlib` from a go1.25.12 build |
+| `kics` | 2 | Both Critical — `containerd` advisories fixed only in the `containerd/v2` module line, which KICS does not use |
+| OS packages | 0 | — |
+
+Three things make that honest rather than cosmetic:
+
+**Fixable is not the same as ours to fix.** 25 of the 28 are Go `stdlib` inside a binary somebody
+else built and signed. Grype marks them fixed because Go shipped the patch; applying it means
+Anchore, Google or betterleaks rebuilding. We could take those to zero by compiling all four from
+source — and we deliberately do not, because it would trade four verified vendor signatures for a
+number (see [When we build a tool from source](#when-we-build-a-tool-from-source)). What we do
+instead is track them: the weekly currency workflow reports them per binary and escalates if a
+vendor goes quiet while carrying them.
+
+**The gate enforces the actionable column, and it moved from 19 to 0 by doing exactly what it
+asked for** — re-pinning a base and bumping five pins. That is the property a gate needs: passing
+it requires an action, and performing that action passes it. The previous raw-count gate required
+50 → 0, which no action available to this repository could produce, and so it had never promoted
+anything at all.
+
+**Zero come from the operating system.** That is the whole reason the runtime base is Wolfi. On
+`debian:bookworm-slim` the OS contributed 105 critical/high of which *not one was fixable* — 70
+marked "won't fix" by Debian, 35 with no fix at all. No amount of patching would have closed a
+single one; only leaving the distro could. 44 came from `perl`, in the image purely because
+Debian's `git` depends on it. The 8 OS findings in the published image (`busybox`, `openssl`) are
+not a return of that problem — they are an aged pin, and `apk`'s own updates close them, which is
+precisely the difference.
 
 To reproduce any of this yourself:
 
@@ -824,8 +907,16 @@ To reproduce any of this yourself:
 # Everything, including findings nobody can currently act on
 grype ghcr.io/zagware/zagware-scanner:latest
 
-# Only what is actionable today -- what our gates enforce
+# Only findings with a published upstream fix
 grype ghcr.io/zagware/zagware-scanner:latest --only-fixed
+
+# Attribute each finding to the binary that owns it -- this is the split
+# between "ours" and "the vendor's" that the promotion gate acts on
+grype ghcr.io/zagware/zagware-scanner:latest -o json \
+  | jq -r '.matches[]
+           | select(.vulnerability.severity | test("Critical|High"))
+           | "\((.artifact.locations[0].path // "os") | split("/") | last)\t\(.artifact.name)\t\(.vulnerability.id)"' \
+  | sort | uniq -c
 ```
 
 ---
