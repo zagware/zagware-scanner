@@ -68,11 +68,18 @@ Versions are published as container tags — see the
   protection, so a moved tag is refused rather than built. It cannot create a
   release and cannot touch `:stable` or `:secure`.
 
-  **Repo setting required:** the scheduled run uses a `refresh` environment
-  instead of `release`, so it does not need weekly manual approval. Create it
-  in Settings → Environments with **no** required reviewer. Real publishes stay
-  on the reviewed `release` environment (SUP-09), and a test fails if the
-  expression ever keys on anything but `schedule`.
+  **Environment configuration** (done, recorded here because it lives in repo
+  settings rather than in this tree): the scheduled run uses a `refresh`
+  environment instead of `release`, so it does not need weekly manual
+  approval. `refresh` has no required reviewer, no wait timer, and a
+  deployment branch policy allowing `main` only — scheduled runs can fire
+  only on the default branch anyway, so the policy costs nothing and stops a
+  pushed branch carrying an edited workflow from reaching the unreviewed
+  environment. `release` is untouched: still `required_reviewers`
+  (@zagware/maintainers, SUP-09) and deliberately still has no branch policy,
+  because it is entered from tag pushes and a branch-only policy there would
+  reject every real publish. A test fails if the environment expression ever
+  keys on anything but `schedule`.
 
 ### Fixed
 
