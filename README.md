@@ -110,7 +110,8 @@ So promotion blocks on the findings a base re-pin or a version bump would clear:
 |---|---|---|
 | OS package (Wolfi base) | re-pin `WOLFI_DIGEST` | **blocks** |
 | Anything in `kics` | ours — we build it from source | **blocks** |
-| Vendored *module* in a vendor binary | bump that tool's pin | **blocks** |
+| Vendored *module* in a vendor binary, **newer release exists** | bump that tool's pin | **blocks** |
+| Vendored *module* in a vendor binary, **already on latest** | no released fix yet | reported |
 | Go `stdlib` in a vendor binary | only that vendor's next release | reported |
 | No fix published anywhere | nobody can clear it | reported |
 
@@ -122,19 +123,43 @@ quiet while carrying them. The list of vendor-built binaries is declared in
 [`promote.yml`](.github/workflows/promote.yml) and [`audit.yml`](.github/workflows/audit.yml) and
 held identical by a test; `kics` is deliberately not on it.
 
-**The cooling period was never the blocker.** It is worth saying plainly, because it is the
-obvious suspect: on 2026-08-25 the candidate digest was 18 days old against a 7-day requirement.
-Every promotion run cleared the age gate and then failed the CVE gate. Shortening the cooling
-period would not have produced a `:stable` image; it would only have shortened the soak.
+**Why the clock runs on the release, not the image.** The two halves of the gate used to fight
+each other. The remedy for a blocking CVE is a rebuild; a rebuild mints a new digest; and the
+cooling period was measured from the digest's creation — so fixing a CVE reset the soak to zero
+and started a fresh 7-day wait, during which the next advisory could land and reset it again.
 
-**Why 7 days.** The cooling period exists so a regression can surface in real pipelines before an
-image is blessed as `:stable`. It was originally 14 days, which in practice mostly delayed *security
-fixes* reaching the channel recommended for production — the opposite of the intent. Every
-regression we have actually shipped surfaced within hours to a day or two, not weeks. The value is
-set once as `COOLING_DAYS` in
-[`promote.yml`](.github/workflows/promote.yml); it used to be the literal `14` repeated in six
-places, including operator-facing error messages, which is how a gate and its own error text drift
-apart.
+That is not a hypothetical race. Findings that block this gate arrived on **8 distinct days in
+the 83** from 2026-05-22, i.e. $\lambda \approx 0.096\,\text{day}^{-1}$, so a clean 7-day window
+had probability $e^{-0.67} \approx 0.51$ — a coin flip per attempt, with every loss restarting the
+clock and no guarantee of ever converging.
+
+So the soak now runs on the **release**. The cooling period exists to catch functional
+regressions, and those live in the commit: our code and our tool pins. An OS package refresh
+changes neither. `promote.yml` reads `org.opencontainers.image.version` off the candidate digest
+— a label baked in at build time, so it cannot be re-pointed afterwards — and measures the age of
+*that release*. A weekly job in [`publish.yml`](.github/workflows/publish.yml) rebuilds the
+current release on whatever the base serves today and republishes it as `:latest` plus an
+immutable `:<version>-<date>`. Because the release has already soaked, the refreshed digest is
+promotable the moment it lands, and OS CVEs close within a week without ever restarting the wait.
+
+The honest cost: `:stable` can point at a digest that was never itself `:latest` in anyone's
+pipeline. The delta from the soaked digest is Wolfi package versions only — same commit, same tool
+pins, same scanner code — and CI's full smoke test runs against the rebuild before it is
+published. A genuinely new release still soaks the full 7 days, which is the case the gate is for.
+
+`:<version>` is never republished. It is documented as immutable per release and people pin it, so
+a refresh takes a dated tag of its own instead of moving it.
+
+**The cooling period was never the original blocker.** Worth saying plainly, because it is the
+obvious suspect: on 2026-08-25 the candidate digest was 18 days old against a 7-day requirement.
+Every promotion run cleared the age gate and then failed the CVE gate.
+
+**Why 7 days.** It was originally 14, which in practice mostly delayed *security fixes* reaching
+the channel recommended for production — the opposite of the intent. Every regression we have
+actually shipped surfaced within hours to a day or two, not weeks. The value is set once as
+`COOLING_DAYS` in [`promote.yml`](.github/workflows/promote.yml); it used to be the literal `14`
+repeated in six places, including operator-facing error messages, which is how a gate and its own
+error text drift apart.
 
 ---
 
@@ -838,12 +863,24 @@ So we require a specific justification, and only KICS currently meets it:
 | **Built from source?** | **Yes** | No |
 
 For KICS there was no signature to give up and no binary to consume, so the trade was free. For the
-others it would swap a working control for `stdlib` findings that clear on the vendor's next
-release anyway — and the evidence says they do clear: Go 1.26.6, which fixes six of the advisories
-in question, was released 2026-08-13, three days *after* Syft v1.51.0 and Grype v0.117.0 were
-built. There is nothing wrong with those releases; they simply predate the patch. If one of these
-projects goes quiet the way Checkmarx did, the currency workflow will say so, and the KICS build
-stage in the [`Dockerfile`](Dockerfile) is already the template.
+others it would swap a working control for `stdlib` findings we cannot apply the fix to ourselves
+anyway.
+
+**How long that wait actually is, measured rather than assumed.** Go 1.26.6 closed six of the
+advisories in question on 2026-08-13. Syft v1.51.0 and Grype v0.117.0 were built three days
+earlier, so they could not have carried it. But Syft **v1.51.1**, released 2026-08-27 — fourteen
+days *after* the patch — is still built with `go1.26.3` and still carries all seven. Anchore pins
+its build toolchain and had not moved it. An earlier draft of this section said these findings
+"clear on the vendor's next release anyway"; that was optimistic and the next release disproved
+it.
+
+This does not change the decision, and it is worth being precise about why. Source-building would
+trade four verified vendor cosign signatures for a count of findings in binaries that run over
+untrusted input either way. What it changes is the expectation: these numbers will sit for
+*months*, not weeks. That is exactly why they must not gate a release — and why the currency
+workflow reports them every week instead, so a wait that becomes a genuine stall is visible rather
+than assumed away. If one of these projects goes quiet the way Checkmarx did, that report is what
+says so, and the KICS build stage in the [`Dockerfile`](Dockerfile) is already the template.
 
 ### Our vulnerability posture
 

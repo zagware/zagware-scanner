@@ -29,6 +29,47 @@ jobs:
       - name: Install Grype
         uses: ./.github/actions/install-grype
 
+      # Same remedy probe promote.yml runs, and for the same reason: a
+      # vendored-module CVE in a vendor binary is only actionable if a newer
+      # release of that tool exists to bump to. Alerting weekly on one that has
+      # no released fix would be an alarm nobody can close -- GO-2026-5970 in
+      # betterleaks had no such release for 35 days.
+      - name: Read pinned versions from Dockerfile
+        run: sed -n 's/^ARG //p' Dockerfile >> "$GITHUB_ENV"
+
+      - name: Check whether a newer release exists for each bundled tool
+        id: newer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TOOLS="syft|anchore/syft|${SYFT_VERSION}
+          grype|anchore/grype|${GRYPE_VERSION}
+          betterleaks|betterleaks/betterleaks|v${BETTERLEAKS_VERSION}
+          osv-scanner|google/osv-scanner|${OSV_SCANNER_VERSION}"
+
+          echo '{}' > /tmp/newer.json
+          while IFS='|' read -r binary repo pinned; do
+            [ -n "$binary" ] || continue
+            binary=$(printf '%s' "$binary" | tr -d '[:space:]')
+            pinned=$(printf '%s' "$pinned" | tr -d '[:space:]')
+
+            LATEST=$(gh api "repos/${repo}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+            if [ -z "$LATEST" ]; then
+              echo "::error::Could not resolve the latest release of ${repo}; the audit cannot say whether its findings are actionable, so it fails rather than guessing."
+              exit 1
+            fi
+
+            if [ "$pinned" = "$LATEST" ]; then HAS_NEWER=false; else HAS_NEWER=true; fi
+            echo "  ${binary}: pinned=${pinned} latest=${LATEST} newer=${HAS_NEWER}"
+
+            jq -c --arg b "$binary" --argjson n "$HAS_NEWER" '. + {($b): $n}' \
+              /tmp/newer.json > /tmp/newer.next && mv /tmp/newer.next /tmp/newer.json
+          done <<< "$TOOLS"
+
+          echo "value=$(cat /tmp/newer.json)" >> "$GITHUB_OUTPUT"
+
       - name: Resolve :stable digest
         id: stable
         run: |
@@ -39,9 +80,14 @@ jobs:
           # which is the ordinary pre-first-promotion state. A missing tag is a
           # skip, not an error; a genuine scan failure is still caught further
           # down, where it is a real finding rather than a bootstrap condition.
+          #
+          # `{{json .Manifest}}` + jq rather than `{{.Manifest.Digest}}`: a
+          # buildx that does not know that field prints the entire inspect
+          # block instead of failing, which would sail past the `-z` check
+          # below as a "digest". See the same note in promote.yml.
           DIGEST=$(docker buildx imagetools inspect \
             ghcr.io/zagware/zagware-scanner:stable \
-            --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+            --format '{{json .Manifest}}' 2>/dev/null | jq -r '.digest // empty' || true)
 
           if [ -z "$DIGEST" ]; then
             echo "No :stable tag found — nothing to audit"
@@ -55,6 +101,11 @@ jobs:
       - name: Scan with Grype
         if: steps.stable.outputs.skip != 'true'
         id: scan
+        env:
+          # Env var, not a ${{ }} interpolation into the script text, so the
+          # run block stays extractable and executable verbatim by
+          # tests/test_workflow_grype_gating.py.
+          HAS_NEWER: ${{ steps.newer.outputs.value }}
         run: |
           IMAGE_REF="ghcr.io/zagware/zagware-scanner@${{ steps.stable.outputs.digest }}"
 
@@ -72,9 +123,9 @@ jobs:
 
           # Three numbers, because they answer three different questions.
           #
-          #   total     — what the image carries. Always reported, never hidden.
-          #   fixable   — a patched version exists SOMEWHERE upstream.
-          #   actionable— a patched version exists in something WE pin.
+          #   total      — what the image carries. Always reported, never hidden.
+          #   fixable    — a patched version exists SOMEWHERE upstream.
+          #   actionable — a patched version exists in something WE pin.
           #
           # The alert fires on `actionable`, not `fixable`, for the same reason
           # promote.yml's gate does: 32 of the 50 critical/high in the
@@ -88,22 +139,36 @@ jobs:
           # live: it reports them per binary and escalates when the vendor
           # goes quiet.
           #
+          # A vendored MODULE in a vendor binary counts as actionable only when
+          # a newer release of that tool exists to bump to; on the newest
+          # release there is nothing to bump and the finding is somebody else's
+          # to ship.
+          #
           # VENDOR_BINARIES is duplicated in promote.yml and pinned equal by
           # tests/test_workflow_grype_gating.py.
           VENDOR_BINARIES='["syft","grype","betterleaks","osv-scanner"]'
 
+          NEWER_JSON="${HAS_NEWER:-}"
+          [ -n "$NEWER_JSON" ] || NEWER_JSON='{}'
+
           # $owner is bound before the lookup: `index(.owner)` would read `.`
           # as the piped-in $vendors array and jq would abort the step.
-          COUNTS=$(echo "$SCAN_JSON" | jq -c --argjson vendors "$VENDOR_BINARIES" '
+          COUNTS=$(echo "$SCAN_JSON" \
+            | jq -c --argjson vendors "$VENDOR_BINARIES" \
+                   --argjson newer "$NEWER_JSON" '
             [ .matches[]
               | select(.vulnerability.severity | ascii_downcase | test("high|critical"))
-              | ((.artifact.locations[0].path // "") | split("/") | last) as $owner
+              | (((.artifact.locations[0].path // "") | split("/") | last) // "") as $owner
               | { fixable: ((.vulnerability.fix.state // "") == "fixed"),
                   stdlib:  ((.artifact.name // "") == "stdlib"),
-                  vendor:  (($vendors | index($owner)) != null) } ]
+                  vendor:  (($vendors | index($owner)) != null),
+                  bumpable: (($newer[$owner]) == true) } ]
             | { total:      length,
                 fixable:    (map(select(.fixable)) | length),
-                actionable: (map(select(.fixable and ((.stdlib and .vendor) | not))) | length) }')
+                actionable: (map(select(.fixable
+                                        and ((.vendor | not)
+                                             or ((.stdlib | not) and .bumpable))))
+                             | length) }')
 
           HIGH_COUNT=$(echo "$COUNTS" | jq -r '.total')
           FIXABLE_COUNT=$(echo "$COUNTS" | jq -r '.fixable')

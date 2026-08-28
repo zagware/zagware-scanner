@@ -10,6 +10,93 @@ Versions are published as container tags — see the
 
 ## [Unreleased]
 
+### Changed
+
+- **The promotion cooling period now runs on the release, not the candidate
+  digest.** The two halves of the gate were fighting each other: the remedy for
+  a blocking CVE is a rebuild, a rebuild mints a new digest, and the clock was
+  measured from that digest's creation — so fixing a CVE reset the soak to zero
+  and began a fresh 7-day wait, during which the next advisory could land and
+  reset it again.
+
+  Measured, not assumed: findings that block this gate arrived on **8 distinct
+  days in the 83** from 2026-05-22 (λ ≈ 0.096/day), so a clean 7-day window had
+  probability e^-0.67 ≈ **0.51**. A coin flip per attempt, every loss
+  restarting the clock, and no guarantee of ever converging.
+
+  `promote.yml` now reads `org.opencontainers.image.version` off the candidate
+  digest — a label baked in at build time, so it cannot be re-pointed
+  afterwards — and measures the age of that GitHub Release. This keeps SUP-18's
+  invariant that the age must belong to the image being promoted: the binding
+  runs from the candidate outward, never from a tag inward.
+
+  The trade, recorded so it is a decision: `:stable` can point at a digest that
+  was never itself `:latest` in anyone's pipeline. The delta is Wolfi package
+  versions only — same commit, same tool pins, same scanner code — and CI's
+  smoke test runs against the rebuild. A genuinely new release still soaks the
+  full 7 days. `COOLING_DAYS` stays 7.
+
+- **A vendored module in a vendor binary only blocks promotion when a newer
+  release of that tool exists.** Both gates now probe upstream before deciding
+  a finding is ours to fix. Without it the gate blocked on findings with no
+  remedy in existence — the same unsatisfiable-gate bug one level in.
+
+  GO-2026-5970 (`golang.org/x/text`) published 2026-07-14; no betterleaks
+  release carried the fixed x/text until 1.8.1 on 2026-08-18, through 1.7.3,
+  1.7.4 and 1.8.0. The previous rule would have held `:stable` shut for **35
+  days** over something this repository could do nothing about.
+
+  Go `stdlib` in a vendor binary stays exempt even when a newer release exists,
+  because a newer release does not imply a newer toolchain — see the correction
+  below.
+
+### Added
+
+- **Weekly base refresh** (`publish.yml`, Sundays 05:00 UTC). Rebuilds the
+  current release, unchanged, on whatever the pinned base and apk repositories
+  serve that day, and republishes it as `:latest` plus an immutable
+  `:<version>-<date>`. Because the release has already soaked, the refreshed
+  digest is promotable immediately, so OS CVEs close within a week without ever
+  restarting the cooling clock.
+
+  `:<version>` is never republished — it is documented as immutable per release
+  and consumers pin it.
+
+  Constrained rather than trusted, because this path has no human reviewer: it
+  rebuilds only the newest release, only from a `vX.Y.Z` tag, and only if that
+  tag's commit is an ancestor of `origin/main` — tags are outside branch
+  protection, so a moved tag is refused rather than built. It cannot create a
+  release and cannot touch `:stable` or `:secure`.
+
+  **Repo setting required:** the scheduled run uses a `refresh` environment
+  instead of `release`, so it does not need weekly manual approval. Create it
+  in Settings → Environments with **no** required reviewer. Real publishes stay
+  on the reviewed `release` environment (SUP-09), and a test fails if the
+  expression ever keys on anything but `schedule`.
+
+### Fixed
+
+- **`{{.Manifest.Digest}}` could silently yield a non-digest.** A buildx that
+  does not know that field ignores the template and prints the whole
+  human-readable inspect block instead of failing, so the digest variable
+  became a multi-line blob that sailed past the `-z` guard and flowed onward as
+  if it were a digest. Observed on buildx v0.22.0 while running the shipped
+  step against the live registry; the runner's newer buildx accepts the field,
+  which is what made it a trap rather than a visible failure. Both workflows
+  now use `{{json .Manifest}}` piped through `jq`, and promote.yml rejects
+  anything that is not `sha256:<64 hex>`.
+
+### Corrected
+
+- **v3.3.0 claimed the vendor `stdlib` findings would "clear on the vendor's
+  next release anyway".** They did not. Syft **v1.51.1** shipped 2026-08-27,
+  fourteen days after Go 1.26.6 closed six of those advisories, still built
+  with `go1.26.3` and still carrying all seven — Anchore pins its build
+  toolchain. The decision not to source-build is unchanged, but the expectation
+  is: these will sit for months, not weeks. That is precisely why they must not
+  gate a release, and why the currency workflow reports them weekly so a wait
+  that becomes a stall is visible rather than assumed away.
+
 ## [3.3.0] — 2026-08-25
 
 Tool currency and a promotion gate that can actually pass. Image critical/high

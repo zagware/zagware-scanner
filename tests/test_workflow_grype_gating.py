@@ -62,10 +62,15 @@ def _write_fake_grype(bin_dir: Path, script_body: str) -> None:
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _run_bash_step(script: str, tmp_path: Path, fake_grype_body: str) -> subprocess.CompletedProcess:
+def _run_bash_step(script: str, tmp_path: Path, fake_grype_body: str,
+                   env_overrides: dict | None = None) -> subprocess.CompletedProcess:
     """Execute `script` the way GitHub Actions executes a run: step with the
     default shell (bash -eo pipefail {0}) on a Linux runner, with a fake
-    `grype` shadowing the real one on PATH."""
+    `grype` shadowing the real one on PATH.
+
+    `env_overrides` stands in for the step's own `env:` block, which the
+    extracted run text does not carry -- HAS_NEWER reaches the gate that way
+    precisely so the script stays free of ${{ }} and remains executable here."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     _write_fake_grype(bin_dir, fake_grype_body)
@@ -79,6 +84,7 @@ def _run_bash_step(script: str, tmp_path: Path, fake_grype_body: str) -> subproc
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["GITHUB_OUTPUT"] = str(gh_output)
     env["GITHUB_STEP_SUMMARY"] = str(gh_summary)
+    env.update(env_overrides or {})
 
     resolved = _resolve_gh_expressions(script)
     proc = subprocess.run(
@@ -88,6 +94,11 @@ def _run_bash_step(script: str, tmp_path: Path, fake_grype_body: str) -> subproc
     proc.gh_output = gh_output.read_text()
     proc.gh_summary = gh_summary.read_text()
     return proc
+
+
+# What the "Check whether a newer release exists" step hands the gate.
+ALL_ON_LATEST = '{"syft":false,"grype":false,"betterleaks":false,"osv-scanner":false}'
+SYFT_BEHIND = '{"syft":true,"grype":false,"betterleaks":false,"osv-scanner":false}'
 
 
 def _parse_output(text: str) -> dict:
@@ -261,16 +272,66 @@ class TestPromoteYmlScanStep:
         assert out["blocking_count"] == "0"
         assert out["scan_failed"] == "false"
 
-    def test_vendor_module_cve_still_blocks_promotion(self, tmp_path):
-        """Not stdlib: a newer release of that same vendor tool clears it, so
-        bumping the pin is a real remedy and the gate must demand it. Without
-        this, 'vendor binary' would become a blanket exemption."""
+    def test_vendor_module_blocks_when_a_newer_release_exists(self, tmp_path):
+        """Not stdlib, and Syft has shipped a newer version: bumping the pin is
+        a real remedy, so the gate must demand it. Without this, 'vendor binary'
+        would become a blanket exemption. This is the go-git case that Syft
+        v1.51.0 actually cleared."""
         script = _extract_run_block(".github/workflows/promote.yml", self.STEP)
-        proc = _run_bash_step(script, tmp_path, VENDOR_MODULE_GRYPE)
+        proc = _run_bash_step(script, tmp_path, VENDOR_MODULE_GRYPE,
+                              {"HAS_NEWER": SYFT_BEHIND})
         assert proc.returncode == 0, proc.stderr
         out = _parse_output(proc.gh_output)
         assert out["blocking_count"] == "1"
         assert out["scan_failed"] == "true"
+
+    def test_vendor_module_does_not_block_when_already_on_latest(self, tmp_path):
+        """The 35-day case. GO-2026-5970 (x/text) published 2026-07-14 and no
+        betterleaks release carried the fix until 1.8.1 on 2026-08-18. While we
+        are on the newest release there is no pin to bump, so demanding one is
+        the same unsatisfiable gate that kept :stable from ever existing."""
+        script = _extract_run_block(".github/workflows/promote.yml", self.STEP)
+        proc = _run_bash_step(script, tmp_path, VENDOR_MODULE_GRYPE,
+                              {"HAS_NEWER": ALL_ON_LATEST})
+        assert proc.returncode == 0, proc.stderr
+        out = _parse_output(proc.gh_output)
+        assert out["high_count"] == "1"
+        assert out["fixable_count"] == "1", "still reported as fixable upstream"
+        assert out["blocking_count"] == "0"
+        assert out["scan_failed"] == "false"
+
+    def test_our_own_findings_block_regardless_of_upstream_releases(self, tmp_path):
+        """The remedy probe must not leak into the classes we control. OS
+        packages and kics are ours whatever Anchore has or has not shipped."""
+        script = _extract_run_block(".github/workflows/promote.yml", self.STEP)
+        proc = _run_bash_step(script, tmp_path, ACTIONABLE_GRYPE,
+                              {"HAS_NEWER": ALL_ON_LATEST})
+        assert proc.returncode == 0, proc.stderr
+        out = _parse_output(proc.gh_output)
+        assert out["blocking_count"] == "2"
+        assert out["scan_failed"] == "true"
+
+    def test_vendor_stdlib_never_blocks_even_when_behind(self, tmp_path):
+        """Syft v1.51.1 shipped 2026-08-27, fourteen days after Go 1.26.6, and
+        is still built with go1.26.3 carrying all seven stdlib advisories. A
+        newer release existing does not mean a newer toolchain, so stdlib stays
+        exempt or the gate closes on a bump that would not help."""
+        script = _extract_run_block(".github/workflows/promote.yml", self.STEP)
+        proc = _run_bash_step(script, tmp_path, VENDOR_STDLIB_GRYPE,
+                              {"HAS_NEWER": SYFT_BEHIND})
+        assert proc.returncode == 0, proc.stderr
+        out = _parse_output(proc.gh_output)
+        assert out["blocking_count"] == "0"
+        assert out["scan_failed"] == "false"
+
+    def test_missing_probe_output_withholds_the_vendor_module_block(self, tmp_path):
+        """No HAS_NEWER at all means no evidence a remedy exists. Withhold the
+        block rather than invent one -- inventing is the fabricated-answer class
+        SUP-01 removed from these gates."""
+        script = _extract_run_block(".github/workflows/promote.yml", self.STEP)
+        proc = _run_bash_step(script, tmp_path, VENDOR_MODULE_GRYPE)
+        assert proc.returncode == 0, proc.stderr
+        assert _parse_output(proc.gh_output)["blocking_count"] == "0"
 
     def test_missing_grype_binary_fails_the_step_instead_of_reporting_999(self, tmp_path):
         """Anchor regression for SUP-03: the old code's `|| echo "999"`

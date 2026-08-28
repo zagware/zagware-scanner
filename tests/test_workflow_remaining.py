@@ -133,30 +133,52 @@ GNU_DATE_SHIM = textwrap.dedent("""\
 
 FAKE_DOCKER = textwrap.dedent("""\
     #!/bin/sh
-    for a in "$@"; do
-      case "$a" in
-        *:latest)
-          [ -n "$FAKE_LATEST_DIGEST" ] || exit 1
-          printf '%s\\n' "$FAKE_LATEST_DIGEST"
-          exit 0
-          ;;
-        *:stable)
-          [ -n "$FAKE_STABLE_DIGEST" ] || exit 1
-          printf '%s\\n' "$FAKE_STABLE_DIGEST"
-          exit 0
-          ;;
+    # Stands in for `docker buildx imagetools inspect <ref> --format <fmt>`,
+    # which promote.yml calls twice: once to resolve a tag to a digest, and
+    # once to read the version label back off that digest.
+    REF=""
+    FMT=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --format) FMT="$2"; shift 2 ;;
+        ghcr.io/*) REF="$1"; shift ;;
+        *) shift ;;
       esac
     done
+
+    case "$FMT" in
+      *Labels*)
+        [ -n "$FAKE_VERSION_LABEL" ] || exit 1
+        printf '%s\\n' "$FAKE_VERSION_LABEL"
+        exit 0
+        ;;
+    esac
+
+    # The real call asks for `{{json .Manifest}}` and pipes it through jq, so
+    # the stub has to answer in that shape -- a stub that returned a bare
+    # digest would pass while the shipped command no longer does.
+    case "$REF" in
+      *:latest)
+        [ -n "$FAKE_LATEST_DIGEST" ] || exit 1
+        printf '{"digest":"%s"}\\n' "$FAKE_LATEST_DIGEST"
+        exit 0
+        ;;
+      *:stable)
+        [ -n "$FAKE_STABLE_DIGEST" ] || exit 1
+        printf '{"digest":"%s"}\\n' "$FAKE_STABLE_DIGEST"
+        exit 0
+        ;;
+    esac
     exit 1
 """)
 
-FAKE_CURL_VERSIONS = textwrap.dedent("""\
+FAKE_GH_RELEASE = textwrap.dedent("""\
     #!/bin/sh
-    if [ -n "$FAKE_CURL_FAIL" ]; then
-      echo "curl: (22) HTTP error" >&2
-      exit 22
+    if [ -n "$FAKE_GH_FAIL" ]; then
+      echo "gh: release not found (HTTP 404)" >&2
+      exit 1
     fi
-    cat "$FAKE_VERSIONS_JSON"
+    printf '%s\\n' "$FAKE_RELEASE_DATE"
 """)
 
 FAKE_CURL_KICS = textwrap.dedent("""\
@@ -230,15 +252,29 @@ def _versions_fixture(entries: list[dict]) -> str:
     ])
 
 
-# ── SUP-18: cooling period must be measured against the resolved digest ──────
+# ── The cooling clock runs on the RELEASE, bound to the candidate digest ─────
+#
+# SUP-18's defect was measuring the age of a different image than the one being
+# promoted: the filter selected on whatever the API reported as tagged `latest`.
+# The fix then measured the candidate digest's own creation date -- correct, but
+# it made the gate unsatisfiable, because the remedy for a blocking CVE is a
+# rebuild and a rebuild mints a new digest, resetting the soak to zero.
+#
+# The clock now runs on the release the candidate was built FROM, read out of
+# the digest's own org.opencontainers.image.version label. That keeps SUP-18's
+# invariant -- the binding runs from the candidate outward, never from a tag
+# inward -- while letting a weekly rebuild of an already-soaked release be
+# promotable the moment it lands.
 
-RESOLVE_STEP = "Resolve latest tag digest and age"
+RESOLVE_STEP = "Resolve promotion candidate and release age"
 
 
-def _run_resolve(tmp_path: Path, versions: str, *,
+def _run_resolve(tmp_path: Path, *,
                  latest_digest: str = LATEST_DIGEST,
                  stable_digest: str = STABLE_DIGEST,
-                 curl_fails: bool = False) -> subprocess.CompletedProcess:
+                 version_label: str = "2.9.0",
+                 release_date: str | None = None,
+                 gh_fails: bool = False) -> subprocess.CompletedProcess:
     script = _run_block(".github/workflows/promote.yml", RESOLVE_STEP)
     assert "${{" not in script, "this step must not interpolate GH expressions into bash"
 
@@ -253,56 +289,72 @@ def _run_resolve(tmp_path: Path, versions: str, *,
     workflow_env = {k: str(v) for k, v in (workflow.get("env") or {}).items()}
     assert "COOLING_DAYS" in workflow_env, "promote.yml no longer defines COOLING_DAYS"
 
-    fixture = tmp_path / "versions.json"
-    fixture.write_text(versions)
-
     return _bash(
         script, tmp_path,
         env_overrides={
             **workflow_env,
             "GH_TOKEN": "test-token",
+            "GITHUB_REPOSITORY": "zagware/zagware-scanner",
             "FAKE_LATEST_DIGEST": latest_digest,
             "FAKE_STABLE_DIGEST": stable_digest,
-            "FAKE_VERSIONS_JSON": str(fixture),
-            "FAKE_CURL_FAIL": "1" if curl_fails else "",
+            "FAKE_VERSION_LABEL": version_label,
+            "FAKE_RELEASE_DATE": (
+                _iso_days_ago(40.04) if release_date is None else release_date
+            ),
+            "FAKE_GH_FAIL": "1" if gh_fails else "",
         },
-        fakes={"docker": FAKE_DOCKER, "curl": FAKE_CURL_VERSIONS, "date": GNU_DATE_SHIM},
+        fakes={"docker": FAKE_DOCKER, "gh": FAKE_GH_RELEASE, "date": GNU_DATE_SHIM},
     )
 
 
 @pytest.mark.integration
-class TestCoolingPeriodUsesTheResolvedDigest:
-    """Anchor regression: the age must come from the version whose digest is
-    the one resolved from the registry, never from whichever version the API
-    reports as tagged :latest."""
-
-    def test_promotes_when_the_resolved_digest_is_old_even_if_the_tagged_one_is_new(self, tmp_path):
-        # Registry says :latest -> LATEST_DIGEST (40 days old). The API's
-        # `latest`-tagged entry is a *different*, 1-day-old version. Pre-fix
-        # the filter picked the tagged entry and refused to promote.
-        versions = _versions_fixture([
-            {"digest": OTHER_DIGEST, "created_at": _iso_days_ago(1), "tags": ["latest"]},
-            {"digest": LATEST_DIGEST, "created_at": _iso_days_ago(40.04), "tags": ["2.9.0"]},
-        ])
-        proc = _run_resolve(tmp_path, versions)
+class TestCoolingPeriodRunsOnTheRelease:
+    def test_old_release_is_promotable(self, tmp_path):
+        proc = _run_resolve(tmp_path)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         out = _parse_output(proc.gh_output)
         assert out["skip"] == "false"
         assert out["age_days"] == "40"
         assert out["digest"] == LATEST_DIGEST
+        assert out["version"] == "2.9.0"
 
-    def test_refuses_when_the_resolved_digest_is_new_even_if_the_tagged_one_is_old(self, tmp_path):
-        # The dangerous direction: pre-fix this promoted a 1-day-old image
-        # because some *other* version had carried :latest for 40 days.
-        versions = _versions_fixture([
-            {"digest": OTHER_DIGEST, "created_at": _iso_days_ago(40.04), "tags": ["latest"]},
-            {"digest": LATEST_DIGEST, "created_at": _iso_days_ago(1), "tags": ["2.9.0"]},
-        ])
-        proc = _run_resolve(tmp_path, versions)
+    def test_young_release_is_refused(self, tmp_path):
+        proc = _run_resolve(tmp_path, release_date=_iso_days_ago(1))
         assert proc.returncode == 0, proc.stdout + proc.stderr
         out = _parse_output(proc.gh_output)
         assert out["skip"] == "true"
         assert "age_days" not in out
+
+    def test_a_rebuild_of_a_soaked_release_is_promotable_immediately(self, tmp_path):
+        """The point of the whole change. A fresh digest -- one that has never
+        been :latest for a single day -- is promotable when the release it was
+        built from has already soaked. Under a digest clock this was the case
+        that reset the wait every time an OS CVE was fixed, which is why no
+        promotion had ever completed."""
+        proc = _run_resolve(tmp_path, latest_digest=OTHER_DIGEST)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        out = _parse_output(proc.gh_output)
+        assert out["skip"] == "false"
+        assert out["digest"] == OTHER_DIGEST
+        assert out["age_days"] == "40"
+
+    def test_age_comes_from_the_candidates_own_label_not_a_tag_lookup(self, tmp_path):
+        """SUP-18's invariant, preserved. The version is read off the digest
+        being promoted, so it cannot be a different image's -- the binding runs
+        from the candidate outward, never from a tag inward."""
+        script = _run_block(".github/workflows/promote.yml", RESOLVE_STEP)
+        code = "\n".join(ln for ln in script.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        assert "org.opencontainers.image.version" in code
+        assert '@${LATEST_DIGEST}' in code, (
+            "the version must be read from the resolved digest, not from a tag"
+        )
+        # The only tag this step may resolve is the candidate pointer itself
+        # and the outgoing :stable -- never a version tag it then trusts.
+        assert ":latest" in code and ":stable" in code
+        assert 'v${VERSION}"' not in code.replace(
+            'releases/tags/v${VERSION}', ''
+        ), "the release lookup is the only permitted use of the version string"
 
 
 @pytest.mark.integration
@@ -310,63 +362,39 @@ class TestCoolingPeriodFailsClosed:
     """Every state in which the age cannot be established must abort the run,
     not skip quietly and not compute an age for the wrong image."""
 
-    def test_two_versions_with_the_same_digest_fail_closed(self, tmp_path):
-        versions = _versions_fixture([
-            {"digest": LATEST_DIGEST, "created_at": _iso_days_ago(40.04), "tags": ["latest"]},
-            {"digest": LATEST_DIGEST, "created_at": _iso_days_ago(1), "tags": ["latest"]},
-        ])
-        proc = _run_resolve(tmp_path, versions)
+    def test_missing_version_label_fails_closed(self, tmp_path):
+        proc = _run_resolve(tmp_path, version_label="")
         assert proc.returncode != 0
         assert "skip=true" not in proc.gh_output
         assert "age_days" not in proc.gh_output
-        assert "found 2" in (proc.stdout + proc.stderr)
 
-    def test_no_version_matching_the_resolved_digest_fails_closed(self, tmp_path):
-        versions = _versions_fixture([
-            {"digest": OTHER_DIGEST, "created_at": _iso_days_ago(40.04), "tags": ["latest"]},
-        ])
-        proc = _run_resolve(tmp_path, versions)
+    @pytest.mark.parametrize("bad_label", ["latest", "v2.9.0", "2.9", "main"])
+    def test_malformed_version_label_fails_closed(self, bad_label, tmp_path):
+        proc = _run_resolve(tmp_path, version_label=bad_label)
+        assert proc.returncode != 0
+        assert "age_days" not in proc.gh_output
+
+    def test_missing_release_fails_closed(self, tmp_path):
+        """An image whose label names a release that does not exist is itself
+        the anomaly worth stopping on."""
+        proc = _run_resolve(tmp_path, gh_fails=True)
         assert proc.returncode != 0
         assert "skip=true" not in proc.gh_output
-        assert "found 0" in (proc.stdout + proc.stderr)
+        assert "age_days" not in proc.gh_output
 
-    def test_api_failure_fails_closed(self, tmp_path):
-        versions = _versions_fixture([
-            {"digest": LATEST_DIGEST, "created_at": _iso_days_ago(40.04), "tags": ["latest"]},
-        ])
-        proc = _run_resolve(tmp_path, versions, curl_fails=True)
+    def test_empty_release_date_fails_closed(self, tmp_path):
+        proc = _run_resolve(tmp_path, release_date="")
         assert proc.returncode != 0
-        assert "skip=true" not in proc.gh_output
+        assert "age_days" not in proc.gh_output
 
-    def test_non_array_api_response_fails_closed(self, tmp_path):
-        proc = _run_resolve(tmp_path, '{"message": "Bad credentials"}')
-        assert proc.returncode != 0
-        assert "skip=true" not in proc.gh_output
-
-    def test_unparseable_created_at_fails_closed(self, tmp_path):
-        versions = _versions_fixture([
-            {"digest": LATEST_DIGEST, "created_at": "not-a-date", "tags": ["latest"]},
-        ])
-        proc = _run_resolve(tmp_path, versions)
+    def test_unparseable_release_date_fails_closed(self, tmp_path):
+        proc = _run_resolve(tmp_path, release_date="not-a-date")
         assert proc.returncode != 0
         assert "skip=true" not in proc.gh_output
         assert "age_days" not in proc.gh_output
 
 
-class TestCoolingPeriodFilterShape:
-    def test_jq_filter_actually_references_the_digest_argument(self):
-        script = _run_block(".github/workflows/promote.yml", RESOLVE_STEP)
-        assert "--arg digest" in script
-        # The defect was a declared-but-unused --arg; the filter must consume it.
-        filter_lines = [ln for ln in script.splitlines() if "select(" in ln]
-        assert filter_lines, "no jq select() filter found in the step"
-        assert any("$digest" in ln for ln in filter_lines), (
-            "the jq filter must select on the resolved digest, not on a tag"
-        )
-        assert not any('index("latest")' in ln for ln in filter_lines), (
-            "selecting on the :latest tag is exactly the SUP-18 defect"
-        )
-
+class TestCoolingPeriodStepShape:
     def test_unreachable_bsd_date_fallback_is_gone(self):
         script = _run_block(".github/workflows/promote.yml", RESOLVE_STEP)
         code = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
@@ -375,27 +403,28 @@ class TestCoolingPeriodFilterShape:
             "'fallback' could only ever turn one failure into a worse one"
         )
 
+    def test_no_tag_keyed_lookup_survives(self):
+        """SUP-18 anchor: selecting the age by a registry tag rather than by
+        the candidate itself is the original defect."""
+        script = _run_block(".github/workflows/promote.yml", RESOLVE_STEP)
+        code = "\n".join(ln for ln in script.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        assert 'index("latest")' not in code
+
 
 # ── SUP-17: the prior :stable digest must be on record ───────────────────────
 
 @pytest.mark.integration
 class TestPromoteRecordsTheDigestItReplaces:
     def test_resolve_step_exports_the_outgoing_stable_digest(self, tmp_path):
-        versions = _versions_fixture([
-            {"digest": LATEST_DIGEST, "created_at": _iso_days_ago(40.04), "tags": ["latest"]},
-        ])
-        proc = _run_resolve(tmp_path, versions)
+        proc = _run_resolve(tmp_path)
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        out = _parse_output(proc.gh_output)
-        assert out["previous_stable_digest"] == STABLE_DIGEST
+        assert _parse_output(proc.gh_output)["previous_stable_digest"] == STABLE_DIGEST
 
     def test_first_ever_promotion_records_an_empty_previous_digest(self, tmp_path):
         """No :stable tag yet -- the output must still exist (downstream steps
         reference it) and must be empty rather than absent."""
-        versions = _versions_fixture([
-            {"digest": LATEST_DIGEST, "created_at": _iso_days_ago(40.04), "tags": ["latest"]},
-        ])
-        proc = _run_resolve(tmp_path, versions, stable_digest="")
+        proc = _run_resolve(tmp_path, stable_digest="")
         assert proc.returncode == 0, proc.stdout + proc.stderr
         out = _parse_output(proc.gh_output)
         assert out["previous_stable_digest"] == ""
@@ -508,26 +537,43 @@ TAG_STEP = "Set image tag"
 
 
 def _run_set_image_tag(tmp_path: Path, input_tag: str,
-                       event_name: str = "workflow_dispatch") -> subprocess.CompletedProcess:
+                       event_name: str = "workflow_dispatch",
+                       refresh_version: str = "") -> subprocess.CompletedProcess:
     script = _run_block(".github/workflows/publish.yml", TAG_STEP)
-    resolved = _resolve(script, {"github.event_name": f'"{event_name}"'})
-    # The runner substitutes the expression *inside* the existing quotes.
-    resolved = resolved.replace(f'""{event_name}""', f'"{event_name}"')
-    return _bash(resolved, tmp_path,
-                 env_overrides={"INPUT_TAG": input_tag, "GITHUB_REF_NAME": "v2.9.0"},
+    # Everything the step needs now arrives through its own `env:` block, so
+    # the shipped bash carries no GH expressions and runs here verbatim --
+    # nothing has to be paraphrased to be testable.
+    assert "${{" not in script, f"this step must not interpolate GH expressions:\n{script}"
+    return _bash(script, tmp_path,
+                 env_overrides={
+                     "INPUT_TAG": input_tag,
+                     "EVENT_NAME": event_name,
+                     "REFRESH_VERSION": refresh_version,
+                     "GITHUB_REF_NAME": "v2.9.0",
+                 },
                  fakes={})
 
 
 class TestDispatchTagOutputIsHeredocDelimited:
     def test_step_never_writes_a_bare_single_line_value_assignment(self):
         """Anchor regression: `echo "value=${INPUT_TAG}" >> "$GITHUB_OUTPUT"`
-        is the exact construct a newline in INPUT_TAG weaponises."""
+        is the exact construct a newline in INPUT_TAG weaponises. Both outputs
+        now go through one `emit` helper, so the property is checked on the
+        helper -- and on the absence of any direct write that bypasses it."""
         script = _run_block(".github/workflows/publish.yml", TAG_STEP)
-        assert not re.search(r'echo\s+"value=', script), (
-            "the tag value must be written with the heredoc delimiter form"
+        assert not re.search(r'echo\s+"(value|image_tag)=', script), (
+            "outputs must be written with the heredoc delimiter form"
         )
-        assert re.search(r'echo\s+"value<<\S+"', script), (
-            "expected the documented `value<<DELIM` heredoc output form"
+        assert re.search(r'echo\s+"\$1<<\S+"', script), (
+            "expected the documented `<name><<DELIM` heredoc output form"
+        )
+        direct_writes = [ln for ln in script.splitlines()
+                         if 'GITHUB_OUTPUT' in ln
+                         and 'emit' not in ln
+                         and not ln.lstrip().startswith('#')]
+        assert len(direct_writes) == 1, (
+            "every GITHUB_OUTPUT write must go through emit(), so the heredoc "
+            f"form cannot be bypassed by a future edit: {direct_writes!r}"
         )
 
     def test_reserved_tag_guard_from_sup_02_is_still_present(self):
@@ -549,11 +595,19 @@ class TestDispatchTagInputValidation:
         proc = _run_set_image_tag(tmp_path, good_input)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         lines = proc.gh_output.splitlines()
+        # Two outputs now: `value` (the release version, which becomes the
+        # image's version label) and `image_tag` (what actually gets pushed).
+        # On a dispatch they are the same; the weekly refresh is where they
+        # diverge. Both must use the heredoc form -- an injected newline must
+        # not be able to smuggle a second output past either one.
         assert lines[0].startswith("value<<")
         delim = lines[0].split("<<", 1)[1]
         assert lines[1] == good_input
         assert lines[2] == delim
-        assert len(lines) == 3
+        assert lines[3] == f"image_tag<<{delim}"
+        assert lines[4] == good_input
+        assert lines[5] == delim
+        assert len(lines) == 6
 
     @pytest.mark.parametrize("bad_input", [
         "latest\nvalue=stable",           # the injection the finding describes
@@ -716,17 +770,11 @@ class TestCoolingPeriodIsSevenDays:
         assert int(workflow["env"]["COOLING_DAYS"]) == 7
 
     def test_six_days_old_is_refused(self, tmp_path):
-        versions = _versions_fixture([
-            {"digest": LATEST_DIGEST, "created_at": _iso_days_ago(6), "tags": ["latest"]},
-        ])
-        out = _parse_output(_run_resolve(tmp_path, versions).gh_output)
+        out = _parse_output(_run_resolve(tmp_path, release_date=_iso_days_ago(6)).gh_output)
         assert out["skip"] == "true"
 
     def test_eight_days_old_is_promoted(self, tmp_path):
-        versions = _versions_fixture([
-            {"digest": LATEST_DIGEST, "created_at": _iso_days_ago(8.04), "tags": ["latest"]},
-        ])
-        out = _parse_output(_run_resolve(tmp_path, versions).gh_output)
+        out = _parse_output(_run_resolve(tmp_path, release_date=_iso_days_ago(8.04)).gh_output)
         assert out["skip"] == "false"
         assert out["age_days"] == "8"
 

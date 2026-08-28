@@ -46,6 +46,22 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # Weekly base refresh. Rebuilds the CURRENT release, unchanged, on whatever
+  # the pinned base and apk repositories serve today, and republishes it as
+  # :latest plus an immutable :<version>-<date> tag.
+  #
+  # This exists because the promotion gate and its own remedy used to fight
+  # each other. An OS CVE is fixed by rebuilding; a rebuild mints a new digest;
+  # under a digest-based cooling clock that reset the soak to zero, so the fix
+  # restarted the wait it was meant to end. Blocking findings arrived on 8
+  # distinct days in the 83 from 2026-05-22, so a 7-day window closed clean
+  # roughly half the time and :stable never happened.
+  #
+  # promote.yml now runs its clock on the RELEASE, so a rebuild of an
+  # already-soaked release is promotable the moment it lands. Sundays, ahead of
+  # promote's Monday-onwards daily cron.
+  schedule:
+    - cron: '0 5 * * 0'
   workflow_dispatch:
     inputs:
       tag:
@@ -70,10 +86,67 @@ jobs:
     # "release" environment is configured in repo Settings with a required
     # reviewer (see .github/CODEOWNERS' @zagware/maintainers team) and,
     # incidentally, also environment-scopes GITHUB_TOKEN. See SUP-09.
-    environment: release
+    #
+    # The weekly refresh uses a SEPARATE environment with no required reviewer,
+    # because a gate that needs a human every Sunday is a gate that stops
+    # happening. What that reviewer was protecting against does not apply to
+    # this path: the refresh takes no input, publishes no new release, builds
+    # from an existing signed release tag rather than a branch, and is refused
+    # below unless that tag is both the newest release and an ancestor of main.
+    # It cannot touch :stable or :secure -- only promote.yml moves those, and
+    # only after its own scan. The residual exposure is that a moved git tag
+    # would be rebuilt unreviewed, which the ancestor check is there to catch.
+    environment: ${{ github.event_name == 'schedule' && 'refresh' || 'release' }}
 
     steps:
+      # Which release does a scheduled refresh rebuild? Resolved before
+      # checkout, so this step must not depend on repository contents.
+      - name: Resolve refresh target
+        id: refresh
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')
+
+          if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Newest release tag '${TAG}' is not a plain vX.Y.Z -- refusing to rebuild something this workflow cannot reason about."
+            exit 1
+          fi
+
+          # Rebuild only the NEWEST release. SUP-02's concern was a publish of
+          # an older version silently rolling :latest backwards; pinning the
+          # refresh to the newest release makes that structurally impossible
+          # rather than merely unlikely.
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "Refreshing ${TAG}"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A scheduled run builds the release tag, not the default branch, so
+          # a refresh can never quietly ship whatever has since landed on main.
+          ref: ${{ github.event_name == 'schedule' && steps.refresh.outputs.tag || github.ref }}
+          # Ancestry is checked below and needs more than the tagged commit.
+          fetch-depth: 0
+
+      # Tags are outside branch protection: nothing stops a tag being moved to
+      # an arbitrary commit, and the scheduled path has no human reviewer to
+      # notice. Requiring the tagged commit to be an ancestor of origin/main
+      # means a refresh can only ever rebuild code that went through the
+      # reviewed branch, whatever the tag currently points at.
+      - name: Verify the refresh target is reachable from main
+        if: github.event_name == 'schedule'
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          HEAD_SHA=$(git rev-parse HEAD)
+          if ! git merge-base --is-ancestor "$HEAD_SHA" origin/main; then
+            echo "::error::${{ steps.refresh.outputs.tag }} resolves to ${HEAD_SHA}, which is not an ancestor of origin/main. A release tag pointing off the reviewed branch is exactly what the unattended refresh path must refuse to build."
+            exit 1
+          fi
+          echo "✓ ${HEAD_SHA} is reachable from origin/main"
 
       # Single source of truth for every pinned version/checksum -- the
       # Dockerfile's own ARG defaults. Everything below reads from these
@@ -266,11 +339,30 @@ jobs:
         id: tag
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
+          # Both reach bash as env vars rather than being interpolated into the
+          # script text, so the run block stays free of ${{ }} and can be
+          # extracted and executed verbatim by
+          # tests/test_publish_tag_validation.py. That test is the reason
+          # SUP-19's injection bug cannot come back.
+          EVENT_NAME: ${{ github.event_name }}
+          REFRESH_VERSION: ${{ steps.refresh.outputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          emit() {
+            # Heredoc delimiter form, not `value=...`: even though the
+            # allowlist below already makes a newline impossible, the
+            # single-line form is what turned a bad input into injected
+            # step outputs in the first place. See SUP-19.
+            {
+              echo "$1<<ZAGWARE_TAG_EOF"
+              echo "$2"
+              echo "ZAGWARE_TAG_EOF"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             case "$INPUT_TAG" in
               stable|secure)
-                echo "::error::Refusing to dispatch directly onto ':$INPUT_TAG' -- that tag is only ever moved by promote.yml after its 14-day cooling period and CVE gate. Publish a version tag instead and let promotion advance :$INPUT_TAG the normal way. See SUP-02."
+                echo "::error::Refusing to dispatch directly onto ':$INPUT_TAG' -- that tag is only ever moved by promote.yml after its cooling period and CVE gate. Publish a version tag instead and let promotion advance :$INPUT_TAG the normal way. See SUP-02."
                 exit 1
                 ;;
             esac
@@ -282,21 +374,26 @@ jobs:
               echo "::error::Invalid tag '$INPUT_TAG' -- must be 'latest' or a plain X.Y.Z version. See SUP-19."
               exit 1
             fi
-            # Heredoc delimiter form, not `value=...`: even though the
-            # allowlist above already makes a newline impossible, the
-            # single-line form is what turned a bad input into injected
-            # step outputs in the first place. See SUP-19.
-            {
-              echo "value<<ZAGWARE_TAG_EOF"
-              echo "${INPUT_TAG}"
-              echo "ZAGWARE_TAG_EOF"
-            } >> "$GITHUB_OUTPUT"
+            emit value "${INPUT_TAG}"
+            emit image_tag "${INPUT_TAG}"
+          elif [ "$EVENT_NAME" = "schedule" ]; then
+            # A refresh must NOT move :<version>. The README calls that tag
+            # immutable per release and people pin it; republishing over it
+            # would make the same tag mean two different digests. The rebuild
+            # gets its own immutable :<version>-<date> tag, and :latest.
+            #
+            # `value` stays the clean semver because it is what the version
+            # LABEL is set from, and promote.yml reads that label off the
+            # digest to decide which release's clock applies.
+            if ! [[ "$REFRESH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Refresh version '$REFRESH_VERSION' is not a plain X.Y.Z -- refusing to tag from it."
+              exit 1
+            fi
+            emit value "${REFRESH_VERSION}"
+            emit image_tag "${REFRESH_VERSION}-$(date -u +%Y%m%d)"
           else
-            {
-              echo "value<<ZAGWARE_TAG_EOF"
-              echo "${GITHUB_REF_NAME#v}"
-              echo "ZAGWARE_TAG_EOF"
-            } >> "$GITHUB_OUTPUT"
+            emit value "${GITHUB_REF_NAME#v}"
+            emit image_tag "${GITHUB_REF_NAME#v}"
           fi
 
       - name: Docker metadata
@@ -305,14 +402,21 @@ jobs:
         with:
           images: ghcr.io/zagware/zagware-scanner
           tags: |
-            type=raw,value=${{ steps.tag.outputs.value }}
-            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=raw,value=${{ steps.tag.outputs.image_tag }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+          # org.opencontainers.image.version is set explicitly rather than left
+          # to metadata-action's ref inference, because promote.yml reads it
+          # back off the digest to decide which release's cooling clock
+          # applies. On a refresh the image TAG carries a date suffix but this
+          # label stays the clean semver, so a rebuild is still recognisably a
+          # build OF that release.
           labels: |
             org.opencontainers.image.title=Zagware Security Scanner
             org.opencontainers.image.description=IaC (KICS) + SCA (Grype) + Secrets (Betterleaks) security scanner for CI pipelines
             org.opencontainers.image.vendor=Zagware Ltd
             org.opencontainers.image.licenses=Apache-2.0 AND MIT
             org.opencontainers.image.source=https://github.com/zagware/zagware-scanner
+            org.opencontainers.image.version=${{ steps.tag.outputs.value }}
 
       - name: Build and push (SBOM + provenance attestations)
         id: build
@@ -345,17 +449,20 @@ jobs:
 
       # ── Reachability variant (opt-in) — same core + Go/Node/govulncheck ──────
       # Built, pushed, signed, and attested exactly like the core above, to
-      # :<version>-reachability (and :reachability on a tag push). Consumers who
-      # want call-graph reachability opt into this larger, equally-attested tag.
+      # :<version>-reachability (and :reachability on a tag push or a weekly
+      # refresh). Consumers who want call-graph reachability opt into this
+      # larger, equally-attested tag.
       - name: Reachability image tags
         id: rtags
         run: |
           {
             echo "value<<ZAGWARE_RTAGS_EOF"
-            echo "ghcr.io/zagware/zagware-scanner:${{ steps.tag.outputs.value }}-reachability"
-            if [ "${{ github.event_name }}" = "push" ]; then
-              echo "ghcr.io/zagware/zagware-scanner:reachability"
-            fi
+            echo "ghcr.io/zagware/zagware-scanner:${{ steps.tag.outputs.image_tag }}-reachability"
+            case "${{ github.event_name }}" in
+              push|schedule)
+                echo "ghcr.io/zagware/zagware-scanner:reachability"
+                ;;
+            esac
             echo "ZAGWARE_RTAGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -448,7 +555,7 @@ jobs:
 
       - name: Build summary
         run: |
-          echo "## Published \`ghcr.io/zagware/zagware-scanner:${{ steps.tag.outputs.value }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "## Published \`ghcr.io/zagware/zagware-scanner:${{ steps.tag.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
