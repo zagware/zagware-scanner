@@ -58,19 +58,27 @@ class TestNoLongLivedPATRemains:
 
 
 class TestNoSecretInterpolatedIntoCommandText:
-    def test_promote_yml_curl_uses_env_not_inline_interpolation(self):
-        """The curl call must read its token from an env var, not from a
-        ${{ secrets.* }} expression interpolated directly into command
-        text (which lands in the rendered run script on disk and in
-        /proc/*/cmdline)."""
+    def test_promote_yml_token_comes_from_env_not_inline_interpolation(self):
+        """The GitHub API call must take its token from an env var, not from a
+        ${{ secrets.* }} expression interpolated directly into command text
+        (which lands in the rendered run script on disk and in /proc/*/cmdline).
+
+        The step now calls `gh api`, which reads GH_TOKEN from the environment
+        itself, so the script text names no token at all -- strictly better
+        than the old hand-rolled curl. What must hold either way is that the
+        env declares the token and the script interpolates no secret."""
         doc = _load(".github/workflows/promote.yml")
         steps = doc["jobs"]["promote"]["steps"]
-        step = next(s for s in steps if s.get("name") == "Resolve latest tag digest and age")
+        step = next(s for s in steps
+                    if s.get("name") == "Resolve promotion candidate and release age")
         assert "env" in step and any("GITHUB_TOKEN" in v for v in step["env"].values())
+        assert "GH_TOKEN" in step["env"], (
+            "gh reads GH_TOKEN from the environment; without it the API call "
+            "runs unauthenticated and the cooling period fails closed"
+        )
         assert "${{ secrets." not in step["run"], (
             "a secret expression must not be interpolated directly into the run script"
         )
-        assert "$GH_TOKEN" in step["run"]
 
 
 class TestAuditYmlHasNoCredential:
@@ -95,9 +103,27 @@ class TestPublishYmlReleaseGate:
     def test_build_sign_push_job_has_environment_gate(self):
         doc = _load(".github/workflows/publish.yml")
         job = doc["jobs"]["build-sign-push"]
-        assert job.get("environment") == "release", (
+        environment = job.get("environment", "")
+        assert "release" in environment, (
             "publish.yml must gate behind an environment with a required "
-            "reviewer -- see SUP-09"
+            f"reviewer -- see SUP-09. Got {environment!r}"
+        )
+
+    def test_only_the_scheduled_refresh_may_leave_the_release_environment(self):
+        """The refresh runs unattended by design -- a gate needing a human
+        every Sunday is a gate that stops happening. But a real publish, which
+        creates a release and can be triggered by a tag push outside branch
+        protection, must still hit the reviewed environment. If the expression
+        ever keys on anything but `schedule`, SUP-09 is quietly gone."""
+        doc = _load(".github/workflows/publish.yml")
+        environment = doc["jobs"]["build-sign-push"]["environment"]
+        if environment == "release":
+            return  # unconditional gate is strictly stronger
+        assert "github.event_name == 'schedule'" in environment, (
+            f"only a scheduled refresh may bypass the reviewer: {environment!r}"
+        )
+        assert "'release'" in environment, (
+            f"every non-scheduled publish must land on 'release': {environment!r}"
         )
 
 

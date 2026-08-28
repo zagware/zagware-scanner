@@ -28,11 +28,35 @@ on:
         default: ''
 
 env:
-  # Days :latest must age before it can be promoted. Lowered 14 -> 7: the
-  # window exists to let a regression surface in real pipelines before an image
-  # is blessed, and in practice breakage has shown up within hours to a day or
-  # two, not weeks. Two weeks mostly delayed CVE fixes reaching :stable, which
-  # cuts against the point of the tag.
+  # Days a RELEASE must age before its image can be promoted. Lowered 14 -> 7:
+  # the window exists to let a regression surface in real pipelines before an
+  # image is blessed, and in practice breakage has shown up within hours to a
+  # day or two, not weeks.
+  #
+  # The clock runs on the release, NOT on the candidate digest, and that
+  # distinction is the whole reason :stable can exist. The soak exists to catch
+  # functional regressions, and those live in the commit: our code and our tool
+  # pins. An OS package refresh changes neither. But the remedy for an OS CVE is
+  # a rebuild, a rebuild mints a new digest, and under a digest clock that reset
+  # the soak to zero -- so fixing a CVE restarted the very wait that fixing it
+  # was supposed to end.
+  #
+  # Measured over 2026-05-22..2026-08-13, findings that block this gate arrived
+  # on 8 distinct days in 83 -- lambda 0.096/day, so P(a clean 7-day window) is
+  # about e^-0.67 = 0.51. A coin flip per attempt, and every loss restarted the
+  # clock. That is why no promotion had ever completed.
+  #
+  # With the clock on the release, publish.yml's weekly base refresh rebuilds
+  # the SAME commit on a fresh base and republishes :latest. The release has
+  # already soaked, so the refreshed digest is promotable immediately and OS
+  # CVEs close within a week without ever restarting the wait. A genuinely new
+  # release still soaks the full 7 days, which is the case the gate is for.
+  #
+  # The trade, recorded so it is a decision and not an accident: :stable can
+  # point at a digest that was never itself :latest in anyone's pipeline. The
+  # delta from the soaked digest is Wolfi package versions only -- same commit,
+  # same tool pins, same scanner code -- and ci.yml's smoke test runs against
+  # the rebuild before it is published.
   COOLING_DAYS: 7
 
 jobs:
@@ -67,19 +91,28 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve latest tag digest and age
+      - name: Resolve promotion candidate and release age
         id: latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # `{{json .Manifest}}` piped through jq, not `{{.Manifest.Digest}}`.
+          # A buildx that does not know that field does NOT error -- it ignores
+          # the template and prints the whole human-readable inspect block, so
+          # LATEST_DIGEST silently becomes a multi-line blob that passes the
+          # `-z` check below and flows onward as if it were a digest. Observed
+          # on buildx v0.22.0; the runner's newer buildx happens to accept the
+          # field, which is exactly what makes it a trap rather than a failure.
+          # The json form works on both, and the shape check makes a wrong
+          # answer impossible to mistake for a right one.
+          #
           # `|| true` for the same reason audit.yml needs it: under `bash -e` a
           # failing lookup aborts the step and the "nothing to promote" branch
           # below never runs, turning an ordinary missing-tag state into a red
-          # workflow. :latest exists today so this has never fired, but the
-          # guard four lines down is only reachable with it.
+          # workflow.
           LATEST_DIGEST=$(docker buildx imagetools inspect \
             ghcr.io/zagware/zagware-scanner:latest \
-            --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+            --format '{{json .Manifest}}' 2>/dev/null | jq -r '.digest // empty' || true)
 
           if [ -z "$LATEST_DIGEST" ]; then
             echo "No :latest tag found — nothing to promote"
@@ -87,49 +120,59 @@ jobs:
             exit 0
           fi
 
+          if ! printf '%s' "$LATEST_DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::Resolved :latest to '${LATEST_DIGEST}', which is not a digest. Refusing to promote something this workflow cannot name."
+            exit 1
+          fi
+
           echo "digest=$LATEST_DIGEST" >> "$GITHUB_OUTPUT"
 
-          # Age must be measured against the digest we just resolved from the
-          # registry -- NOT against whichever version the API happens to report
-          # as tagged :latest. The cooling period is the load-bearing
-          # guarantee of the whole rollout design; measuring it against a
-          # different image silently voids it. See SUP-18.
-          VERSIONS_JSON=$(curl -sS --fail \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/orgs/zagware/packages/container/zagware-scanner/versions?per_page=100") || VERSIONS_JSON=""
+          # Which release is this digest a build of? Read it from the image's
+          # own org.opencontainers.image.version label, which publish.yml sets
+          # explicitly from the release version for BOTH the release build and
+          # the weekly refresh rebuild.
+          #
+          # The label, not a registry tag lookup. SUP-18 was exactly this class
+          # of bug -- the age was measured against whichever version the API
+          # reported as tagged `latest`, which need not be the image being
+          # promoted. A label is baked into the digest at build time, so
+          # digest -> version cannot drift or be re-pointed afterwards. The
+          # binding runs from the candidate outward, never from a tag inward.
+          VERSION=$(docker buildx imagetools inspect \
+            "ghcr.io/zagware/zagware-scanner@${LATEST_DIGEST}" \
+            --format '{{ index .Image.Config.Labels "org.opencontainers.image.version" }}' \
+            2>/dev/null || true)
 
-          if [ -z "$VERSIONS_JSON" ] || ! printf '%s' "$VERSIONS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
-            echo "::error::Could not list container versions from the GitHub API -- the ${COOLING_DAYS}-day cooling period for ${LATEST_DIGEST} cannot be verified, so promotion fails closed rather than guessing an age. See SUP-18."
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Candidate ${LATEST_DIGEST} carries no usable org.opencontainers.image.version label (got '${VERSION}'). The cooling period is measured from that release, so promotion fails closed rather than guessing which release this image is."
             exit 1
           fi
 
-          TAG_DATES=$(printf '%s' "$VERSIONS_JSON" \
-            | jq -r --arg digest "${LATEST_DIGEST#sha256:}" \
-              '.[] | select(.name == "sha256:" + $digest) | .created_at')
-          MATCH_COUNT=$(printf '%s\n' "$TAG_DATES" | grep -c '[^[:space:]]' || true)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          if [ "$MATCH_COUNT" -ne 1 ]; then
-            echo "::error::Expected exactly one GHCR version with digest ${LATEST_DIGEST}, found ${MATCH_COUNT}. Zero means the registry and the packages API disagree (or the version is beyond the first 100 results); more than one means the creation date is ambiguous. Either way the cooling period cannot be measured, so promotion fails closed. See SUP-18."
+          # The release's publication date is the soak clock. It does not move
+          # when the image is rebuilt, which is the entire point.
+          RELEASE_DATE=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v${VERSION}" \
+            --jq '.published_at' 2>/dev/null || true)
+
+          if [ -z "$RELEASE_DATE" ] || [ "$RELEASE_DATE" = "null" ]; then
+            echo "::error::No published GitHub Release found for v${VERSION}, so the ${COOLING_DAYS}-day cooling period cannot be measured. Promotion fails closed. An image whose version label names a release that does not exist is itself the anomaly worth stopping on."
             exit 1
           fi
 
-          TAG_DATE="$TAG_DATES"
-
-          # GNU date only -- these workflows only ever run on ubuntu-latest, and
-          # the old BSD `date -jf` fallback could never have fired there.
-          TAG_TS=$(date -u -d "$TAG_DATE" +%s) || TAG_TS=""
-          if [ -z "$TAG_TS" ]; then
-            echo "::error::Could not parse the creation date '${TAG_DATE}' reported for ${LATEST_DIGEST} -- failing closed. See SUP-18."
+          # GNU date only -- these workflows only ever run on ubuntu-latest.
+          RELEASE_TS=$(date -u -d "$RELEASE_DATE" +%s) || RELEASE_TS=""
+          if [ -z "$RELEASE_TS" ]; then
+            echo "::error::Could not parse the publication date '${RELEASE_DATE}' of release v${VERSION} -- failing closed."
             exit 1
           fi
 
           NOW_TS=$(date -u +%s)
-          AGE_DAYS=$(( (NOW_TS - TAG_TS) / 86400 ))
+          AGE_DAYS=$(( (NOW_TS - RELEASE_TS) / 86400 ))
 
-          echo "Latest digest: $LATEST_DIGEST"
-          echo "Latest tag age: ${AGE_DAYS} days"
+          echo "Candidate digest: $LATEST_DIGEST"
+          echo "Built from release: v${VERSION} (published ${RELEASE_DATE})"
+          echo "Release age: ${AGE_DAYS} days"
 
           # Read the digest :stable currently points at. This is both the
           # "already promoted?" check and the only record of the digest this
@@ -139,7 +182,7 @@ jobs:
           # alerts, rollback stays a deliberate manual decision. See SUP-17.
           STABLE_DIGEST=$(docker buildx imagetools inspect \
             ghcr.io/zagware/zagware-scanner:stable \
-            --format '{{.Manifest.Digest}}' 2>/dev/null || echo "")
+            --format '{{json .Manifest}}' 2>/dev/null | jq -r '.digest // empty' || echo "")
 
           echo "previous_stable_digest=$STABLE_DIGEST" >> "$GITHUB_OUTPUT"
           echo "Current :stable digest (will be replaced): ${STABLE_DIGEST:-<none>}"
@@ -174,6 +217,60 @@ jobs:
         if: steps.latest.outputs.skip == 'true'
         run: echo "Skipping promotion — see previous step output for reason."
 
+      # Which bundled tools have a newer upstream release? A vendored-module
+      # CVE in a vendor binary is only actionable if bumping that pin could
+      # actually clear it, and that is only possible when a newer release
+      # exists. Without this check the gate blocks on findings with no remedy
+      # in existence -- the same unsatisfiable-gate bug one level in.
+      #
+      # This is not hypothetical. GO-2026-5970 (golang.org/x/text) published
+      # 2026-07-14; no betterleaks release carried the fixed x/text until 1.8.1
+      # on 2026-08-18, through 1.7.3, 1.7.4 and 1.8.0. A "block on any fixable
+      # vendored module" gate would have held :stable shut for 35 days with
+      # nothing this repository could have done about it.
+      - name: Read pinned versions from Dockerfile
+        if: steps.latest.outputs.skip != 'true'
+        run: sed -n 's/^ARG //p' Dockerfile >> "$GITHUB_ENV"
+
+      - name: Check whether a newer release exists for each bundled tool
+        if: steps.latest.outputs.skip != 'true'
+        id: newer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # binary|repo|pinned. The binary name is what grype attributes a
+          # finding to; the repo is where a remedy would come from.
+          TOOLS="syft|anchore/syft|${SYFT_VERSION}
+          grype|anchore/grype|${GRYPE_VERSION}
+          betterleaks|betterleaks/betterleaks|v${BETTERLEAKS_VERSION}
+          osv-scanner|google/osv-scanner|${OSV_SCANNER_VERSION}"
+
+          echo '{}' > /tmp/newer.json
+          while IFS='|' read -r binary repo pinned; do
+            [ -n "$binary" ] || continue
+            binary=$(printf '%s' "$binary" | tr -d '[:space:]')
+            pinned=$(printf '%s' "$pinned" | tr -d '[:space:]')
+
+            LATEST=$(gh api "repos/${repo}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+            if [ -z "$LATEST" ]; then
+              # Fail closed, and loudly. Guessing here would either invent a
+              # remedy that does not exist or hide one that does, and both are
+              # the fabricated-answer class SUP-01 removed from these gates.
+              echo "::error::Could not resolve the latest release of ${repo}, so it cannot be determined whether a newer version would clear its findings. Promotion fails closed rather than guessing."
+              exit 1
+            fi
+
+            if [ "$pinned" = "$LATEST" ]; then HAS_NEWER=false; else HAS_NEWER=true; fi
+            echo "  ${binary}: pinned=${pinned} latest=${LATEST} newer=${HAS_NEWER}"
+
+            jq -c --arg b "$binary" --argjson n "$HAS_NEWER" '. + {($b): $n}' \
+              /tmp/newer.json > /tmp/newer.next && mv /tmp/newer.next /tmp/newer.json
+          done <<< "$TOOLS"
+
+          echo "value=$(cat /tmp/newer.json)" >> "$GITHUB_OUTPUT"
+
       # ── The CVE gate ──────────────────────────────────────────────────────
       # This blocks on findings WE CAN ACT ON, which is not the same as every
       # fixable finding, and is very much not the same as every finding.
@@ -191,18 +288,26 @@ jobs:
       # So the gate asks the question that actually has an answer: is there a
       # finding a base re-pin or a version bump would clear?
       #
-      #   OS packages           -> ours (re-pin WOLFI_DIGEST)          BLOCKS
-      #   kics                  -> ours (we build it; re-pin GO_VERSION) BLOCKS
-      #   vendor binary, module -> a newer upstream release clears it  BLOCKS
-      #   vendor binary, stdlib -> only a vendor rebuild clears it     reported
-      #   no fix in existence   -> nobody can clear it                 reported
+      #   OS packages              -> ours (re-pin WOLFI_DIGEST)         BLOCKS
+      #   kics                     -> ours (we build it; GO_VERSION)     BLOCKS
+      #   vendor module, newer rel -> bumping that pin may clear it      BLOCKS
+      #   vendor module, on latest -> no released fix exists yet         reported
+      #   vendor binary, stdlib    -> only a vendor rebuild clears it    reported
+      #   no fix in existence      -> nobody can clear it                reported
       #
-      # The last two are not silence: tool-currency.yml reports every one of
-      # them weekly, per owning binary, and escalates when a vendor goes quiet
-      # while carrying them. The count is also written into the signed
-      # promotion predicate below, so a promoted digest always carries its own
-      # honest vulnerability total -- we publish the number, we just stopped
-      # pretending we could drive it to zero.
+      # The stdlib carve-out stays even when a newer release exists, because a
+      # newer release does not imply a newer toolchain: Syft v1.51.1 shipped
+      # 2026-08-27, fourteen days after Go 1.26.6 closed six stdlib advisories,
+      # and is still built with go1.26.3 carrying all seven. Bumping to it would
+      # not clear one of them, so blocking on them would just be the closed door
+      # again, wearing a version number.
+      #
+      # None of this is silence: tool-currency.yml reports every one of them
+      # weekly, per owning binary, and escalates when a vendor goes quiet while
+      # carrying them. The counts are written into the signed promotion
+      # predicate below, so a promoted digest always carries its own honest
+      # vulnerability total -- we publish the number, we just stopped pretending
+      # we could drive it to zero.
       #
       # VENDOR_BINARIES is duplicated in audit.yml and pinned equal by
       # tests/test_workflow_grype_gating.py, the same test-enforced-duplication
@@ -210,6 +315,12 @@ jobs:
       - name: Scan image for CVEs (Grype)
         if: steps.latest.outputs.skip != 'true'
         id: scan
+        env:
+          # Reaches bash as an env var rather than being interpolated into the
+          # script text, the same way PREVIOUS_STABLE_DIGEST does below: the
+          # run block stays free of ${{ }} so it can be extracted and executed
+          # verbatim by tests/test_workflow_grype_gating.py.
+          HAS_NEWER: ${{ steps.newer.outputs.value }}
         run: |
           IMAGE_REF="ghcr.io/zagware/zagware-scanner@${{ steps.latest.outputs.digest }}"
           echo "Scanning $IMAGE_REF for CVEs..."
@@ -228,19 +339,38 @@ jobs:
             exit 1
           fi
 
+          # Absent (a standalone run of this block, or a skipped probe) means
+          # "no newer release known", which withholds the vendor-module block
+          # rather than inventing a remedy. Assigned to a plain variable
+          # because `${HAS_NEWER:-{\}}` expands to the literal `{\}` under
+          # bash, which is not JSON and takes jq down with it.
+          NEWER_JSON="${HAS_NEWER:-}"
+          [ -n "$NEWER_JSON" ] || NEWER_JSON='{}'
+
+          # A finding blocks when a remedy exists on our side:
+          #   not vendor                  -> OS or kics, ours to re-pin
+          #   vendor, module, newer rel   -> bumping that pin may clear it
+          # Everything else is reported and does not block.
+          #
           # `$vendors | index($owner)` binds $owner FIRST on purpose: writing
           # `index(.owner)` reads `.` as the piped-in $vendors array, not the
           # finding, and jq fails with "cannot index array with string".
-          COUNTS=$(echo "$SCAN_JSON" | jq -c --argjson vendors "$VENDOR_BINARIES" '
+          COUNTS=$(echo "$SCAN_JSON" \
+            | jq -c --argjson vendors "$VENDOR_BINARIES" \
+                   --argjson newer "$NEWER_JSON" '
             [ .matches[]
               | select(.vulnerability.severity | ascii_downcase | test("high|critical"))
-              | ((.artifact.locations[0].path // "") | split("/") | last) as $owner
+              | (((.artifact.locations[0].path // "") | split("/") | last) // "") as $owner
               | { fixable: ((.vulnerability.fix.state // "") == "fixed"),
                   stdlib:  ((.artifact.name // "") == "stdlib"),
-                  vendor:  (($vendors | index($owner)) != null) } ]
+                  vendor:  (($vendors | index($owner)) != null),
+                  bumpable: (($newer[$owner]) == true) } ]
             | { total:    length,
                 fixable:  (map(select(.fixable)) | length),
-                blocking: (map(select(.fixable and ((.stdlib and .vendor) | not))) | length) }')
+                blocking: (map(select(.fixable
+                                      and ((.vendor | not)
+                                           or ((.stdlib | not) and .bumpable))))
+                           | length) }')
 
           HIGH_COUNT=$(echo "$COUNTS" | jq -r '.total')
           FIXABLE_COUNT=$(echo "$COUNTS" | jq -r '.fixable')
@@ -254,13 +384,15 @@ jobs:
 
           if [ "$BLOCKING_COUNT" != "0" ]; then
             echo "Found $BLOCKING_COUNT actionable HIGH/CRITICAL vulnerabilities — promotion blocked"
-            echo "$SCAN_JSON" | jq -r --argjson vendors "$VENDOR_BINARIES" '
+            echo "$SCAN_JSON" | jq -r --argjson vendors "$VENDOR_BINARIES" \
+                                      --argjson newer "$NEWER_JSON" '
               .matches[]
               | select(.vulnerability.severity | ascii_downcase | test("high|critical"))
               | select((.vulnerability.fix.state // "") == "fixed")
-              | ((.artifact.locations[0].path // "") | split("/") | last) as $owner
-              | select((((.artifact.name // "") == "stdlib")
-                        and (($vendors | index($owner)) != null)) | not)
+              | (((.artifact.locations[0].path // "") | split("/") | last) // "") as $owner
+              | (($vendors | index($owner)) != null) as $isvendor
+              | select(($isvendor | not)
+                       or (((.artifact.name // "") != "stdlib") and (($newer[$owner]) == true)))
               | "  \($owner): \(.vulnerability.id) in \(.artifact.name // "?")@\(.artifact.version // "?")"'
             echo "scan_failed=true" >> "$GITHUB_OUTPUT"
           else
