@@ -62,17 +62,21 @@ historical tracking, trend charts, and suppression management.
 
 | Tag | Description |
 |---|---|
-| `:<version>` | Immutable per release. Pick a tag from the [releases](https://github.com/zagware/zagware-scanner/releases) page. Pin by digest for the strongest guarantee. |
-| `:latest` | Newest release. Moves on every tag push. **Not** security-vetted. |
-| `:stable` | Promoted from `:latest` after a 7-day cooling period, a signature-verify check, and a CVE scan with **zero actionable** HIGH/CRITICAL findings. **Not yet published** — see [Promotion workflow](#promotion-workflow) for why the first cycle had not completed. |
+| `:<version>` | **Immutable.** The exact image built from that release, never republished. Pick one from the [releases](https://github.com/zagware/zagware-scanner/releases) page. |
+| `:<version>-<date>` | **Immutable.** A rebuild of that same release on a newer base — same commit, same tool versions, refreshed OS packages. Published by the weekly base refresh (see below). |
+| `:latest` | Newest published image: moves on every release **and** on each weekly base refresh. **Not** security-vetted. |
+| `:stable` | Promoted from `:latest` after a 7-day cooling period on the release, a signature check, and a CVE scan with **zero actionable** HIGH/CRITICAL findings. **Not yet published** — v3.3.0 becomes eligible 2026-09-01. |
 | `:secure` | Identical digest to `:stable`, once `:stable` exists. |
 | `:reachability` (and `:<version>-reachability`) | The same core plus the Go/Node toolchains needed for **advisory SCA reachability enrichment** (govulncheck, npm audit, osv-scanner call analysis). Larger image, larger trusted surface — opt in only if you want reachability verdicts. Equally cosign-signed + SLSA-attested. |
 
-**Recommendation:** once `:stable` exists, pin it (or better, pin by digest — see
-[Pinning to a specific version](#pinning-to-a-specific-version)) for production CI. Until then, pin
-an exact `:<version>` tag for a reproducible build rather than tracking `:latest`, unless you
-specifically want new features immediately and are comfortable with `:latest`'s lack of a
-cooling-off period.
+**Which one to pin.** For production CI, pin `:stable` once it exists — or better, pin its digest
+(see [Pinning to a specific version](#pinning-to-a-specific-version)). Until then pin an exact
+`:<version>` or `:<version>-<date>` for a reproducible build. Track `:latest` only if you want new
+features immediately and accept that it has no cooling period and no CVE gate.
+
+If you want the security fixes without waiting for `:stable`, pin the newest `:<version>-<date>`:
+it is the same reviewed release you already trust, rebuilt on a current base, and it is immutable
+so your builds stay reproducible.
 
 **Two images, one source of truth.** The default `:latest`/`:<version>` (and future
 `:stable`/`:secure`) is the **minimal core** — the four scan engines plus the SHA256-pinned
@@ -85,81 +89,26 @@ with `ZAGWARE_SCA_REACHABILITY=false`.
 ### Promotion workflow
 
 1. A new version is tagged → image builds as `:<version>` and `:latest`
-2. After the cooling period, the promotion workflow verifies the image's cosign signature and
-   scans it for CVEs with Grype
-3. If the signature is valid and **zero actionable** HIGH/CRITICAL CVEs are found →
-   `:stable` and `:secure` are re-tagged to the same digest
-4. If actionable CVEs are found → promotion is blocked, a GitHub issue is opened, `:latest` stays
-5. A weekly audit workflow re-scans `:stable` for post-promotion CVE disclosures
+2. Every Sunday, the current release is rebuilt on a current base and republished as
+   `:<version>-<date>` and `:latest` — same commit, same tool pins, fresher OS packages
+3. Once the **release** is 7 days old, promotion verifies the candidate's cosign signature and
+   scans it with Grype
+4. Zero **actionable** HIGH/CRITICAL findings → `:stable` and `:secure` re-tag to that digest
+5. Otherwise promotion is blocked and an issue is opened; `:latest` stays where it is
+6. A weekly audit re-scans `:stable` for CVEs disclosed after promotion
 
-**What "actionable" means, and why the gate is not simply zero.** The image bundles five
-third-party Go binaries. Most of their CRITICAL/HIGH findings are Go `stdlib` advisories baked in
-by whichever toolchain the vendor compiled with. Grype reports those as *fixed* — Go published the
-patch — but the fix is applied by the vendor rebuilding, not by anything we can pin. On
-2026-08-25 the published image carried 50 CRITICAL/HIGH, of which **32 were exactly that**.
-Upgrading every bundled tool to its newest upstream release still left 25.
+Two details are worth knowing if you depend on this channel, because both are deliberate and
+neither is obvious:
 
-A gate demanding zero was therefore unsatisfiable by construction, and it had blocked every
-scheduled promotion since the workflow was written: `:stable` did not exist, so the README told
-users to pin `:latest`, which has no CVE gate at all. A gate that can only pass on a condition no
-action of ours produces is not a gate.
+- **The gate blocks on what we can fix, not on every finding.** Most CRITICAL/HIGH findings in the
+  image are Go `stdlib` advisories compiled into third-party binaries by their vendors. A patched
+  Go exists, but only the vendor rebuilding applies it. A gate demanding zero was unsatisfiable and
+  had never promoted anything.
+- **The cooling period runs on the release, not on the image digest.** Otherwise fixing a CVE —
+  which means rebuilding — would restart the very wait it was meant to end.
 
-So promotion blocks on the findings a base re-pin or a version bump would clear:
-
-| Finding | Remedy | Gate |
-|---|---|---|
-| OS package (Wolfi base) | re-pin `WOLFI_DIGEST` | **blocks** |
-| Anything in `kics` | ours — we build it from source | **blocks** |
-| Vendored *module* in a vendor binary, **newer release exists** | bump that tool's pin | **blocks** |
-| Vendored *module* in a vendor binary, **already on latest** | no released fix yet | reported |
-| Go `stdlib` in a vendor binary | only that vendor's next release | reported |
-| No fix published anywhere | nobody can clear it | reported |
-
-Nothing is hidden by this. The full total is printed in the run summary, written into the signed
-promotion attestation (`cveScan.highOrCriticalCount`, `.fixableCount`, `.actionableCount`), and
-tracked per owning binary by the weekly
-[tool-currency workflow](.github/workflows/tool-currency.yml), which escalates when a vendor goes
-quiet while carrying them. The list of vendor-built binaries is declared in
-[`promote.yml`](.github/workflows/promote.yml) and [`audit.yml`](.github/workflows/audit.yml) and
-held identical by a test; `kics` is deliberately not on it.
-
-**Why the clock runs on the release, not the image.** The two halves of the gate used to fight
-each other. The remedy for a blocking CVE is a rebuild; a rebuild mints a new digest; and the
-cooling period was measured from the digest's creation — so fixing a CVE reset the soak to zero
-and started a fresh 7-day wait, during which the next advisory could land and reset it again.
-
-That is not a hypothetical race. Findings that block this gate arrived on **8 distinct days in
-the 83** from 2026-05-22, i.e. $\lambda \approx 0.096\,\text{day}^{-1}$, so a clean 7-day window
-had probability $e^{-0.67} \approx 0.51$ — a coin flip per attempt, with every loss restarting the
-clock and no guarantee of ever converging.
-
-So the soak now runs on the **release**. The cooling period exists to catch functional
-regressions, and those live in the commit: our code and our tool pins. An OS package refresh
-changes neither. `promote.yml` reads `org.opencontainers.image.version` off the candidate digest
-— a label baked in at build time, so it cannot be re-pointed afterwards — and measures the age of
-*that release*. A weekly job in [`publish.yml`](.github/workflows/publish.yml) rebuilds the
-current release on whatever the base serves today and republishes it as `:latest` plus an
-immutable `:<version>-<date>`. Because the release has already soaked, the refreshed digest is
-promotable the moment it lands, and OS CVEs close within a week without ever restarting the wait.
-
-The honest cost: `:stable` can point at a digest that was never itself `:latest` in anyone's
-pipeline. The delta from the soaked digest is Wolfi package versions only — same commit, same tool
-pins, same scanner code — and CI's full smoke test runs against the rebuild before it is
-published. A genuinely new release still soaks the full 7 days, which is the case the gate is for.
-
-`:<version>` is never republished. It is documented as immutable per release and people pin it, so
-a refresh takes a dated tag of its own instead of moving it.
-
-**The cooling period was never the original blocker.** Worth saying plainly, because it is the
-obvious suspect: on 2026-08-25 the candidate digest was 18 days old against a 7-day requirement.
-Every promotion run cleared the age gate and then failed the CVE gate.
-
-**Why 7 days.** It was originally 14, which in practice mostly delayed *security fixes* reaching
-the channel recommended for production — the opposite of the intent. Every regression we have
-actually shipped surfaced within hours to a day or two, not weeks. The value is set once as
-`COOLING_DAYS` in [`promote.yml`](.github/workflows/promote.yml); it used to be the literal `14`
-repeated in six places, including operator-facing error messages, which is how a gate and its own
-error text drift apart.
+Both are measured rather than asserted, with the numbers and the trade-offs, under
+[Why promotion works the way it does](#why-promotion-works-the-way-it-does).
 
 ---
 
@@ -227,10 +176,12 @@ jobs:
           if-no-files-found: warn
 ```
 
-> **Security-conscious consumers:** once `:stable` exists (see
-> [Image tags and release channels](#image-tags-and-release-channels)), pin it — or better, pin
-> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. The `:latest` shown
-> above has no cooling-off period or CVE gate.
+> **Security-conscious consumers:** the `:latest` shown above has no cooling period and no CVE
+> gate. Pin `:stable` once it exists, or pin
+> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. In the meantime the
+> newest `:<version>-<date>` is the closest equivalent — a reviewed release rebuilt on a current
+> base, and immutable. See
+> [Image tags and release channels](#image-tags-and-release-channels).
 
 `GITHUB_TOKEN` is provided automatically by GitHub — no secrets to configure for the scanner itself.
 `ZAGWARE_PLATFORM_URL` and `ZAGWARE_PLATFORM_TOKEN` are optional; omit them to run the scanner
@@ -357,10 +308,12 @@ zagware-scanner:
   allow_failure: true
 ```
 
-> **Security-conscious consumers:** once `:stable` exists (see
-> [Image tags and release channels](#image-tags-and-release-channels)), pin it — or better, pin
-> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. The `:latest` shown
-> above has no cooling-off period or CVE gate.
+> **Security-conscious consumers:** the `:latest` shown above has no cooling period and no CVE
+> gate. Pin `:stable` once it exists, or pin
+> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. In the meantime the
+> newest `:<version>-<date>` is the closest equivalent — a reviewed release rebuilt on a current
+> base, and immutable. See
+> [Image tags and release channels](#image-tags-and-release-channels).
 
 > **To block merges on new findings:** remove `allow_failure: true` or set `ZAGWARE_FAIL_ON_NEW: "true"`.
 
@@ -400,10 +353,12 @@ pipelines:
             - zagware-scan-results/**
 ```
 
-> **Security-conscious consumers:** once `:stable` exists (see
-> [Image tags and release channels](#image-tags-and-release-channels)), pin it — or better, pin
-> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. The `:latest` shown
-> above has no cooling-off period or CVE gate.
+> **Security-conscious consumers:** the `:latest` shown above has no cooling period and no CVE
+> gate. Pin `:stable` once it exists, or pin
+> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. In the meantime the
+> newest `:<version>-<date>` is the closest equivalent — a reviewed release rebuilt on a current
+> base, and immutable. See
+> [Image tags and release channels](#image-tags-and-release-channels).
 
 ---
 
@@ -467,10 +422,12 @@ steps:
 > than empty — define both pipeline variables when you add these flags, or the scanner receives
 > a garbage URL/token and attempts (and fails) a platform upload on every run.
 
-> **Security-conscious consumers:** once `:stable` exists (see
-> [Image tags and release channels](#image-tags-and-release-channels)), pin it — or better, pin
-> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. The `:latest` shown
-> above has no cooling-off period or CVE gate.
+> **Security-conscious consumers:** the `:latest` shown above has no cooling period and no CVE
+> gate. Pin `:stable` once it exists, or pin
+> `ghcr.io/zagware/zagware-scanner@sha256:<digest>` from the release notes. In the meantime the
+> newest `:<version>-<date>` is the closest equivalent — a reviewed release rebuilt on a current
+> base, and immutable. See
+> [Image tags and release channels](#image-tags-and-release-channels).
 
 `BUILD_REPOSITORY_NAME` is required for the `repo_base_url` link in platform uploads — without it the
 scanner still works, but that link is omitted. `SYSTEM_TEAMPROJECT` and repository names containing
@@ -881,6 +838,100 @@ untrusted input either way. What it changes is the expectation: these numbers wi
 workflow reports them every week instead, so a wait that becomes a genuine stall is visible rather
 than assumed away. If one of these projects goes quiet the way Checkmarx did, that report is what
 says so, and the KICS build stage in the [`Dockerfile`](Dockerfile) is already the template.
+
+### Why promotion works the way it does
+
+The short version is in [Promotion workflow](#promotion-workflow). This is the evidence behind it,
+because both design choices look wrong until you see the numbers.
+
+**What "actionable" means, and why the gate is not simply zero.** The image bundles five
+third-party Go binaries. Most of their CRITICAL/HIGH findings are Go `stdlib` advisories baked in
+by whichever toolchain the vendor compiled with. Grype reports those as *fixed* — Go published the
+patch — but the fix is applied by the vendor rebuilding, not by anything we can pin. On
+2026-08-25 the published image carried 50 CRITICAL/HIGH, of which **32 were exactly that**.
+Upgrading every bundled tool to its newest upstream release still left 25.
+
+A gate demanding zero was therefore unsatisfiable by construction, and it had blocked every
+scheduled promotion since the workflow was written: `:stable` did not exist, so the README told
+users to pin `:latest`, which has no CVE gate at all. A gate that can only pass on a condition no
+action of ours produces is not a gate.
+
+So promotion blocks on the findings a base re-pin or a version bump would clear:
+
+| Finding | Remedy | Gate |
+|---|---|---|
+| OS package (Wolfi base) | re-pin `WOLFI_DIGEST` | **blocks** |
+| Anything in `kics` | ours — we build it from source | **blocks** |
+| Vendored *module* in a vendor binary, **newer release exists** | bump that tool's pin | **blocks** |
+| Vendored *module* in a vendor binary, **already on latest** | no released fix yet | reported |
+| Go `stdlib` in a vendor binary | only that vendor's next release | reported |
+| No fix published anywhere | nobody can clear it | reported |
+
+Nothing is hidden by this. The full total is printed in the run summary, written into the signed
+promotion attestation (`cveScan.highOrCriticalCount`, `.fixableCount`, `.actionableCount`), and
+tracked per owning binary by the weekly
+[tool-currency workflow](.github/workflows/tool-currency.yml), which escalates when a vendor goes
+quiet while carrying them. The list of vendor-built binaries is declared in
+[`promote.yml`](.github/workflows/promote.yml) and [`audit.yml`](.github/workflows/audit.yml) and
+held identical by a test; `kics` is deliberately not on it.
+
+**Why the clock runs on the release, not the image.** The two halves of the gate used to fight
+each other. The remedy for a blocking CVE is a rebuild; a rebuild mints a new digest; and the
+cooling period was measured from the digest's creation — so fixing a CVE reset the soak to zero
+and started a fresh 7-day wait, during which the next advisory could land and reset it again.
+
+That is not a hypothetical race. Every finding from the last quarter that would trip this gate,
+with its disclosure date:
+
+| Date | Arrival | Class |
+|---|---|---|
+| 2026-05-22 | GO-2026-5026 | `kics` stdlib |
+| 2026-06-02 | GO-2026-5037 | `kics` stdlib |
+| 2026-07-07 | GO-2026-4970 | `kics` stdlib |
+| 2026-07-14 | GO-2026-5942 | `kics` stdlib |
+| 2026-07-14 | GO-2026-5970 `x/text` | vendor module |
+| 2026-07-15 | `busybox` ×4 | OS |
+| 2026-08-05 | CVE-2026-54876 `openssl` | OS |
+| 2026-08-07 | GHSA-hc8v-wwc9-vgxm `go-git` | vendor module |
+| 2026-08-13 | GO-2026-5972/6088/6089/6090 + CVE-2026-14456 | `kics` stdlib + OS |
+
+Eight arrival events in 83 days, i.e. $\lambda \approx 0.096\,\text{day}^{-1}$, so a clean 7-day
+window had probability
+
+$$P = e^{-0.096 \times 7} \approx 0.51$$
+
+A coin flip per attempt, with every loss restarting the clock and no guarantee of ever converging.
+Note the cluster from 2026-07-07 to 2026-07-15 — four arrivals in nine days, a stretch in which the
+gate could not have closed at all.
+
+So the soak now runs on the **release**. The cooling period exists to catch functional
+regressions, and those live in the commit: our code and our tool pins. An OS package refresh
+changes neither. `promote.yml` reads `org.opencontainers.image.version` off the candidate digest
+— a label baked in at build time, so it cannot be re-pointed afterwards — and measures the age of
+*that release*. A weekly job in [`publish.yml`](.github/workflows/publish.yml) rebuilds the
+current release on whatever the base serves today and republishes it as `:latest` plus an
+immutable `:<version>-<date>`. Because the release has already soaked, the refreshed digest is
+promotable the moment it lands, and OS CVEs close within a week without ever restarting the wait.
+
+The honest cost: `:stable` can point at a digest that was never itself `:latest` in anyone's
+pipeline. The delta from the soaked digest is Wolfi package versions only — same commit, same tool
+pins, same scanner code — and CI's full smoke test runs against the rebuild before it is
+published. A genuinely new release still soaks the full 7 days, which is the case the gate is for.
+
+`:<version>` is never republished. It is documented as immutable per release and people pin it, so
+a refresh takes a dated tag of its own instead of moving it.
+
+**The cooling period was never the original blocker.** Worth saying plainly, because it is the
+obvious suspect: on 2026-08-25 the candidate digest was 18 days old against a 7-day requirement.
+Every promotion run cleared the age gate and then failed the CVE gate.
+
+**Why 7 days.** It was originally 14, which in practice mostly delayed *security fixes* reaching
+the channel recommended for production — the opposite of the intent. Every regression we have
+actually shipped surfaced within hours to a day or two, not weeks. The value is set once as
+`COOLING_DAYS` in [`promote.yml`](.github/workflows/promote.yml); it used to be the literal `14`
+repeated in six places, including operator-facing error messages, which is how a gate and its own
+error text drift apart.
+
 
 ### Our vulnerability posture
 
