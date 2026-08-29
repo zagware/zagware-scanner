@@ -96,6 +96,13 @@ jobs:
     # It cannot touch :stable or :secure -- only promote.yml moves those, and
     # only after its own scan. The residual exposure is that a moved git tag
     # would be rebuilt unreviewed, which the ancestor check is there to catch.
+    #
+    # "refresh" is configured with a deployment branch policy allowing `main`
+    # only. Scheduled runs can only ever fire on the default branch anyway, so
+    # the policy costs nothing -- what it buys is that a pushed branch carrying
+    # an edited copy of this workflow cannot reach the unreviewed environment.
+    # "release" deliberately has NO branch policy: it is entered from tag
+    # pushes, and a branch-only policy there would reject every real publish.
     environment: ${{ github.event_name == 'schedule' && 'refresh' || 'release' }}
 
     steps:
