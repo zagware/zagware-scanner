@@ -10,6 +10,13 @@ Versions are published as container tags — see the
 
 ## [Unreleased]
 
+## [3.4.0] — 2026-10-23
+
+Go 1.26.10 for the source-built binaries and freshly pinned bases, in response
+to the eMudhra intermediate CA key compromise (CVE-2026-111943), plus the
+promotion-gate and weekly-refresh work merged since 3.3.0. Scanner code is
+unchanged; the image contents move, so `__version__` bumps to 3.4.0.
+
 ### Changed
 
 - **The promotion cooling period now runs on the release, not the candidate
@@ -103,6 +110,16 @@ Versions are published as container tags — see the
   is: these will sit for months, not weeks. That is precisely why they must not
   gate a release, and why the currency workflow reports them weekly so a wait
   that becomes a stall is visible rather than assumed away.
+
+### Security
+
+- **Go toolchain 1.26.7 → 1.26.10 for the KICS and govulncheck builds.**
+  1.26.10 makes `crypto/x509` reject chains containing the eight compromised
+  eMudhra intermediate keys (CVE-2026-111943, go.dev/issue/82345); binaries
+  built with older toolchains accept certificates forged with those keys.
+- **Wolfi and Debian base digests re-pinned** (2026-10-23), picking up the
+  `ca-certificates` updates that drop the emSign / `AAA Certificate Services`
+  roots the compromised intermediates chain to.
 
 ## [3.3.0] — 2026-08-25
 
@@ -686,6 +703,7 @@ remediation, not new features.
 ### Added
 - Grype SCA scanning alongside KICS IaC scanning, unified into a single scanner.
 
+[3.4.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.4.0
 [3.3.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.3.0
 [3.2.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.2.0
 [3.1.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.1.0

@@ -65,7 +65,11 @@ import hashlib
 # :stable exist at all. Scanner code is unchanged, but betterleaks 1.8.x splits
 # generic-api-key into three rules, so some secrets findings change rule id and
 # therefore similarity_id once. See CHANGELOG.md.
-__version__ = "3.3.0"
+#
+# 3.4.0 builds KICS and govulncheck with Go 1.26.10, whose crypto/x509 rejects
+# the compromised eMudhra intermediate keys (CVE-2026-111943), and re-pins the
+# Wolfi and Debian bases. Scanner code is unchanged. See CHANGELOG.md.
+__version__ = "3.4.0"
 
 # Boolean-shaped env vars previously used five different, mutually incompatible
 # parsing conventions (.lower()=="true", .lower()!="false", bare truthiness, and
