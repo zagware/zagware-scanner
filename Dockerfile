@@ -19,20 +19,22 @@
 # pin can eventually become unpullable. That forces periodic re-pinning, which
 # a rolling base wants anyway. Mirror the digest into our own registry if
 # reproducible rebuilds of old tags ever become a hard requirement.
-ARG WOLFI_DIGEST=sha256:a31344ab2cb8618db84f535eec56f76f6178b142cb92cb2e48676cc2dcebea72
+ARG WOLFI_DIGEST=sha256:f15fea2f49cb14dceaea491fcbde0d35e0c190126a744ac05a9838440d47d994
 
 # Debian is still used for the download/verify stage only: it has dpkg, which
 # the Syft and Grype .deb artifacts need. Nothing from this stage's filesystem
 # reaches the runtime image except the four verified binaries.
-ARG DEBIAN_DIGEST=sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+ARG DEBIAN_DIGEST=sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 
 # Go toolchain for the KICS build. The toolchain version is a security input,
 # not an implementation detail -- KICS's go.mod declares go 1.26.2, and that
 # exact stdlib is what the released binary was compiled against and what showed
 # up as stdlib CVEs in scans of this image. The toolchain is re-pinned whenever
 # a Go patch release closes stdlib advisories that appear in our own scans:
-# 1.26.5 left five (GO-2026-5026/5972/5942/6088/6090), all fixed in 1.26.6, so
-# this now tracks 1.26.7. Every stdlib finding attributed to `kics` is ours to
+# 1.26.5 left five (GO-2026-5026/5972/5942/6088/6090), all fixed in 1.26.6;
+# 1.26.10 adds the crypto/x509 blocklist for the compromised eMudhra
+# intermediate keys (CVE-2026-111943), so this now tracks 1.26.10. Every
+# stdlib finding attributed to `kics` is ours to
 # clear here -- unlike the vendor-built binaries, where only the vendor's next
 # release can move the number.
 #
@@ -41,8 +43,8 @@ ARG DEBIAN_DIGEST=sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4
 # two FROMs here and the pullability check in tool-currency.yml -- none of
 # which any test tied to GO_DIGEST, so a re-pin could leave a tag and a digest
 # that disagree and nothing would say so.
-ARG GO_VERSION=1.26.7
-ARG GO_DIGEST=sha256:dc2521c2a906db43073b8b4d99f491b6341cf15610b6ebbab187c45153f9959e
+ARG GO_VERSION=1.26.10
+ARG GO_DIGEST=sha256:672c944cfd07599b5f1bb179869270cdc94c6254e41db4d431259693cb286b82
 
 # ── KICS: built from source at a pinned commit, not downloaded ────────────────
 # Checkmarx stopped publishing release binaries after v2.1.20 -- v2.1.21 is a
