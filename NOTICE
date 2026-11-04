@@ -18,31 +18,34 @@ KICS
                (the commit the v2.1.21 tag points to; Checkmarx published no
                release binaries for this version)
   Query rules: vendored from the same commit, so binary and rules cannot drift
+  Modules:   golang.org/x/net, google.golang.org/grpc and go-jose/v4 are
+             raised above the commit's go.mod to patched releases at build
+             time (see the KICS stage in Dockerfile)
 
 Syft
   Vendor:    Anchore
   License:   Apache-2.0
   Source:    https://github.com/anchore/syft
-  Version:   v1.51.0
+  Version:   v1.56.0
   Role:      Generates the SBOM that Grype scans for known vulnerabilities.
 
 Grype
   Vendor:    Anchore
   License:   Apache-2.0
   Source:    https://github.com/anchore/grype
-  Version:   v0.117.0
+  Version:   v0.121.1
 
 betterleaks
   Vendor:    betterleaks
   License:   MIT
   Source:    https://github.com/betterleaks/betterleaks
-  Version:   1.8.1
+  Version:   1.9.0
 
 osv-scanner
   Vendor:    Google
   License:   Apache-2.0
   Source:    https://github.com/google/osv-scanner
-  Version:   v2.5.1
+  Version:   v2.7.0
   Role:      Cross-ecosystem advisory matching in both images; call analysis
              in the :reachability variant only.
 

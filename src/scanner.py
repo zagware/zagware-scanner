@@ -69,7 +69,13 @@ import hashlib
 # 3.4.0 builds KICS and govulncheck with Go 1.26.10, whose crypto/x509 rejects
 # the compromised eMudhra intermediate keys (CVE-2026-111943), and re-pins the
 # Wolfi and Debian bases. Scanner code is unchanged. See CHANGELOG.md.
-__version__ = "3.4.0"
+#
+# 3.5.0 bumps Syft, Grype, betterleaks and osv-scanner, overrides three
+# vulnerable modules in the KICS source build, and re-pins every base: the
+# actionable critical/high that kept :stable from ever being promoted. Scanner
+# code is unchanged; betterleaks 1.9.0 adds 46 rules, so new secrets findings
+# can appear once. See CHANGELOG.md.
+__version__ = "3.5.0"
 
 # Boolean-shaped env vars previously used five different, mutually incompatible
 # parsing conventions (.lower()=="true", .lower()!="false", bare truthiness, and

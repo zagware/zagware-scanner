@@ -11,14 +11,16 @@ name: Audit Stable Image
 
 on:
   schedule:
-    # Weekly on Mondays at 06:00 UTC
-    - cron: '0 6 * * 1'
+    # Weekly on Mondays at 06:37 UTC -- off the hour, where GitHub delays
+    # scheduled runs least, and clear of promote.yml's daily 06:17.
+    - cron: '37 6 * * 1'
   workflow_dispatch:
 
 jobs:
   audit:
     name: Scan :stable for new CVEs
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       issues: write
       contents: read
@@ -182,28 +184,33 @@ jobs:
       - name: Open issue for new CVEs
         if: steps.stable.outputs.skip != 'true' && steps.scan.outputs.actionable_count != '0'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        # Env vars, not ${{ }} spliced into the script source -- see promote.yml.
+        env:
+          ACTIONABLE_COUNT: ${{ steps.scan.outputs.actionable_count }}
+          FIXABLE_COUNT: ${{ steps.scan.outputs.fixable_count }}
+          HIGH_COUNT: ${{ steps.scan.outputs.high_count }}
+          DIGEST: ${{ steps.stable.outputs.digest }}
         with:
           script: |
-            const count = '${{ steps.scan.outputs.actionable_count }}';
-            const fixable = '${{ steps.scan.outputs.fixable_count }}';
-            const total = '${{ steps.scan.outputs.high_count }}';
-            const digest = '${{ steps.stable.outputs.digest }}';
+            const { ACTIONABLE_COUNT: count, FIXABLE_COUNT: fixable,
+                    HIGH_COUNT: total, DIGEST: digest } = process.env;
 
             // Check if an issue already exists for this digest
-            const issues = await github.rest.issues.listForRepo({
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               state: 'open',
-              labels: 'security,audit-cve'
+              labels: 'security,audit-cve',
+              per_page: 100,
             });
 
-            const existing = issues.data.find(i => i.body && i.body.includes(digest));
+            const existing = issues.find(i => i.body && i.body.includes(digest));
             if (existing) {
               console.log(`Issue already exists: ${existing.html_url}`);
               return;
             }
 
-            github.rest.issues.create({
+            await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: `Audit alert: ${count} actionable HIGH/CRITICAL CVEs in :stable (${digest.substring(0, 19)})`,

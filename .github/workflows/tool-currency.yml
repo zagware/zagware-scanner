@@ -29,9 +29,10 @@ name: Tool currency
 
 on:
   schedule:
-    # Mondays 07:00 UTC — a day after the promote cron, so a fresh :stable is
-    # already in place when the report lands.
-    - cron: '0 7 * * 1'
+    # Mondays 07:47 UTC -- the morning after publish.yml's Sunday base refresh,
+    # so CVE attribution measures the freshest image. Off the hour, where
+    # GitHub delays scheduled runs least.
+    - cron: '47 7 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -52,6 +53,7 @@ jobs:
   currency:
     name: Check upstream releases and CVE attribution
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       issues: write   # open/update the single currency issue
@@ -72,36 +74,64 @@ jobs:
         run: |
           set -euo pipefail
 
-          # repo|pinned|label. KICS is compared by tag even though we build it
-          # from source: the question "is there a newer KICS" is unchanged by
-          # how we obtain it.
+          # where|pinned|label|origin. `origin` says where a newer version
+          # comes from and what the report may recommend:
+          #   binary  vendor-built release binary, looked up as a GitHub release
+          #   source  GitHub release we compile ourselves (see the escalation
+          #           rule in the issue step)
+          #   gomod   Go module we `go install`, looked up on proxy.golang.org
+          # KICS is compared by tag even though we build it from source: the
+          # question "is there a newer KICS" is unchanged by how we obtain it.
           #
           # osv-scanner belongs here for the same reason as the rest -- it is a
           # pinned third-party binary in BOTH published images -- and it was
           # missing until the 2026-08-25 review, which is how its pin sat at
           # v2.4.0 for 68 days, two releases behind, carrying 11 critical/high,
           # the worst of any bundled tool, with nothing reporting it.
+          # govulncheck was missing the same way: pinned at v1.1.4 in the
+          # reachability image while golang.org/x/vuln reached v1.9.0. Its
+          # GitHub mirror still marks a stale v1.1.4 *release* as latest, so a
+          # release lookup would have called it current; the module proxy is
+          # the authority for a module.
           TOOLS=$(cat <<EOF
-          Checkmarx/kics|v${KICS_VERSION}|KICS
-          anchore/syft|${SYFT_VERSION}|Syft
-          anchore/grype|${GRYPE_VERSION}|Grype
-          betterleaks/betterleaks|v${BETTERLEAKS_VERSION}|betterleaks
-          google/osv-scanner|${OSV_SCANNER_VERSION}|osv-scanner
+          Checkmarx/kics|v${KICS_VERSION}|KICS|source
+          anchore/syft|${SYFT_VERSION}|Syft|binary
+          anchore/grype|${GRYPE_VERSION}|Grype|binary
+          betterleaks/betterleaks|v${BETTERLEAKS_VERSION}|betterleaks|binary
+          google/osv-scanner|${OSV_SCANNER_VERSION}|osv-scanner|binary
+          golang.org/x/vuln|${GOVULNCHECK_VERSION}|govulncheck|gomod
           EOF
           )
 
           echo "[]" > /tmp/tools.json
           NOW=$(date -u +%s)
 
-          while IFS='|' read -r repo pinned label; do
+          while IFS='|' read -r repo pinned label origin; do
             [ -n "$repo" ] || continue
 
-            # Latest release by tag. Falls back to the newest tag when a project
-            # stops cutting releases -- which is exactly the KICS failure mode,
-            # so treating "no releases" as "up to date" would hide it.
-            LATEST=$(gh api "repos/${repo}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
-            if [ -z "$LATEST" ]; then
-              LATEST=$(gh api "repos/${repo}/tags?per_page=1" --jq '.[0].name' 2>/dev/null || echo "")
+            if [ "$origin" = gomod ]; then
+              MOD=$(curl -fsS "https://proxy.golang.org/${repo}/@latest" 2>/dev/null || echo "{}")
+              LATEST=$(printf '%s' "$MOD" | jq -r '.Version // empty')
+              PUBLISHED=$(printf '%s' "$MOD" | jq -r '.Time // empty')
+              ASSETS=0   # nothing to download; `go install` builds it
+            else
+              # Latest release by tag. Falls back to the highest semver tag
+              # when a project stops cutting releases -- which is exactly the
+              # KICS failure mode, so treating "no releases" as "up to date"
+              # would hide it. Highest by `sort -V`, not the tags API's first
+              # entry, whose order is not a version order.
+              LATEST=$(gh api "repos/${repo}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+              if [ -z "$LATEST" ]; then
+                LATEST=$(gh api "repos/${repo}/tags?per_page=100" --jq '.[].name' 2>/dev/null \
+                           | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+              fi
+              PUBLISHED=$(gh api "repos/${repo}/releases/latest" --jq '.published_at' 2>/dev/null || echo "")
+              # Does the newest release actually ship a linux_amd64 artifact? A
+              # tag with no binaries is the precise thing that stranded us on
+              # KICS v2.1.20, and it is invisible from a version number alone.
+              ASSETS=$(gh api "repos/${repo}/releases/latest" \
+                         --jq '[.assets[].name | select(test("linux[_-]amd64|linux_x64"))] | length' \
+                         2>/dev/null || echo 0)
             fi
             [ -n "$LATEST" ] || LATEST="unknown"
 
@@ -112,7 +142,6 @@ jobs:
             # have escalated every tool on any runner whose `date` lacks GNU
             # `-d`. Same fabricated-fallback class SUP-01 removed from the CVE
             # gates; caught by dry-running this on a BSD `date`.
-            PUBLISHED=$(gh api "repos/${repo}/releases/latest" --jq '.published_at' 2>/dev/null || echo "")
             PUB_TS=""
             if [ -n "$PUBLISHED" ]; then
               PUB_TS=$(date -u -d "$PUBLISHED" +%s 2>/dev/null || echo "")
@@ -123,21 +152,16 @@ jobs:
               AGE=-1   # unknown, and reported as unknown -- not as fresh, not as stale
             fi
 
-            # Does the newest release actually ship a linux_amd64 artifact? A
-            # tag with no binaries is the precise thing that stranded us on
-            # KICS v2.1.20, and it is invisible from a version number alone.
-            ASSETS=$(gh api "repos/${repo}/releases/latest" \
-                       --jq '[.assets[].name | select(test("linux[_-]amd64|linux_x64"))] | length' \
-                       2>/dev/null || echo 0)
-
             BEHIND=false
             [ "$pinned" != "$LATEST" ] && BEHIND=true
 
             jq -c --arg repo "$repo" --arg label "$label" --arg pinned "$pinned" \
                   --arg latest "$LATEST" --argjson age "$AGE" \
                   --argjson assets "${ASSETS:-0}" --argjson behind "$BEHIND" \
+                  --argjson source "$([ "$origin" = binary ] && echo false || echo true)" \
               '. += [{repo:$repo,label:$label,pinned:$pinned,latest:$latest,
-                      age_days:$age,linux_assets:$assets,behind:$behind}]' \
+                      age_days:$age,linux_assets:$assets,behind:$behind,
+                      source:$source}]' \
               /tmp/tools.json > /tmp/tools.next && mv /tmp/tools.next /tmp/tools.json
           done <<< "$TOOLS"
 
@@ -203,37 +227,57 @@ jobs:
           # not GC this way, but they are checked identically -- a pin that
           # cannot be fetched is the same outage whatever the registry's policy.
           #
-          # Three states, not two. `docker manifest inspect` failing does NOT
-          # mean the digest is gone: on 2026-08-24 this reported BOTH Docker Hub
-          # pins as UNPULLABLE and told a human "the next build will fail",
-          # while an authenticated registry HEAD showed both digests present and
-          # returning 200. The runner had simply hit Docker Hub's anonymous
-          # pull limit, which cgr.dev does not impose -- hence Wolfi passing in
-          # the same run. Reporting a rate-limit as a dead pin is the same
+          # Three states, not two. A failed lookup does NOT mean the digest is
+          # gone: on 2026-08-24 this reported BOTH Docker Hub pins as
+          # UNPULLABLE and told a human "the next build will fail", while an
+          # authenticated registry HEAD showed both digests present and
+          # returning 200. Reporting a failed lookup as a dead pin is the same
           # fabricated-answer class SUP-01 removed from the CVE gates: a failed
           # lookup is "unknown", and it must say so.
+          #
+          # A registry HEAD on the manifest, not `docker manifest inspect`.
+          # That command never got an answer for the two Docker Hub pins: it
+          # GETs the manifest (which Docker Hub meters against the shared
+          # runner IP's anonymous pull limit) and then re-verifies the digest
+          # client-side, failing with "manifest verification failed for
+          # digest" even when the registry served it -- so Debian and Go were
+          # reported UNRESOLVED every week and never actually checked. A HEAD
+          # is not metered, and its status code IS the registry's answer:
+          # 200 present, 404 gone, anything else unknown.
           echo "[]" > /tmp/bases.json
           check() {
-            local name="$1" ref="$2" err=""
-            if err=$(docker manifest inspect "$ref" 2>&1 >/dev/null); then
-              S=ok
-            elif printf '%s' "$err" | grep -qiE 'manifest unknown|not found|no such manifest|MANIFEST_UNKNOWN'; then
-              # The registry answered, and the answer was "that digest is gone".
-              S=UNPULLABLE
-            else
-              # Rate limit, auth failure, DNS, timeout -- the registry never
-              # told us anything about the digest.
-              S=UNRESOLVED
+            local name="$1" registry="$2" repo="$3" digest="$4"
+            local challenge realm service token code S detail
+            local auth=()
+            # Anonymous bearer token, from whatever realm the registry names.
+            challenge=$(curl -sS -o /dev/null -D - "https://${registry}/v2/" 2>/dev/null \
+                          | tr -d '\r' | grep -i '^www-authenticate:' || true)
+            realm=$(printf '%s' "$challenge" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')
+            service=$(printf '%s' "$challenge" | sed -n 's/.*service="\([^"]*\)".*/\1/p')
+            if [ -n "$realm" ]; then
+              token=$(curl -fsS --get "$realm" \
+                        --data-urlencode "service=${service}" \
+                        --data-urlencode "scope=repository:${repo}:pull" 2>/dev/null \
+                        | jq -r '.token // .access_token // empty' || true)
+              [ -z "$token" ] || auth=(-H "Authorization: Bearer ${token}")
             fi
-            echo "  $name: $S${err:+ -- ${err%%$'\n'*}}"
-            jq -c --arg n "$name" --arg s "$S" --arg e "${err%%$'\n'*}" \
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -I "${auth[@]}" \
+                     -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+                     "https://${registry}/v2/${repo}/manifests/${digest}" 2>/dev/null || true)
+            case "$code" in
+              200) S=ok;         detail="" ;;
+              404) S=UNPULLABLE; detail="HTTP 404 from ${registry}: manifest unknown" ;;
+              *)   S=UNRESOLVED; detail="HTTP ${code:-000} from ${registry}: no answer about the digest" ;;
+            esac
+            echo "  $name: $S${detail:+ -- $detail}"
+            jq -c --arg n "$name" --arg s "$S" --arg e "$detail" \
               '. += [{name:$n,status:$s,detail:$e}]' \
               /tmp/bases.json > /tmp/b.next && mv /tmp/b.next /tmp/bases.json
           }
           echo "Base image pins:"
-          check "Wolfi (runtime)"  "cgr.dev/chainguard/wolfi-base@${WOLFI_DIGEST}"
-          check "Debian (builder)" "debian:bookworm-slim@${DEBIAN_DIGEST}"
-          check "Go (kics build)"  "golang:${GO_VERSION}@${GO_DIGEST}"
+          check "Wolfi (runtime)"                "cgr.dev"              "chainguard/wolfi-base" "$WOLFI_DIGEST"
+          check "Debian (builder)"               "registry-1.docker.io" "library/debian"        "$DEBIAN_DIGEST"
+          check "Go ${GO_VERSION} (kics build)"  "registry-1.docker.io" "library/golang"        "$GO_DIGEST"
 
       - name: Open or update the currency issue
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -250,29 +294,36 @@ jobs:
             // Map a repo label to the binary name grype attributes CVEs to.
             const binaryOf = { KICS: 'kics', Syft: 'syft', Grype: 'grype',
                                betterleaks: 'betterleaks',
-                               'osv-scanner': 'osv-scanner' };
+                               'osv-scanner': 'osv-scanner',
+                               govulncheck: 'govulncheck' };
 
-            const rows = [], escalations = [], behind = [];
+            const rows = [], escalations = [], behind = [], ours = [];
             for (const t of tools) {
               const c = cves[binaryOf[t.label]] || { total: 0, fixable: 0 };
-              const noAssets = t.linux_assets === 0;
+              const noAssets = !t.source && t.linux_assets === 0;
               // age_days === -1 means the release date could not be resolved.
               // Treated as escalating (fail closed, consistent with the rest of
               // this repo's gates) but reported honestly as unknown rather than
               // as a day count we do not have.
               const unknownAge = t.age_days < 0;
               const isStale    = t.age_days > stale || unknownAge;
-              const escalate   = c.fixable > 0 && (isStale || noAssets);
+              // The escalation recommends building from source, which is
+              // meaningless for a tool we already build from source -- KICS
+              // sat permanently "escalated" for having no release binary we
+              // do not use. For those, a fixable finding is ours to clear with
+              // a module override or a toolchain bump, and says so instead.
+              const escalate   = !t.source && c.fixable > 0 && (isStale || noAssets);
 
               if (t.behind) behind.push(t.label);
               if (escalate) escalations.push({ ...t, ...c, noAssets, unknownAge });
+              if (t.source && c.fixable > 0) ours.push({ ...t, ...c });
 
               rows.push(`| ${t.label} | \`${t.pinned}\` | \`${t.latest}\` | ` +
                         `${t.behind ? '**yes**' : 'no'} | ` +
                         `${t.age_days < 0 ? '?' : t.age_days + 'd'} | ` +
-                        `${noAssets ? '**none**' : t.linux_assets} | ` +
+                        `${t.source ? 'n/a (source build)' : noAssets ? '**none**' : t.linux_assets} | ` +
                         `${c.total} (${c.fixable} fixable) | ` +
-                        `${escalate ? '🔴 **escalate**' : 'ok'} |`);
+                        `${escalate ? '🔴 **escalate**' : t.source && c.fixable > 0 ? '🟠 **ours**' : 'ok'} |`);
             }
 
             const deadBases    = bases.filter(b => b.status === 'UNPULLABLE');
@@ -305,6 +356,15 @@ jobs:
               body += `\n`;
             }
 
+            if (ours.length) {
+              body += `## 🟠 Source-built tools carrying fixable CVEs\n\n`;
+              body += `We compile these, so no vendor release is needed: bump the vulnerable `;
+              body += `module with a \`go get\` override in the Dockerfile's build stage, or `;
+              body += `bump \`GO_VERSION\` for \`stdlib\` findings. promote.yml blocks on these.\n\n`;
+              for (const o of ours) body += `- **${o.label}** — ${o.fixable} fixable crit/high\n`;
+              body += `\n`;
+            }
+
             if (deadBases.length) {
               body += `## 🔴 Base image pin unresolvable\n\n`;
               body += `The registry answered, and the digest is gone — the next build will fail.\n\n`;
@@ -314,16 +374,15 @@ jobs:
 
             if (unknownBases.length) {
               body += `## ⚠️ Base image pin not checked this run\n\n`;
-              body += `The registry lookup itself failed, so nothing is known about these `;
-              body += `digests either way. A Docker Hub anonymous pull-rate limit on the `;
-              body += `runner is the usual cause and it clears by itself; this is reported `;
-              body += `rather than counted as a dead pin, because guessing which one it was `;
-              body += `is how a rate limit gets read as an outage.\n\n`;
+              body += `The registry did not answer the manifest HEAD (rate limit, auth `;
+              body += `failure, DNS or timeout), so nothing is known about these digests `;
+              body += `either way. This is reported rather than counted as a dead pin, `;
+              body += `because guessing is how a transient failure gets read as an outage.\n\n`;
               for (const b of unknownBases) body += `- **${b.name}**: ${b.detail || b.status}\n`;
               body += `\n`;
             }
 
-            if (!behind.length && !escalations.length && !deadBases.length && !unknownBases.length) {
+            if (!behind.length && !escalations.length && !ours.length && !deadBases.length && !unknownBases.length) {
               body += `✅ Everything pinned is current, every pin resolves, and nothing is `;
               body += `carrying fixable CVEs against a stale upstream.\n`;
             }
@@ -344,7 +403,7 @@ jobs:
                 issue_number: existing.data[0].number, body,
               });
               core.info(`Updated issue #${existing.data[0].number}`);
-            } else if (behind.length || escalations.length || deadBases.length || unknownBases.length) {
+            } else if (behind.length || escalations.length || ours.length || deadBases.length || unknownBases.length) {
               const created = await github.rest.issues.create({
                 owner: context.repo.owner, repo: context.repo.repo,
                 title: TITLE, body, labels: ['security', 'tool-currency'],

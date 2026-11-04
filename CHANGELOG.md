@@ -10,6 +10,112 @@ Versions are published as container tags — see the
 
 ## [Unreleased]
 
+## [3.5.0] — 2026-11-04
+
+Every bundled vendor binary moved to its current release, three vulnerable
+modules overridden in the KICS source build, and every base re-pinned. `:stable`
+and `:secure` still do not exist. Eleven blocked-promotion issues were filed
+between 2026-08-14 and 2026-11-01, and the 2026-11-03 run was blocked by **40**
+actionable critical/high. Scanner code is unchanged.
+
+Measured on a local build of this tree with Grype's 2026-11-04 database, using
+promote.yml's own gate logic:
+
+| | 3.4.0 `:latest` (2026-11-03 run) | 3.5.0 |
+|---|---|---|
+| Critical/High | 108 | **30** |
+| With an upstream fix | 104 | **25** |
+| Actionable by us (the promotion gate) | 40 | **0** |
+
+The remaining 25 fixable are Go `stdlib` inside betterleaks (go1.25.12, 14) and
+osv-scanner (go1.27.0, 11), both on their newest release. The 5 unfixable are
+three `containerd` v1 advisories in KICS, GO-2026-4887 (`docker/docker`) in
+Grype and CVE-2026-119586 in Wolfi's `sqlite-libs`.
+
+### Security
+
+- **Syft v1.51.0 → v1.56.0, Grype v0.117.0 → v0.121.1.** Both are now built
+  with go1.27.3 and vendor x/net v0.61.0, x/crypto v0.58.0, grpc v1.84.0,
+  go-jose v4.1.6 and containerd/v2 v2.4.2: clears GO-2026-6603/6610/6611/6612/
+  6617, GO-2026-6354/6355, GHSA-2v4p-qf9q-27wj, GHSA-vp52-pcj8-j9qc,
+  GHSA-mgcc-cww5-fp2q and GHSA-p7v4-vr35-mj6f in both binaries, and every
+  `stdlib` finding they carried.
+- **osv-scanner v2.5.1 → v2.7.0** (x/net v0.61.0, grpc v1.84.0).
+- **betterleaks 1.8.1 → 1.9.0.**
+- **KICS source build overrides `golang.org/x/net` v0.56.0 → v0.61.0,
+  `google.golang.org/grpc` v1.82.1 → v1.83.2 and `go-jose/v4` v4.1.4 → v4.1.6**
+  with `go get` before compiling (MVS raises x/crypto, x/sys, x/text and x/tools
+  with them). Every module is verified against sum.golang.org.
+- **Wolfi, Debian and `golang:1.26.10` digests re-pinned.** The Go tag was
+  rebuilt upstream onto a newer Debian base, so its index digest moved.
+- **The runtime image now runs `apk upgrade` before `apk add`.** The packages
+  that ship inside the pinned `wolfi-base` digest (glibc, libcrypto3/libssl3,
+  busybox, zlib) were never upgraded by the weekly refresh, only the packages
+  added on top of it, so a fix to any of them waited for a manual re-pin.
+
+### Changed
+
+- **betterleaks 1.9.0 adds 46 detection rules**, so secrets findings that no
+  rule matched before can appear once as net-new. Empty reports are now `[]`
+  rather than `null`; the scanner already treats both as zero findings.
+- **KICS stays on v2.1.21 rather than v2.2.0**, a decision rather than an
+  oversight. v2.2.0 removes `--disable-full-descriptions`, which scanner.py
+  passes, so every IaC scan would fail on an unknown flag. It also adds an
+  unconditional request to the GitHub releases API on every scan, with a 20s
+  timeout and no flag to disable it: new egress from every consumer's CI.
+  The module overrides above deliver the same fixes v2.2.0 would have.
+- **govulncheck stays on v1.1.4** (upstream: v1.9.0). It ships only in the
+  opt-in reachability image, which the promotion gate does not scan.
+  tool-currency.yml now reports it.
+
+### CI and release workflows
+
+- **publish.yml verifies Syft and Grype through their Sigstore bundles.**
+  Anchore stopped publishing the detached `checksums.txt.pem`/`.sig` pair. The
+  old step would have hit a 404 and failed this release before building. Every
+  verification download now uses `curl -f`, so a missing asset fails at the
+  download instead of one step later as a cosign parse error.
+- **Build provenance uses `actions/attest`**, not
+  `actions/attest-build-provenance`. Since v4 the latter is only a wrapper, and
+  upstream directs new use to `actions/attest`, which promote.yml already pins.
+- **docker/setup-buildx-action v4.2.0 → v4.4.1, build-push-action v7.3.0 →
+  v7.4.0, login-action v4.6.0 → v4.7.0.** Every other action was already on
+  its latest release.
+- **promote.yml keeps exactly one open blocked-promotion issue.** Deduplication
+  was per digest, and every weekly refresh produces a new digest, so eleven
+  issues (#4, #9–#16, #18, #19) accumulated, all but the newest describing an
+  image that was no longer the candidate. A new block now closes the older
+  issues as superseded, and a successful promotion closes all of them. The
+  issue is created with `await`. Without it the create call was
+  fire-and-forget, and an API error never surfaced. Step outputs reach the
+  script as env vars instead of being spliced into its source.
+- **promote.yml's `version` dispatch input is removed.** Nothing read it, so a
+  manual run looked like it could promote an arbitrary version when it could
+  not. Overlapping runs are serialised with a concurrency group.
+- **audit.yml awaits its issue creation** and paginates the duplicate check.
+- **tool-currency.yml's base-pin check now actually checks the Docker Hub
+  pins.** `docker manifest inspect` failed every week on Debian and Go with
+  "manifest verification failed for digest", so both were reported unresolved
+  and never verified. The check is now a registry `HEAD`, which Docker Hub
+  does not meter, and its status code is the answer: 200 present, 404 gone,
+  anything else unknown.
+- **tool-currency.yml no longer tells us to build KICS from source.** KICS is
+  already built from source, so the "no linux/amd64 asset" escalation was
+  permanent noise. Source-built tools with fixable findings now get their own
+  section, which names the remedy (a module override or a `GO_VERSION` bump).
+  govulncheck is watched via proxy.golang.org: its GitHub mirror still marks a
+  stale v1.1.4 release as latest. The tag fallback now picks the highest
+  version with `sort -V` instead of the API's first entry.
+- **Scheduled runs moved off the top of the hour** (promote 06:17, audit Mon
+  06:37, tool-currency Mon 07:47). GitHub delays `:00` schedules under load,
+  and the daily `0 6` promote cron routinely started 4–7 hours late.
+- **Every job has a `timeout-minutes`**, instead of the 6-hour default. PR CI
+  cancels superseded runs.
+- **CI runs actionlint** (v1.7.12, SHA256-pinned) with shellcheck over every
+  workflow.
+- **Dependabot proposes GitHub Actions bumps** weekly, with a 7-day cooldown to
+  match `COOLING_DAYS`. Actions stay pinned to a SHA with a `# vX.Y.Z` comment.
+
 ## [3.4.0] — 2026-10-23
 
 Go 1.26.10 for the source-built binaries and freshly pinned bases, in response
@@ -703,6 +809,7 @@ remediation, not new features.
 ### Added
 - Grype SCA scanning alongside KICS IaC scanning, unified into a single scanner.
 
+[3.5.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.5.0
 [3.4.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.4.0
 [3.3.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.3.0
 [3.2.0]: https://github.com/zagware/zagware-scanner/releases/tag/v3.2.0

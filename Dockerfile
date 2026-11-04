@@ -19,12 +19,12 @@
 # pin can eventually become unpullable. That forces periodic re-pinning, which
 # a rolling base wants anyway. Mirror the digest into our own registry if
 # reproducible rebuilds of old tags ever become a hard requirement.
-ARG WOLFI_DIGEST=sha256:f15fea2f49cb14dceaea491fcbde0d35e0c190126a744ac05a9838440d47d994
+ARG WOLFI_DIGEST=sha256:771146c2dfc880902a185f060c3db5571473c46b267edd98c3119c83068dfb61
 
 # Debian is still used for the download/verify stage only: it has dpkg, which
 # the Syft and Grype .deb artifacts need. Nothing from this stage's filesystem
 # reaches the runtime image except the four verified binaries.
-ARG DEBIAN_DIGEST=sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+ARG DEBIAN_DIGEST=sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 
 # Go toolchain for the KICS build. The toolchain version is a security input,
 # not an implementation detail -- KICS's go.mod declares go 1.26.2, and that
@@ -44,7 +44,7 @@ ARG DEBIAN_DIGEST=sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43
 # which any test tied to GO_DIGEST, so a re-pin could leave a tag and a digest
 # that disagree and nothing would say so.
 ARG GO_VERSION=1.26.10
-ARG GO_DIGEST=sha256:672c944cfd07599b5f1bb179869270cdc94c6254e41db4d431259693cb286b82
+ARG GO_DIGEST=sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c
 
 # ── KICS: built from source at a pinned commit, not downloaded ────────────────
 # Checkmarx stopped publishing release binaries after v2.1.20 -- v2.1.21 is a
@@ -79,6 +79,26 @@ RUN git init -q . \
     && git fetch --depth=1 --quiet origin ${KICS_RULES_COMMIT} \
     && git checkout --quiet ${KICS_RULES_COMMIT}
 
+# Vendored-module overrides. We compile KICS, so a fixed module release is a
+# remedy we can apply ourselves -- promote.yml's gate counts every `kics`
+# finding as ours for exactly that reason. v2.1.21's go.mod pins modules that
+# the 2026-11-03 promotion run blocked on:
+#   golang.org/x/net        v0.56.0 -> v0.61.0  GO-2026-6603/6610/6611/6612/6617 (fixed 0.60.0)
+#   google.golang.org/grpc  v1.82.1 -> v1.83.2  GHSA-2v4p-qf9q-27wj, GHSA-vp52-pcj8-j9qc
+#   go-jose/go-jose/v4      v4.1.4  -> v4.1.6   GHSA-mgcc-cww5-fp2q
+# grpc v1.83.2 is what KICS v2.2.0 itself ships. v2.2.0 is not adopted wholesale
+# (see CHANGELOG 3.5.0): it removes --disable-full-descriptions, which
+# scanner.py passes, and adds an unconditional GitHub API version check on
+# every scan. `go get` verifies every new module against sum.golang.org, the
+# same transparency log behind the rest of this build, and raises whatever the
+# new versions require (x/crypto, x/sys, x/text, x/tools ... by MVS) -- the
+# build log's "go: upgraded" lines are the full list. Drop each override once
+# the pinned KICS release carries an equal or newer version.
+RUN go get \
+        golang.org/x/net@v0.61.0 \
+        google.golang.org/grpc@v1.83.2 \
+        github.com/go-jose/go-jose/v4@v4.1.6
+
 # CGO_ENABLED=0 for a static binary -- the runtime base is a different libc
 # from the build base, and static is what makes that safe.
 # -trimpath keeps build paths out of the binary so the output is reproducible.
@@ -100,26 +120,27 @@ RUN mkdir -p /out/iac-rules/assets \
 # curl and dpkg are only needed here; the runtime image has neither.
 FROM debian:bookworm-slim@${DEBIAN_DIGEST} AS builder
 
-ARG SYFT_VERSION=v1.51.0
-ARG SYFT_CHECKSUM=197b629b12b9d913e83ce0fcccfb27891bb2bfedb4d114a1913b8298cc0ad74f
+ARG SYFT_VERSION=v1.56.0
+ARG SYFT_CHECKSUM=35c48378923f7ec97b1ca20d289a372834ae2c1ecc416bd21caa925eb17f9f2a
 
 # Grype v0.112.0 was four minor releases behind and carried 22 critical/high in
 # its own vendored modules -- an unacceptable posture for a vulnerability
-# scanner. v0.117.0 brings that to 8, and only one of those eight has a fix we
-# could apply by bumping: the remaining seven are Go stdlib baked in by the
-# go1.26.3 toolchain Anchore built with, plus one docker/docker advisory whose
-# only patched module path is moby/moby/v2. Both wait on Anchore's next
-# release; see "Our vulnerability posture" in README.md.
-ARG GRYPE_VERSION=v0.117.0
-ARG GRYPE_CHECKSUM=ded1af2d2946fc92863ba2278d91da64dabb2c7a33a0e703868311686bc98873
+# scanner. v0.121.1 (like Syft v1.56.0) is built with go1.27.3 (`grype version`
+# GoVersion) and vendors x/net v0.61.0, x/crypto v0.58.0, grpc v1.84.0, go-jose
+# v4.1.6 and containerd/v2 v2.4.2, which clears every vendored-module and
+# stdlib advisory the 2026-11-03 promotion run attributed to either binary. The
+# one remaining Grype finding (GO-2026-4887, docker/docker) has no fixed
+# version on that module path; see "Our vulnerability posture" in README.md.
+ARG GRYPE_VERSION=v0.121.1
+ARG GRYPE_CHECKSUM=e101bf67b3e5613adfc349eed40ae6e4ce77be1a5bb627fdc697440c32f2eecc
 
 # 1.8.0 split generic-api-key into generic-api-key / generic-password /
 # generic-credential-uri. betterleaks fingerprints are file:rule_id:line, so a
 # consumer suppression pinned to an old generic-api-key finding stops matching
 # and the finding returns as net-new once. Base and head are scanned with the
 # same image, so the PR diff itself is unaffected. See CHANGELOG.
-ARG BETTERLEAKS_VERSION=1.8.1
-ARG BETTERLEAKS_CHECKSUM=efa407244e1ea8e35f582b8a42becdeac08bdead04f68eb752adda722d583c2a
+ARG BETTERLEAKS_VERSION=1.9.0
+ARG BETTERLEAKS_CHECKSUM=f8b185a39ffcece2a1ca82bf3a4e7435cd81963ffd16b7a9128daf75f35f6de7
 
 # osv-scanner: cross-ecosystem advisory matching for the core image. Static Go
 # binary, SHA256-pinned exactly like Syft/Grype. The release carries SLSA
@@ -129,8 +150,8 @@ ARG BETTERLEAKS_CHECKSUM=efa407244e1ea8e35f582b8a42becdeac08bdead04f68eb752adda7
 # substitution. Verifying multiple.intoto.jsonl is the outstanding gap; it is
 # NOT the equivalent of the Syft/Grype cosign step, and this comment used to
 # claim it was.
-ARG OSV_SCANNER_VERSION=v2.5.1
-ARG OSV_SCANNER_CHECKSUM=f9f25499a2c8cc367b3af45df2ea7eeca7fbccceab9c35079968f4b3652194be
+ARG OSV_SCANNER_VERSION=v2.7.0
+ARG OSV_SCANNER_CHECKSUM=160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
@@ -190,7 +211,14 @@ FROM cgr.dev/chainguard/wolfi-base@${WOLFI_DIGEST} AS base-min
 # python-3.13 provides /usr/bin/python3 directly; no symlink needed. Wolfi's
 # git pulls no perl, which is where 44 of the old image's critical/high CVEs
 # came from.
-RUN apk add --no-cache ca-certificates git python-3.13
+#
+# `apk upgrade` first: the base digest is pinned, so without it the packages
+# that ship IN wolfi-base (glibc, libcrypto3/libssl3, busybox, zlib) stay at
+# whatever the pinned digest froze, and publish.yml's weekly refresh -- whose
+# whole job is to pick up OS fixes without a re-pin -- would only ever refresh
+# the packages added here. apk verifies everything against Wolfi's signing keys.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates git python-3.13
 
 # ── Non-root runtime user ──────────────────────────────────────────────────────
 # This image clones and scans untrusted pull-request content (scanner.py's
