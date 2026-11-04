@@ -73,6 +73,10 @@ jobs:
   build-sign-push:
     name: Build · Sign · Push
     runs-on: ubuntu-latest
+    # Generous: two image builds, a KICS source build and a full Grype scan.
+    # The default is 6 hours, which a hung registry push would happily spend
+    # holding the release environment.
+    timeout-minutes: 60
     permissions:
       contents: write       # create GitHub Releases on tag push
       packages: write        # push to GHCR
@@ -167,7 +171,10 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       # ── Pre-build: verify Syft + Grype + Betterleaks release signatures ──────
-      # Anchore/betterleaks sign checksums.txt via cosign/sigstore. verify-blob
+      # All three sign checksums.txt with keyless cosign and publish a Sigstore
+      # bundle (`*.sigstore.json`) beside it. Anchore used to ship a detached
+      # .pem/.sig pair; Syft v1.56.0 / Grype v0.121.1 ship only the bundle, so
+      # the old pair is a 404 and the steps fetch the bundle instead. verify-blob
       # proves the FILE is authentic (produced by their real CI) -- it says
       # nothing about whether the checksum hand-copied into the Dockerfile
       # actually matches an entry in it. A transcription error, or a value
@@ -175,15 +182,16 @@ jobs:
       # other signal. Each step below extracts the asset's own line from the
       # now-authenticated file and fails closed on any mismatch against the
       # Dockerfile's pinned value. See SUP-07.
+      #
+      # curl -f on every fetch: without it a 404 page is written to disk and
+      # the failure surfaces one step later as a confusing cosign parse error.
       - name: Verify Syft release signature
         run: |
           SYFT_VER="${SYFT_VERSION#v}"
-          curl -sL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_checksums.txt" -o syft_checksums.txt
-          curl -sL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_checksums.txt.pem" -o syft_checksums.txt.pem
-          curl -sL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_checksums.txt.sig" -o syft_checksums.txt.sig
+          curl -fsSL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_checksums.txt" -o syft_checksums.txt
+          curl -fsSL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VER}_checksums.txt.sigstore.json" -o syft_checksums.txt.sigstore.json
           cosign verify-blob \
-            --certificate syft_checksums.txt.pem \
-            --signature syft_checksums.txt.sig \
+            --bundle syft_checksums.txt.sigstore.json \
             --certificate-identity-regexp "^https://github.com/anchore/syft/.+$" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             syft_checksums.txt
@@ -199,17 +207,15 @@ jobs:
             exit 1
           fi
           echo "✓ Dockerfile's pinned SYFT_CHECKSUM matches the signed manifest"
-          rm syft_checksums.txt syft_checksums.txt.pem syft_checksums.txt.sig
+          rm syft_checksums.txt syft_checksums.txt.sigstore.json
 
       - name: Verify Grype release signature
         run: |
           GRYPE_VER="${GRYPE_VERSION#v}"
-          curl -sL "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_checksums.txt" -o grype_checksums.txt
-          curl -sL "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_checksums.txt.pem" -o grype_checksums.txt.pem
-          curl -sL "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_checksums.txt.sig" -o grype_checksums.txt.sig
+          curl -fsSL "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_checksums.txt" -o grype_checksums.txt
+          curl -fsSL "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VER}_checksums.txt.sigstore.json" -o grype_checksums.txt.sigstore.json
           cosign verify-blob \
-            --certificate grype_checksums.txt.pem \
-            --signature grype_checksums.txt.sig \
+            --bundle grype_checksums.txt.sigstore.json \
             --certificate-identity-regexp "^https://github.com/anchore/grype/.+$" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             grype_checksums.txt
@@ -225,12 +231,12 @@ jobs:
             exit 1
           fi
           echo "✓ Dockerfile's pinned GRYPE_CHECKSUM matches the signed manifest"
-          rm grype_checksums.txt grype_checksums.txt.pem grype_checksums.txt.sig
+          rm grype_checksums.txt grype_checksums.txt.sigstore.json
 
       - name: Verify Betterleaks release signature
         run: |
-          curl -sL "https://github.com/betterleaks/betterleaks/releases/download/v${BETTERLEAKS_VERSION}/checksums.txt" -o betterleaks_checksums.txt
-          curl -sL "https://github.com/betterleaks/betterleaks/releases/download/v${BETTERLEAKS_VERSION}/checksums.txt.sigstore.json" -o betterleaks_checksums.txt.sigstore.json
+          curl -fsSL "https://github.com/betterleaks/betterleaks/releases/download/v${BETTERLEAKS_VERSION}/checksums.txt" -o betterleaks_checksums.txt
+          curl -fsSL "https://github.com/betterleaks/betterleaks/releases/download/v${BETTERLEAKS_VERSION}/checksums.txt.sigstore.json" -o betterleaks_checksums.txt.sigstore.json
           cosign verify-blob \
             --bundle betterleaks_checksums.txt.sigstore.json \
             --certificate-identity-regexp "^https://github.com/betterleaks/betterleaks/.+$" \
@@ -261,7 +267,7 @@ jobs:
       # ARG comment in the Dockerfile.
       - name: Verify osv-scanner checksum against upstream manifest
         run: |
-          curl -sL "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_SHA256SUMS" -o osv_sums.txt
+          curl -fsSL "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_SHA256SUMS" -o osv_sums.txt
           EXPECTED=$(grep " osv-scanner_linux_amd64\$" osv_sums.txt | cut -d' ' -f1)
           if [ -z "$EXPECTED" ]; then
             echo "::error::osv-scanner_linux_amd64 not found in upstream SHA256SUMS for ${OSV_SCANNER_VERSION}"
@@ -333,10 +339,10 @@ jobs:
 
       # sbom: true and provenance: true require the docker-container buildx driver
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -427,7 +433,7 @@ jobs:
 
       - name: Build and push (SBOM + provenance attestations)
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: core
@@ -448,8 +454,13 @@ jobs:
           cosign sign --yes "ghcr.io/zagware/zagware-scanner@${{ steps.build.outputs.digest }}"
           echo "✓ Signed: ${{ steps.build.outputs.digest }}"
 
+      # actions/attest, not actions/attest-build-provenance: since v4 the latter
+      # is only a wrapper, and upstream directs new use to actions/attest. With
+      # no predicate input it generates the same SLSA build provenance, and
+      # promote.yml already pins it for the promotion attestation -- one action,
+      # one SHA, one thing to bump.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ghcr.io/zagware/zagware-scanner
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -475,7 +486,7 @@ jobs:
 
       - name: Build and push reachability variant (SBOM + provenance)
         id: build_reach
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: reachability
@@ -491,14 +502,14 @@ jobs:
           echo "✓ Signed reachability: ${{ steps.build_reach.outputs.digest }}"
 
       - name: Attest reachability build provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ghcr.io/zagware/zagware-scanner
           subject-digest: ${{ steps.build_reach.outputs.digest }}
 
       # ── Post-push: scan the published image for its own CVEs ─────────────────
       # Advisory only (continue-on-error: true) — this never blocks a publish.
-      # The load-bearing CVE gate is promote.yml's 14-day-cooling-period check
+      # The load-bearing CVE gate is promote.yml's COOLING_DAYS + CVE check
       # before :stable/:secure move; this is a same-day heads-up, deliberately
       # not a release gate. See SUP-04.
       - name: Install Grype

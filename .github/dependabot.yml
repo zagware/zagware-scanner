@@ -1,0 +1,33 @@
+# Proposes GitHub Actions bumps as pull requests; it never merges anything.
+#
+# Every action here is pinned to a commit SHA with a trailing `# vX.Y.Z`
+# comment (enforced by ci.yml and tests/test_workflow_remaining.py). Dependabot
+# rewrites both together, so a bump PR still passes those checks and still goes
+# through CI and @zagware/maintainers review like any other change. Without
+# this, drift was only noticed by hand: three docker/* pins sat a minor behind
+# and attest-build-provenance stayed on its deprecated wrapper until the
+# 2026-11-04 review.
+#
+# cooldown mirrors promote.yml's COOLING_DAYS: a release must be 7 days old
+# before it is proposed, so a compromised or broken action release has a week
+# to be noticed and yanked before it reaches a workflow holding packages,
+# id-token and attestations write.
+#
+# Scanner binaries and base images are deliberately NOT here: they are Dockerfile
+# ARGs (Dependabot cannot follow a digest through an ARG) with checksums that
+# publish.yml cross-checks against signed upstream manifests. tool-currency.yml
+# reports those weekly.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci

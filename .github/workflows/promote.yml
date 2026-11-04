@@ -18,14 +18,22 @@ name: Promote to Stable
 
 on:
   schedule:
-    # Daily at 06:00 UTC
-    - cron: '0 6 * * *'
+    # Daily at 06:17 UTC. Off the top of the hour on purpose: GitHub queues
+    # scheduled runs and delays (or drops) the ones that land on :00 under
+    # load -- the `0 6` cron this replaced routinely started 4-7 hours late.
+    - cron: '17 6 * * *'
+  # No inputs: the candidate is always :latest and the release it was built
+  # from is read off the digest's own version label. A `version` input used to
+  # be declared here that nothing read, which made a manual run look like it
+  # could promote an arbitrary version when it could not.
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to promote (e.g. 2.2.0). Leave empty to auto-detect.'
-        required: false
-        default: ''
+
+# One promotion at a time. A manual dispatch overlapping the cron run would
+# otherwise scan, re-tag and attest the same digest twice and race the
+# blocked-promotion issue bookkeeping. Never cancel a run mid-retag.
+concurrency:
+  group: promote-stable
+  cancel-in-progress: false
 
 env:
   # Days a RELEASE must age before its image can be promoted. Lowered 14 -> 7:
@@ -63,6 +71,7 @@ jobs:
   promote:
     name: Promote latest → stable
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read        # no step writes repository contents
       packages: write       # re-tag images
@@ -85,7 +94,7 @@ jobs:
       # so far skipped on the cooling-period gate, and :stable does not yet
       # exist. The first real promotion is what proves it.
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -400,39 +409,59 @@ jobs:
             echo "scan_failed=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # One open blocked-promotion issue at a time. The dedupe key is the
+      # digest, so without this every weekly refresh (a new digest) filed a
+      # fresh issue and left the last one open -- eleven accumulated between
+      # 2026-08-14 and 2026-11-01, all but one describing an image that was no
+      # longer the candidate. Older ones are closed as superseded, pointing at
+      # the current one, so the open issue is always the live blocker.
+      #
+      # Values arrive as env vars, not ${{ }} interpolated into the script
+      # text: a step output spliced into JavaScript source is code, not data.
       - name: Open issue for blocked promotion
         if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed == 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BLOCKING_COUNT: ${{ steps.scan.outputs.blocking_count }}
+          HIGH_COUNT: ${{ steps.scan.outputs.high_count }}
+          DIGEST: ${{ steps.latest.outputs.digest }}
         with:
           script: |
-            const count = '${{ steps.scan.outputs.blocking_count }}';
-            const total = '${{ steps.scan.outputs.high_count }}';
-            const digest = '${{ steps.latest.outputs.digest }}';
+            const { BLOCKING_COUNT: count, HIGH_COUNT: total, DIGEST: digest } = process.env;
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
 
-            // Check if a blocked-promotion issue already exists for this digest —
-            // without this, once the cooling period elapses this workflow
-            // runs daily via cron and would otherwise file a fresh issue every
-            // single day the image remains vulnerable. See SUP-03.
-            const issues = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'security,promotion-blocked'
+            // Reuse the issue for this digest if one is open -- once the
+            // cooling period elapses this runs daily, and would otherwise
+            // file a fresh issue every day the image stays blocked. See SUP-03.
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: 'security,promotion-blocked', per_page: 100,
             });
 
-            const existing = issues.data.find(i => i.body && i.body.includes(digest));
-            if (existing) {
-              console.log(`Blocked-promotion issue already exists: ${existing.html_url}`);
-              return;
+            let current = open.find(i => i.body && i.body.includes(digest));
+            if (current) {
+              core.info(`Blocked-promotion issue already exists: ${current.html_url}`);
+            } else {
+              ({ data: current } = await github.rest.issues.create({
+                owner, repo,
+                title: `Promotion blocked: ${digest} has ${count} actionable HIGH/CRITICAL CVEs`,
+                body: `The promotion of \`ghcr.io/zagware/zagware-scanner@${digest}\` to :stable was blocked because Grype found **${count}** HIGH/CRITICAL vulnerabilities that a base re-pin or a tool version bump would clear (${total} HIGH/CRITICAL in total; the remainder are either unfixable upstream or Go \`stdlib\` inside a vendor-built binary, which only that vendor's next release can move — tool-currency.yml tracks those).\n\nThe [scan step's log](${runUrl}) lists each blocking finding with its owning binary.\n\nThe image remains on :latest. Re-pin the base or bump the affected tool, publish, and this workflow will retry on its next run.`,
+                labels: ['security', 'promotion-blocked'],
+              }));
+              core.info(`Opened ${current.html_url}`);
             }
 
-            github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `Promotion blocked: ${digest} has ${count} actionable HIGH/CRITICAL CVEs`,
-              body: `The promotion of \`ghcr.io/zagware/zagware-scanner@${digest}\` to :stable was blocked because Grype found **${count}** HIGH/CRITICAL vulnerabilities that a base re-pin or a tool version bump would clear (${total} HIGH/CRITICAL in total; the remainder are either unfixable upstream or Go \`stdlib\` inside a vendor-built binary, which only that vendor's next release can move — tool-currency.yml tracks those).\n\nThe scan step's log lists each blocking finding with its owning binary.\n\nThe image remains on :latest. Re-pin the base or bump the affected tool, publish, and this workflow will retry on its next run.`,
-              labels: ['security', 'promotion-blocked']
-            });
+            for (const stale of open.filter(i => i.number !== current.number)) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: stale.number,
+                body: `Superseded by #${current.number}: :latest has since been rebuilt, so this digest is no longer the promotion candidate.`,
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: stale.number,
+                state: 'closed', state_reason: 'not_planned',
+              });
+              core.info(`Closed superseded #${stale.number}`);
+            }
 
       - name: Promote to stable and secure
         if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'
@@ -506,6 +535,33 @@ jobs:
           subject-digest: ${{ steps.latest.outputs.digest }}
           predicate-type: https://zagware.io/attestations/promotion/v1
           predicate-path: /tmp/promotion-predicate.json
+
+      # A successful promotion resolves every open blocked-promotion issue:
+      # whatever they described, :stable now points at a digest that passed
+      # the gate. Left open, they would read as live blockers indefinitely.
+      - name: Close resolved blocked-promotion issues
+        if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          DIGEST: ${{ steps.latest.outputs.digest }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: 'security,promotion-blocked', per_page: 100,
+            });
+            for (const issue of open) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issue.number,
+                body: `Resolved: \`${process.env.DIGEST}\` passed the CVE gate and was promoted to :stable and :secure in ${runUrl}.`,
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: issue.number,
+                state: 'closed', state_reason: 'completed',
+              });
+              core.info(`Closed #${issue.number}`);
+            }
 
       - name: Promotion summary
         if: steps.latest.outputs.skip != 'true' && steps.scan.outputs.scan_failed != 'true'

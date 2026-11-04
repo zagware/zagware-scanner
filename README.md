@@ -724,7 +724,7 @@ Every release of `ghcr.io/zagware/zagware-scanner` is built with a verifiable su
 | **betterleaks binary** | SHA256 checksum hardcoded in the Dockerfile and verified at build time; cosign sigstore-bundle signature verified in CI before build |
 | **Our image** | Signed with cosign (keyless, GitHub OIDC → sigstore Rekor transparency log) |
 | **SBOM** | SPDX SBOM generated at build time and attached as an OCI attestation |
-| **Provenance** | SLSA v1.0 Build **Level 2** provenance attestation (`actions/attest-build-provenance`) — links the image digest to this source commit and workflow run; verifiable with `gh attestation verify` |
+| **Provenance** | SLSA v1.0 Build **Level 2** provenance attestation (`actions/attest`) — links the image digest to this source commit and workflow run; verifiable with `gh attestation verify` |
 
 ### Why this matters (TeamPCP context)
 
@@ -767,31 +767,37 @@ docker buildx imagetools inspect ghcr.io/zagware/zagware-scanner:latest \
 ### Keeping the tools current
 
 This image bundles five third-party scanners — KICS, Syft, Grype, betterleaks and osv-scanner —
-plus three base images. Every one is pinned, and a pin that nobody watches is just a slow-motion
-vulnerability. A [weekly workflow](.github/workflows/tool-currency.yml) checks all eight and
-maintains a single, continuously-updated issue. It **never edits a pin**; it reports, and a human
-decides.
+plus govulncheck in the reachability variant, and three base images. Every one is pinned, and a
+pin that nobody watches is just a slow-motion vulnerability. A
+[weekly workflow](.github/workflows/tool-currency.yml) checks all nine and maintains a single,
+continuously-updated issue. It **never edits a pin**; it reports, and a human decides. GitHub
+Actions pins are kept current separately, by Dependabot pull requests with a 7-day cooldown.
 
 osv-scanner was missing from that list until 2026-08-25, and the cost was exactly what the
 workflow exists to prevent: the pin sat at v2.4.0 (released 2026-06-18) for 68 days, two releases
 behind, carrying 11 CRITICAL/HIGH — the worst of any bundled tool — with nothing reporting it. A
 watcher that omits a tool is worse than no watcher, because the silence reads as health.
+govulncheck was missing the same way until 2026-11-04, by which time it was eight minor releases
+behind.
 
-It distinguishes four situations, because they call for different responses:
+It distinguishes five situations, because they call for different responses:
 
 | Signal | Meaning | Response |
 |---|---|---|
 | **Behind** | Upstream published a newer release than we pin | Routine: bump, re-checksum, release |
-| **Escalate** | Our pinned build carries **fixable** CRITICAL/HIGH CVEs **and** upstream has gone quiet (no release in 90 days) or has stopped shipping `linux/amd64` binaries | Consider building that tool from source — see below |
+| **Escalate** | A vendor binary carries **fixable** CRITICAL/HIGH CVEs **and** upstream has gone quiet (no release in 90 days) or has stopped shipping `linux/amd64` binaries | Consider building that tool from source — see below |
+| **Ours** | A tool we already build from source (KICS, govulncheck) carries **fixable** CRITICAL/HIGH CVEs | Override the module with `go get` in its Dockerfile build stage, or bump `GO_VERSION`. For KICS the promotion gate blocks until we do |
 | **Unpullable pin** | The registry answered, and the pinned digest is gone | Re-pin before the next build fails |
-| **Unchecked pin** | The registry lookup itself failed, so nothing is known either way | Usually a Docker Hub anonymous pull-rate limit on the runner; it clears by itself |
+| **Unchecked pin** | The registry did not answer the manifest `HEAD`, so nothing is known either way | Transient (rate limit, auth, DNS); re-run the workflow |
 
 The last two used to be one signal, and it lied. On 2026-08-24 the report declared both Docker Hub
 pins `UNPULLABLE` and told a human "the next build will fail", when an authenticated registry HEAD
-showed both digests present and serving. The runner had hit Docker Hub's anonymous pull limit —
-which is also why the Chainguard pin passed in the same run. Reporting a failed lookup as a dead
-pin is the same fabricated-answer class the CVE gates had removed; a lookup that did not happen
-now says so.
+showed both digests present and serving. Reporting a failed lookup as a dead pin is the same
+fabricated-answer class the CVE gates had removed; a lookup that did not happen now says so. The
+lookup itself was the next problem: `docker manifest inspect` failed on both Docker Hub pins every
+week with "manifest verification failed for digest", so they were never actually checked. The
+check is now a registry `HEAD`, which Docker Hub does not count against its pull limit, and its
+status code is the registry's own answer.
 
 ### When we build a tool from source
 
@@ -937,57 +943,57 @@ error text drift apart.
 
 We publish the numbers rather than claiming zero, and we say who can act on each one.
 
-Measured 2026-08-25 with Grype's database of the same date, against the published image
-`sha256:b510b834…` and against each bundled binary individually:
+Measured 2026-11-04 with Grype's database of the same date, against the 3.4.0 `:latest`
+(`sha256:532001ad…`, as scanned by promote.yml on 2026-11-03) and against a build of 3.5.0:
 
-| | published image | after the pin bumps below |
+| | 3.4.0 `:latest` | 3.5.0 |
 |---|---|---|
-| CRITICAL/HIGH | 50 | **28** |
-| — Critical | 2 | **2** |
-| — High | 48 | **26** |
-| From OS packages | 8 | **0** |
-| With no upstream fix at all | 4 | **3** |
-| Actionable by us (what the gate enforces) | 19 | **0** |
+| CRITICAL/HIGH | 108 | **30** |
+| — Critical | — | **5** |
+| — High | — | **25** |
+| With an upstream fix | 104 | **25** |
+| With no upstream fix at all | 4 | **5** |
+| Actionable by us (what the gate enforces) | 40 | **0** |
 
-The bumps: Wolfi base re-pinned, Go 1.26.5 → 1.26.7, Syft v1.50.0 → v1.51.0, Grype v0.116.1 →
-v0.117.0, betterleaks 1.7.2 → 1.8.1, osv-scanner v2.4.0 → v2.5.1. The right-hand column is
-per-binary measurement of the actual upstream release artifacts plus a re-pinned base; the built
-image's own total is re-measured by `publish.yml`'s self-scan on the next release.
+The bumps: Syft v1.51.0 → v1.56.0, Grype v0.117.0 → v0.121.1, betterleaks 1.8.1 → 1.9.0,
+osv-scanner v2.5.1 → v2.7.0, three module overrides in the KICS source build, and every base
+re-pinned. The built image's own total is re-measured by `publish.yml`'s self-scan on each
+release.
 
-Where the remaining 28 sit, and why each is where it is:
+Where the remaining 30 sit, and why each is where it is:
 
 | Owner | Count | Nature |
 |---|---|---|
-| `syft` v1.51.0 | 7 | Go `stdlib` from Anchore's go1.26.3 build |
-| `grype` v0.117.0 | 8 | 7 the same `stdlib`, 1 `docker/docker` patched only in `moby/moby/v2` |
-| `osv-scanner` v2.5.1 | 6 | Go `stdlib` from Google's go1.26.5 build |
-| `betterleaks` 1.8.1 | 5 | Go `stdlib` from a go1.25.12 build |
-| `kics` | 2 | Both Critical — `containerd` advisories fixed only in the `containerd/v2` module line, which KICS does not use |
-| OS packages | 0 | — |
+| `betterleaks` 1.9.0 | 14 | Go `stdlib` from a go1.25.12 build |
+| `osv-scanner` v2.7.0 | 11 | Go `stdlib` from Google's go1.27.0 build |
+| `kics` | 3 | `containerd` v1 advisories (two Critical) with no fixed release on the v1 module line KICS uses |
+| `grype` v0.121.1 | 1 | GO-2026-4887 in `docker/docker`, no fixed version on that module path |
+| `syft` v1.56.0 | 0 | — |
+| OS packages | 1 | CVE-2026-119586 in Wolfi's `sqlite-libs`, no fixed Wolfi package yet |
 
 Three things make that honest rather than cosmetic:
 
-**Fixable is not the same as ours to fix.** 25 of the 28 are Go `stdlib` inside a binary somebody
-else built and signed. Grype marks them fixed because Go shipped the patch; applying it means
-Anchore, Google or betterleaks rebuilding. We could take those to zero by compiling all four from
-source — and we deliberately do not, because it would trade four verified vendor signatures for a
+**Fixable is not the same as ours to fix.** All 25 fixable findings are Go `stdlib` inside a
+binary somebody else built and signed. Grype marks them fixed because Go shipped the patch;
+applying it means Google or betterleaks rebuilding. We could take those to zero by compiling both
+from source — and we deliberately do not, because it would trade verified vendor signatures for a
 number (see [When we build a tool from source](#when-we-build-a-tool-from-source)). What we do
 instead is track them: the weekly currency workflow reports them per binary and escalates if a
 vendor goes quiet while carrying them.
 
-**The gate enforces the actionable column, and it moved from 19 to 0 by doing exactly what it
-asked for** — re-pinning a base and bumping five pins. That is the property a gate needs: passing
-it requires an action, and performing that action passes it. The previous raw-count gate required
-50 → 0, which no action available to this repository could produce, and so it had never promoted
-anything at all.
+**The gate enforces the actionable column, and it moved from 40 to 0 by doing exactly what it
+asked for** — bumping four pins, overriding three modules in a build we own, and re-pinning the
+bases. That is the property a gate needs: passing it requires an action, and performing that
+action passes it. A raw-count gate would have required 30 → 0, which no action available to this
+repository can produce.
 
-**Zero come from the operating system.** That is the whole reason the runtime base is Wolfi. On
-`debian:bookworm-slim` the OS contributed 105 critical/high of which *not one was fixable* — 70
-marked "won't fix" by Debian, 35 with no fix at all. No amount of patching would have closed a
-single one; only leaving the distro could. 44 came from `perl`, in the image purely because
-Debian's `git` depends on it. The 8 OS findings in the published image (`busybox`, `openssl`) are
-not a return of that problem — they are an aged pin, and `apk`'s own updates close them, which is
-precisely the difference.
+**One comes from the operating system, and it has no fix yet.** Keeping that number near zero is
+why the runtime base is Wolfi. On `debian:bookworm-slim` the OS contributed 105 critical/high of which
+*not one was fixable* — 70 marked "won't fix" by Debian, 35 with no fix at all. No amount of
+patching would have closed a single one; only leaving the distro could. 44 came from `perl`, in
+the image purely because Debian's `git` depends on it. On Wolfi, OS findings close as soon as a
+fixed package lands: the runtime stage runs `apk upgrade`, so the weekly refresh picks the fix up
+without a re-pin, including for the packages that ship inside the pinned base.
 
 To reproduce any of this yourself:
 
